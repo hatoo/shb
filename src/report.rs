@@ -3,7 +3,14 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::Args;
-use crate::stats::{Stats, latency_summary};
+use crate::stats::{PERCENTILES, Stats, latency_summary};
+
+/// Format a percentile label like oha: "50" / "99.9" / "99.99"
+fn percentile_label(p: f64) -> String {
+    let s = format!("{p:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
 
 fn protocol_name(args: &Args) -> &'static str {
     if args.http3 {
@@ -52,14 +59,15 @@ pub fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duratio
     if let Some(l) = latency_summary(&stats.latencies_ns) {
         println!("Latency (ms):");
         println!(
-            "  min {:.3}  mean {:.3}  p50 {:.3}  p90 {:.3}  p99 {:.3}  max {:.3}",
+            "  min {:.3}  mean {:.3}  max {:.3}",
             l.min * 1e3,
             l.mean * 1e3,
-            l.p50 * 1e3,
-            l.p90 * 1e3,
-            l.p99 * 1e3,
             l.max * 1e3,
         );
+        println!("Latency distribution:");
+        for (p, v) in PERCENTILES.iter().zip(l.percentiles.iter()) {
+            println!("  {}% in {:.3} ms", percentile_label(*p), v * 1e3);
+        }
     }
 }
 
@@ -78,14 +86,20 @@ pub fn print_json_report(
         .map(|(code, &n)| (code.to_string(), n.into()))
         .collect();
     let latency = latency_summary(&stats.latencies_ns).map(|l| {
-        serde_json::json!({
-            "min": l.min,
-            "mean": l.mean,
-            "p50": l.p50,
-            "p90": l.p90,
-            "p99": l.p99,
-            "max": l.max,
-        })
+        let mut obj = serde_json::Map::new();
+        obj.insert("min".to_string(), l.min.into());
+        obj.insert("mean".to_string(), l.mean.into());
+        obj.insert("max".to_string(), l.max.into());
+        let percentiles: serde_json::Map<String, serde_json::Value> = PERCENTILES
+            .iter()
+            .zip(l.percentiles.iter())
+            .map(|(p, v)| (format!("p{}", percentile_label(*p)), (*v).into()))
+            .collect();
+        obj.insert(
+            "percentiles".to_string(),
+            serde_json::Value::Object(percentiles),
+        );
+        serde_json::Value::Object(obj)
     });
     let report = serde_json::json!({
         "url": args.url,

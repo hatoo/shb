@@ -51,14 +51,16 @@ impl Stats {
     }
 }
 
+/// Percentile sample points, matching oha's latency distribution
+pub const PERCENTILES: [f64; 9] = [10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99];
+
 /// Latency summary (in seconds)
 pub struct LatencySummary {
     pub min: f64,
     pub mean: f64,
-    pub p50: f64,
-    pub p90: f64,
-    pub p99: f64,
     pub max: f64,
+    /// Percentiles paired with [`PERCENTILES`] (seconds)
+    pub percentiles: [f64; 9],
 }
 
 pub fn latency_summary(latencies_ns: &[u64]) -> Option<LatencySummary> {
@@ -67,16 +69,15 @@ pub fn latency_summary(latencies_ns: &[u64]) -> Option<LatencySummary> {
     }
     let mut lat = latencies_ns.to_vec();
     lat.sort_unstable();
+    // Same index formula as oha: floor(p/100 * len), clamped to the last element
     let pct = |p: f64| -> f64 {
-        let idx = ((lat.len() as f64 * p).ceil() as usize).saturating_sub(1);
-        lat[idx.min(lat.len() - 1)] as f64 / 1e9
+        let idx = ((p / 100.0 * lat.len() as f64) as usize).min(lat.len() - 1);
+        lat[idx] as f64 / 1e9
     };
     Some(LatencySummary {
         min: lat[0] as f64 / 1e9,
         mean: lat.iter().sum::<u64>() as f64 / lat.len() as f64 / 1e9,
-        p50: pct(0.50),
-        p90: pct(0.90),
-        p99: pct(0.99),
         max: lat[lat.len() - 1] as f64 / 1e9,
+        percentiles: PERCENTILES.map(pct),
     })
 }
