@@ -29,13 +29,13 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 100_000)]
     requests: u64,
 
-    /// Run for this many seconds instead of a fixed request count
-    #[arg(short = 'z', long)]
-    duration: Option<f64>,
+    /// Run for this long instead of a fixed request count (e.g. 10s, 1m30s)
+    #[arg(short = 'z', long, value_parser = humantime::parse_duration)]
+    duration: Option<Duration>,
 
-    /// Connection establishment timeout in seconds
-    #[arg(long, default_value_t = 3.0)]
-    connect_timeout: f64,
+    /// Connection establishment timeout (e.g. 3s, 500ms)
+    #[arg(long, default_value = "3s", value_parser = humantime::parse_duration)]
+    connect_timeout: Duration,
 
     /// Number of worker threads
     #[arg(short = 't', long, default_value_t = default_threads())]
@@ -453,7 +453,7 @@ fn main() -> Result<()> {
     }
     let target = parse_target(&args.url)?;
 
-    let duration_limit = args.duration.map(Duration::from_secs_f64);
+    let duration_limit = args.duration;
 
     // 1 スレッドには最低 1 コネクション割り当てる
     let threads = args.threads.min(args.connections);
@@ -519,7 +519,7 @@ fn run_worker(
     connections: usize,
     max_requests: u64,
     duration_limit: Option<Duration>,
-    connect_timeout_secs: f64,
+    connect_timeout: Duration,
 ) -> Result<Stats> {
     if connections == 0 || max_requests == 0 {
         return Ok(Stats::default());
@@ -535,9 +535,7 @@ fn run_worker(
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
     let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
-    let connect_timeout = Box::new(types::Timespec::from(Duration::from_secs_f64(
-        connect_timeout_secs,
-    )));
+    let connect_timeout = Box::new(types::Timespec::from(connect_timeout));
 
     let mut stats = Stats::default();
     if duration_limit.is_none() {

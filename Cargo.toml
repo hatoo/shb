@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
+humantime = "2.4.0"
 io-uring = "0.7.14"
 libc = "0.2"
 shiguredo_http11 = "2026.6.1"
