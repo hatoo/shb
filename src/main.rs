@@ -1,18 +1,18 @@
 use std::mem;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, Request, ResponseDecoder};
 
-/// recv 書き込み枠の初期値。mut_buf はゼロ初期化を伴うため小さく始め、
-/// 枠を使い切った recv が続く間だけ倍増させる (上限 RECV_WINDOW_MAX)
-const RECV_WINDOW_INIT: usize = 4 * 1024;
-/// recv 書き込み枠の上限 (デコーダーの max_buffer_size と同値)
-const RECV_WINDOW_MAX: usize = 64 * 1024;
+/// provided buffer ring の 1 バッファのサイズ
+const RECV_BUF_SIZE: usize = 16 * 1024;
+/// provided buffer ring のバッファグループ ID (ワーカーごとに 1 つ)
+const BUF_GROUP: u16 = 0;
 const TIMEOUT_USER_DATA: u64 = u64::MAX;
 
 #[derive(Parser)]
@@ -113,6 +113,91 @@ fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
     Ok(fd)
 }
 
+/// multishot recv 用の provided buffer ring
+///
+/// カーネルは受信のたびにこのリングからバッファを取り出して書き込み、
+/// CQE の flags でバッファ ID を通知する。処理後は `recycle` で返却する。
+/// リング領域とデータバッファはバッファグループの登録解除 (= io_uring の drop)
+/// までカーネルが参照するため、この構造体は必ず ring より先に宣言して
+/// 逆順 drop で ring より後に破棄されるようにすること。
+struct BufRing {
+    /// io_uring_buf エントリ配列 (ページ境界に確保、カーネルと共有)
+    ring_ptr: *mut types::BufRingEntry,
+    layout: std::alloc::Layout,
+    entries: u16,
+    mask: u16,
+    /// ローカルの tail シャドウ。publish で共有領域に Release ストアする
+    tail: u16,
+    /// entries * RECV_BUF_SIZE の連続データバッファ (再確保しないこと)
+    data: Vec<u8>,
+}
+
+impl BufRing {
+    fn new(entries: u16) -> Result<Self> {
+        assert!(entries.is_power_of_two());
+        let layout = std::alloc::Layout::from_size_align(
+            entries as usize * mem::size_of::<types::BufRingEntry>(),
+            4096,
+        )
+        .context("invalid buffer ring layout")?;
+        let ring_ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut types::BufRingEntry;
+        if ring_ptr.is_null() {
+            bail!("failed to allocate buffer ring");
+        }
+        let mut this = BufRing {
+            ring_ptr,
+            layout,
+            entries,
+            mask: entries - 1,
+            tail: 0,
+            data: vec![0u8; entries as usize * RECV_BUF_SIZE],
+        };
+        // 全バッファを初期投入する
+        for bid in 0..entries {
+            this.push_entry(bid);
+        }
+        this.publish();
+        Ok(this)
+    }
+
+    fn push_entry(&mut self, bid: u16) {
+        let idx = (self.tail & self.mask) as usize;
+        unsafe {
+            let entry = &mut *self.ring_ptr.add(idx);
+            entry.set_addr(self.data.as_ptr() as u64 + bid as u64 * RECV_BUF_SIZE as u64);
+            entry.set_len(RECV_BUF_SIZE as u32);
+            entry.set_bid(bid);
+        }
+        self.tail = self.tail.wrapping_add(1);
+    }
+
+    /// tail をカーネルへ公開する
+    fn publish(&self) {
+        unsafe {
+            let tail_ptr = types::BufRingEntry::tail(self.ring_ptr) as *const AtomicU16;
+            (*tail_ptr).store(self.tail, Ordering::Release);
+        }
+    }
+
+    /// CQE で通知されたバッファのデータを参照する
+    fn data(&self, bid: u16, len: usize) -> &[u8] {
+        let off = bid as usize * RECV_BUF_SIZE;
+        &self.data[off..off + len]
+    }
+
+    /// 処理し終えたバッファをリングに返却する
+    fn recycle(&mut self, bid: u16) {
+        self.push_entry(bid);
+        self.publish();
+    }
+}
+
+impl Drop for BufRing {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ring_ptr as *mut u8, self.layout) };
+    }
+}
+
 struct Target {
     addr: SocketAddr,
     request_bytes: Vec<u8>,
@@ -190,10 +275,11 @@ struct Conn {
     decoder: ResponseDecoder,
     /// 部分送信の再開位置
     send_offset: usize,
-    /// 現在の recv 書き込み枠サイズ (適応的に増える)
-    recv_window: usize,
-    /// 直前の recv で確保した枠のサイズ (枠を使い切ったか判定用)
-    last_recv_len: usize,
+    /// multishot recv が有効か (MORE フラグの落ちた CQE で無効になる)
+    recv_armed: bool,
+    /// 再接続世代。close のたびに増え、旧世代の CQE
+    /// (取り消された multishot recv 等) を user_data で識別して無視する
+    generation: u64,
     /// 現在のレスポンスのメタ情報 (None = ヘッダー未デコード)
     resp: Option<ResponseMeta>,
     request_start: Instant,
@@ -206,8 +292,8 @@ impl Conn {
             connected: false,
             decoder: ResponseDecoder::new(),
             send_offset: 0,
-            recv_window: RECV_WINDOW_INIT,
-            last_recv_len: 0,
+            recv_armed: false,
+            generation: 0,
             resp: None,
             request_start: Instant::now(),
         }
@@ -220,6 +306,9 @@ impl Conn {
             self.fd = -1;
         }
         self.connected = false;
+        self.recv_armed = false;
+        // 旧接続向けオペレーションの CQE を無視できるよう世代を進める
+        self.generation += 1;
     }
 
     /// 受信済みデータをデコーダーに与えた後の状態遷移を進める
@@ -281,14 +370,16 @@ impl Conn {
     }
 }
 
-// user_data: 下位 2bit がオペレーション種別、残りがコネクション番号
+// user_data: 下位 2bit がオペレーション種別、次の CONN_IDX_BITS bit が
+// コネクション番号、残りが再接続世代
 const OP_SEND: u64 = 0;
 const OP_RECV: u64 = 1;
 const OP_CONNECT: u64 = 2;
 const OP_CONNECT_TIMEOUT: u64 = 3;
+const CONN_IDX_BITS: u64 = 20;
 
-fn user_data(conn_idx: usize, op: u64) -> u64 {
-    ((conn_idx as u64) << 2) | op
+fn user_data(conn_idx: usize, generation: u64, op: u64) -> u64 {
+    (generation << (2 + CONN_IDX_BITS)) | ((conn_idx as u64) << 2) | op
 }
 
 fn push_sqe(ring: &mut IoUring, entry: squeue::Entry) -> Result<()> {
@@ -349,10 +440,10 @@ fn start_connect(
     )
     .build()
     .flags(squeue::Flags::IO_LINK)
-    .user_data(user_data(conn_idx, OP_CONNECT));
+    .user_data(user_data(conn_idx, conn.generation, OP_CONNECT));
     let link_timeout = opcode::LinkTimeout::new(timeout as *const types::Timespec)
         .build()
-        .user_data(user_data(conn_idx, OP_CONNECT_TIMEOUT));
+        .user_data(user_data(conn_idx, conn.generation, OP_CONNECT_TIMEOUT));
     push_sqe_pair(ring, connect, link_timeout)
 }
 
@@ -364,33 +455,22 @@ fn push_send(ring: &mut IoUring, conn_idx: usize, conn: &Conn, request: &[u8]) -
         remaining.len() as u32,
     )
     .build()
-    .user_data(user_data(conn_idx, OP_SEND));
+    .user_data(user_data(conn_idx, conn.generation, OP_SEND));
     push_sqe(ring, entry)
 }
 
-/// デコーダー内部バッファに直接受信する Recv SQE を投入する (ゼロコピー)
+/// multishot recv を投入する
 ///
-/// `mut_buf` で確保した未確定領域に kernel が書き込み、完了時に
-/// `advance_buf` で確定する。Recv の in-flight 中はこの Conn の decoder に
-/// 一切触れないことがポインタ有効性の前提 (触れなければ内部 Vec は再確保されない)。
-fn push_recv(ring: &mut IoUring, conn_idx: usize, conn: &mut Conn) -> Result<()> {
-    let len = conn.decoder.available_buf().min(conn.recv_window);
-    if len == 0 {
-        bail!("decoder buffer full (response headers too large?)");
-    }
-    conn.last_recv_len = len;
-    let buf = conn
-        .decoder
-        .mut_buf(len)
-        .map_err(|e| anyhow::anyhow!("mut_buf failed: {e:?}"))?;
-    let entry = opcode::Recv::new(
-        types::Fixed(conn_idx as u32),
-        buf.as_mut_ptr(),
-        buf.len() as u32,
-    )
-    .build()
-    .user_data(user_data(conn_idx, OP_RECV));
-    push_sqe(ring, entry)
+/// 一度の投入で、MORE フラグが立つ間は受信のたびに CQE が届き続けるため、
+/// レスポンスごとの Recv SQE が不要になる。受信バッファは provided buffer
+/// ring からカーネルが選び、CQE の flags でバッファ ID が通知される。
+fn push_recv_multi(ring: &mut IoUring, conn_idx: usize, conn: &mut Conn) -> Result<()> {
+    let entry = opcode::RecvMulti::new(types::Fixed(conn_idx as u32), BUF_GROUP)
+        .build()
+        .user_data(user_data(conn_idx, conn.generation, OP_RECV));
+    push_sqe(ring, entry)?;
+    conn.recv_armed = true;
+    Ok(())
 }
 
 struct Stats {
@@ -518,11 +598,16 @@ fn run_worker(
     if connections == 0 || max_requests == 0 {
         return Ok(Stats::default());
     }
+    if connections > 1 << CONN_IDX_BITS {
+        bail!("too many connections per thread (max {})", 1u64 << CONN_IDX_BITS);
+    }
 
-    // conns は ring より先に宣言する。逆順 drop により ring (teardown 時に
-    // in-flight オペレーションのキャンセル完了を待つ) が先に破棄され、
-    // in-flight recv が書き込むデコーダーバッファ (conns 内) の解放後に
-    // kernel が書き込む use-after-free を防ぐ。
+    // buf_ring / conns は ring より先に宣言する。逆順 drop により ring
+    // (teardown 時に in-flight オペレーションのキャンセル完了を待つ) が
+    // 先に破棄され、kernel が参照するバッファの解放後に書き込まれる
+    // use-after-free を防ぐ。
+    let buf_entries = (connections * 2).next_power_of_two().clamp(64, 32768) as u16;
+    let mut buf_ring = BufRing::new(buf_entries)?;
     let mut conns: Vec<Conn> = Vec::with_capacity(connections);
     for _ in 0..connections {
         conns.push(Conn::new());
@@ -548,6 +633,18 @@ fn run_worker(
     ring.submitter()
         .register_files_sparse(connections as u32)
         .context("register_files_sparse failed")?;
+
+    // provided buffer ring を登録する (要 kernel 5.19+、RecvMulti は 6.0+)
+    unsafe {
+        ring.submitter()
+            .register_buf_ring_with_flags(
+                buf_ring.ring_ptr as u64,
+                buf_ring.entries,
+                BUF_GROUP,
+                0,
+            )
+            .context("register_buf_ring failed")?;
+    }
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
     let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
@@ -585,7 +682,7 @@ fn run_worker(
         )?;
     }
 
-    let mut cqe_buf: Vec<(u64, i32)> = Vec::with_capacity(entries as usize);
+    let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize);
     let mut stop = false;
 
     'outer: loop {
@@ -596,16 +693,27 @@ fn run_worker(
 
         cqe_buf.clear();
         for cqe in ring.completion() {
-            cqe_buf.push((cqe.user_data(), cqe.result()));
+            cqe_buf.push((cqe.user_data(), cqe.result(), cqe.flags()));
         }
 
-        for &(ud, res) in &cqe_buf {
+        for &(ud, res, flags) in &cqe_buf {
             if ud == TIMEOUT_USER_DATA {
                 stop = true;
                 continue;
             }
-            let conn_idx = (ud >> 2) as usize;
             let op = ud & 0b11;
+            let conn_idx = ((ud >> 2) & ((1 << CONN_IDX_BITS) - 1)) as usize;
+            let generation = ud >> (2 + CONN_IDX_BITS);
+
+            // 旧世代 (close 済み接続) のオペレーションの CQE は無視する。
+            // 旧 multishot recv がバッファ付きで完了していた場合は返却だけ行う。
+            if generation != conns[conn_idx].generation {
+                if let Some(bid) = cqueue::buffer_select(flags) {
+                    buf_ring.recycle(bid);
+                }
+                continue;
+            }
+
             let mut request_finished = false;
             let mut keep_conn = true;
 
@@ -620,6 +728,8 @@ fn run_worker(
                     } else {
                         let conn = &mut conns[conn_idx];
                         conn.connected = true;
+                        // 接続と同時にコネクション寿命の multishot recv を張る
+                        push_recv_multi(&mut ring, conn_idx, conn)?;
                         // レイテンシは送信開始から測る (接続確立時間は含めない)
                         conn.request_start = Instant::now();
                         push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
@@ -640,21 +750,36 @@ fn run_worker(
                         conn.send_offset += res as usize;
                         if conn.send_offset < target.request_bytes.len() {
                             push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
-                        } else {
-                            push_recv(&mut ring, conn_idx, conn)?;
+                        } else if !conn.recv_armed {
+                            // ENOBUFS 等で multishot が終了していた場合の再投入
+                            push_recv_multi(&mut ring, conn_idx, conn)?;
                         }
                     }
                 }
                 OP_RECV => {
                     let conn = &mut conns[conn_idx];
-                    // mut_buf で確保した未確定領域を確定 (エラー/EOF 時は破棄)
-                    conn.decoder
-                        .advance_buf(if res > 0 { res as usize } else { 0 });
+                    // MORE フラグの落ちた CQE でこの multishot recv は終了している
+                    if !cqueue::more(flags) {
+                        conn.recv_armed = false;
+                    }
                     if res < 0 {
-                        stats.errors += 1;
-                        request_finished = true;
-                        keep_conn = false;
+                        // 万一バッファが付いていたら返却する
+                        if let Some(bid) = cqueue::buffer_select(flags) {
+                            buf_ring.recycle(bid);
+                        }
+                        if res == -libc::ENOBUFS {
+                            // バッファ枯渇で multishot が止まっただけ。
+                            // このバッチの処理でバッファは返却されるので再投入する
+                            push_recv_multi(&mut ring, conn_idx, conn)?;
+                        } else {
+                            stats.errors += 1;
+                            request_finished = true;
+                            keep_conn = false;
+                        }
                     } else if res == 0 {
+                        if let Some(bid) = cqueue::buffer_select(flags) {
+                            buf_ring.recycle(bid);
+                        }
                         // EOF: close-delimited ボディなら正常完了
                         // (is_close_delimited はヘッダーデコード済みを含意する)
                         if conn.decoder.is_close_delimited() {
@@ -670,28 +795,31 @@ fn run_worker(
                         keep_conn = false;
                     } else {
                         stats.bytes_received += res as u64;
-                        // 枠を使い切った = まだ受信データが残っている可能性が高い
-                        if res as usize == conn.last_recv_len {
-                            conn.recv_window = (conn.recv_window * 2).min(RECV_WINDOW_MAX);
-                        }
-                        match conn.parse() {
-                            Ok(ParseOutcome::Complete { keep_alive }) => {
-                                stats.record_success(conn);
-                                request_finished = true;
-                                keep_conn = keep_alive;
-                            }
-                            Ok(ParseOutcome::NeedMoreData) => {
-                                if let Err(e) = push_recv(&mut ring, conn_idx, conn) {
-                                    eprintln!("recv setup failed: {e}");
+                        let bid = cqueue::buffer_select(flags)
+                            .context("recv CQE without buffer id")?;
+                        let feed_result = conn.decoder.feed(buf_ring.data(bid, res as usize));
+                        buf_ring.recycle(bid);
+                        if feed_result.is_err() {
+                            stats.errors += 1;
+                            request_finished = true;
+                            keep_conn = false;
+                        } else {
+                            match conn.parse() {
+                                Ok(ParseOutcome::Complete { keep_alive }) => {
+                                    stats.record_success(conn);
+                                    request_finished = true;
+                                    keep_conn = keep_alive;
+                                }
+                                Ok(ParseOutcome::NeedMoreData) => {
+                                    if !conn.recv_armed {
+                                        push_recv_multi(&mut ring, conn_idx, conn)?;
+                                    }
+                                }
+                                Err(_) => {
                                     stats.errors += 1;
                                     request_finished = true;
                                     keep_conn = false;
                                 }
-                            }
-                            Err(_) => {
-                                stats.errors += 1;
-                                request_finished = true;
-                                keep_conn = false;
                             }
                         }
                     }
@@ -705,6 +833,9 @@ fn run_worker(
                     started += 1;
                     conn.begin_request();
                     if keep_conn && conn.connected {
+                        if !conn.recv_armed {
+                            push_recv_multi(&mut ring, conn_idx, conn)?;
+                        }
                         push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
                     } else {
                         conn.close();
