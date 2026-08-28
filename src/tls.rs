@@ -94,17 +94,23 @@ impl TlsSession {
     }
 
     /// Feed ciphertext received from the socket and process it
-    pub fn feed(&mut self, mut data: &[u8]) -> Result<()> {
+    ///
+    /// Returns the number of decrypted plaintext bytes now available via
+    /// [`read_plaintext`](Self::read_plaintext).
+    pub fn feed(&mut self, mut data: &[u8]) -> Result<usize> {
+        let mut available = 0;
         while !data.is_empty() {
             let n = self.conn.read_tls(&mut data).context("read_tls failed")?;
             if n == 0 {
                 break;
             }
-            self.conn
+            let state = self
+                .conn
                 .process_new_packets()
                 .map_err(|e| anyhow::anyhow!("TLS error: {e}"))?;
+            available = state.plaintext_bytes_to_read();
         }
-        Ok(())
+        Ok(available)
     }
 
     /// Read decrypted plaintext into buf; Ok(0) means none is available

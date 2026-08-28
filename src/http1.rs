@@ -311,8 +311,6 @@ pub fn run_worker(
     }
 
     let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
-    // Reusable buffer for decrypted plaintext (TLS mode)
-    let mut scratch = vec![0u8; 64 * 1024];
     let mut stop = false;
 
     'outer: loop {
@@ -456,23 +454,34 @@ pub fn run_worker(
                         stats.bytes_received += res as u64;
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
-                        // In TLS mode decrypt into scratch and feed the
-                        // plaintext; otherwise feed the socket bytes directly
+                        // In TLS mode decrypt straight into the decoder's
+                        // internal buffer via mut_buf/advance_buf (no
+                        // intermediate copy); otherwise feed the socket bytes
+                        // directly
                         let feed_result: Result<()> = match &mut conn.tls {
-                            Some(tls) => {
-                                tls.feed(buf_ring.data(bid, res as usize)).and_then(|_| {
-                                    loop {
-                                        let n = tls.read_plaintext(&mut scratch)?;
+                            Some(tls) => tls.feed(buf_ring.data(bid, res as usize)).and_then(
+                                |mut available| {
+                                    while available > 0 {
+                                        let len = available.min(conn.decoder.available_buf());
+                                        if len == 0 {
+                                            anyhow::bail!(
+                                                "decoder buffer full (response headers too large?)"
+                                            );
+                                        }
+                                        let buf = conn
+                                            .decoder
+                                            .mut_buf(len)
+                                            .map_err(|e| anyhow::anyhow!("mut_buf: {e:?}"))?;
+                                        let n = tls.read_plaintext(buf)?;
+                                        conn.decoder.advance_buf(n);
                                         if n == 0 {
                                             break;
                                         }
-                                        conn.decoder
-                                            .feed(&scratch[..n])
-                                            .map_err(|e| anyhow::anyhow!("decode feed: {e:?}"))?;
+                                        available -= n;
                                     }
                                     Ok(())
-                                })
-                            }
+                                },
+                            ),
                             None => conn
                                 .decoder
                                 .feed(buf_ring.data(bid, res as usize))
