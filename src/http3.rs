@@ -19,7 +19,7 @@ use quinn_proto::{
     ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event as QuicEvent, ReadError,
     StreamEvent, StreamId, VarInt, WriteError,
 };
-use shiguredo_http3::{ClientConnection, Event as H3Event, Header};
+use shiguredo_http3::{ClientConnection, Event as H3Event, Header, Settings};
 
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
@@ -29,8 +29,57 @@ use crate::uring::{self, BUF_GROUP, CONN_IDX_BITS, OP_RECV, OP_SEND, TIMEOUT_USE
 /// Receive windows, matching the h2 worker's h2load-style sizing
 const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
 
-/// Floor for the wait timeout so an imminent QUIC timer cannot busy-spin us
-const MIN_WAIT: Duration = Duration::from_millis(1);
+/// UDP_SEGMENT socket option (missing from libc for linux-gnu)
+const UDP_SEGMENT: libc::c_int = 103;
+
+/// Max segments per UDP GSO send (kernel limit is 64)
+const GSO_SEGMENTS: usize = 64;
+
+/// Advertise a QPACK dynamic table so the server can index repeated response
+/// headers instead of Huffman-encoding full literals on every response
+/// (measured ~20% of client CPU without it)
+fn make_h3_settings() -> Settings {
+    let mut settings = Settings::new();
+    settings.qpack_max_table_capacity =
+        Some(shiguredo_http3::VarInt::new(4096).expect("valid varint"));
+    settings.qpack_blocked_streams = Some(shiguredo_http3::VarInt::new(128).expect("valid varint"));
+    settings
+}
+
+/// One outgoing UDP send: either a single datagram (segment_size == 0) or a
+/// GSO batch of equally sized segments with a shorter tail
+struct Datagram {
+    buf: Vec<u8>,
+    segment_size: usize,
+}
+
+/// Pinned storage for a sendmsg SQE (msghdr + iovec + GSO cmsg); must stay at
+/// a stable address while the SQE is in flight
+#[repr(C)]
+struct MsgState {
+    iov: libc::iovec,
+    msg: libc::msghdr,
+    cmsg: [u8; 64],
+}
+
+/// Whether the kernel supports UDP GSO (UDP_SEGMENT)
+fn probe_gso(addr: &std::net::SocketAddr) -> bool {
+    let Ok(fd) = uring::make_udp_socket(addr) else {
+        return false;
+    };
+    let zero: libc::c_int = 0;
+    let ok = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_UDP,
+            UDP_SEGMENT,
+            &zero as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } == 0;
+    drop(unsafe { UdpSocket::from_raw_fd(fd) });
+    ok
+}
 
 fn build_request_headers(target: &Target) -> Result<Vec<Header>> {
     Ok(vec![
@@ -83,7 +132,9 @@ struct Conn {
     /// GOAWAY received: no new streams on this connection
     goaway: bool,
     /// Outgoing datagrams; the front one is in flight while `sending`
-    out_queue: VecDeque<Vec<u8>>,
+    out_queue: VecDeque<Datagram>,
+    /// Pinned sendmsg bookkeeping for GSO sends
+    msg_state: Box<MsgState>,
     sending: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
@@ -104,6 +155,7 @@ impl Conn {
             h3_ready: false,
             goaway: false,
             out_queue: VecDeque::new(),
+            msg_state: Box::new(unsafe { std::mem::zeroed() }),
             sending: false,
             recv_armed: false,
             generation: 0,
@@ -268,6 +320,47 @@ fn fill_streams(
     Ok(())
 }
 
+/// Submit the front of the send queue (plain send, or sendmsg with a GSO
+/// cmsg for multi-segment batches)
+fn push_front_send(
+    submitter: &io_uring::Submitter<'_>,
+    sq: &mut io_uring::squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+) -> Result<()> {
+    let Some(front) = conn.out_queue.front() else {
+        return Ok(());
+    };
+    conn.sending = true;
+    if front.segment_size > 0 {
+        unsafe {
+            let state = &mut *conn.msg_state;
+            state.iov.iov_base = front.buf.as_ptr() as *mut libc::c_void;
+            state.iov.iov_len = front.buf.len();
+            state.msg = std::mem::zeroed();
+            state.msg.msg_iov = &mut state.iov;
+            state.msg.msg_iovlen = 1;
+            state.msg.msg_control = state.cmsg.as_mut_ptr() as *mut libc::c_void;
+            state.msg.msg_controllen = libc::CMSG_SPACE(2) as usize;
+            let cmsg = libc::CMSG_FIRSTHDR(&state.msg);
+            (*cmsg).cmsg_level = libc::SOL_UDP;
+            (*cmsg).cmsg_type = UDP_SEGMENT;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(2) as usize;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut u16, front.segment_size as u16);
+            let entry = io_uring::opcode::SendMsg::new(
+                io_uring::types::Fixed(conn_idx as u32),
+                &state.msg as *const libc::msghdr,
+            )
+            .build()
+            .user_data(uring::user_data(conn_idx, conn.generation, OP_SEND));
+            uring::push_sqe(submitter, sq, entry)?;
+        }
+    } else {
+        uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &front.buf)?;
+    }
+    Ok(())
+}
+
 /// Move pending QUIC datagrams into the send queue and start sending
 fn pump_transmits(
     submitter: &io_uring::Submitter<'_>,
@@ -276,23 +369,31 @@ fn pump_transmits(
     conn: &mut Conn,
     now: Instant,
     transmit_buf: &mut Vec<u8>,
+    gso: bool,
 ) -> Result<()> {
     if let Some(quic) = conn.quic.as_mut() {
+        let max_datagrams = if gso { GSO_SEGMENTS } else { 1 };
         loop {
             transmit_buf.clear();
-            match quic.poll_transmit(now, 1, transmit_buf) {
-                Some(transmit) => conn
-                    .out_queue
-                    .push_back(transmit_buf[..transmit.size].to_vec()),
+            match quic.poll_transmit(now, max_datagrams, transmit_buf) {
+                Some(transmit) => {
+                    // segment_size is only meaningful when the batch holds
+                    // more than one segment
+                    let segment_size = transmit
+                        .segment_size
+                        .filter(|s| transmit.size > *s)
+                        .unwrap_or(0);
+                    conn.out_queue.push_back(Datagram {
+                        buf: transmit_buf[..transmit.size].to_vec(),
+                        segment_size,
+                    });
+                }
                 None => break,
             }
         }
     }
-    if !conn.sending
-        && let Some(front) = conn.out_queue.front()
-    {
-        conn.sending = true;
-        uring::push_send_slice(submitter, sq, conn_idx, conn.generation, front)?;
+    if !conn.sending {
+        push_front_send(submitter, sq, conn_idx, conn)?;
     }
     Ok(())
 }
@@ -324,7 +425,7 @@ fn drive(
                 QuicEvent::Connected => {
                     // Set up the H3 control + QPACK streams; the client uni
                     // streams get ids 2, 6, 10 in open order
-                    let mut h3 = ClientConnection::with_default_settings();
+                    let mut h3 = ClientConnection::new(make_h3_settings());
                     let control = quic.streams().open(Dir::Uni).context("no uni stream")?;
                     let encoder = quic.streams().open(Dir::Uni).context("no uni stream")?;
                     let decoder = quic.streams().open(Dir::Uni).context("no uni stream")?;
@@ -384,8 +485,8 @@ fn drive(
             }
 
             // 3. H3 events: response progress and completions
-            for event in h3
-                .drain_events()
+            while let Some(event) = h3
+                .poll_event()
                 .map_err(|e| anyhow::anyhow!("h3 error: {e:?}"))?
             {
                 match event {
@@ -469,6 +570,7 @@ pub fn run_worker(
 
     let request_headers = build_request_headers(target)?;
     let quic_config = make_quic_client_config(connect_timeout)?;
+    let gso = probe_gso(&target.addr);
     let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
     // Declare buf_ring / conns before the ring (see the h1/h2 workers)
@@ -525,7 +627,7 @@ pub fn run_worker(
         conn.quic = Some(quic);
         uring::push_recv_multi(&submitter, &mut sq, i, conn.generation)?;
         conn.recv_armed = true;
-        pump_transmits(&submitter, &mut sq, i, conn, now, &mut transmit_buf)?;
+        pump_transmits(&submitter, &mut sq, i, conn, now, &mut transmit_buf, gso)?;
     }
 
     let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
@@ -550,7 +652,10 @@ pub fn run_worker(
                         quic.handle_timeout(now);
                         expired = true;
                     } else {
-                        wait = wait.min(deadline - now).max(MIN_WAIT);
+                        // Wait exactly until the nearest QUIC timer (often the
+                        // pacer, microseconds away): rounding it up would
+                        // quantize the pacing rate and stall the connection
+                        wait = wait.min(deadline - now);
                         break;
                     }
                 }
@@ -566,7 +671,15 @@ pub fn run_worker(
                     max_requests,
                     stop,
                 );
-                pump_transmits(&submitter, &mut sq, conn_idx, conn, now, &mut transmit_buf)?;
+                pump_transmits(
+                    &submitter,
+                    &mut sq,
+                    conn_idx,
+                    conn,
+                    now,
+                    &mut transmit_buf,
+                    gso,
+                )?;
                 if !alive {
                     handle_broken(
                         &mut endpoint,
@@ -581,6 +694,7 @@ pub fn run_worker(
                         max_requests,
                         stop,
                         &mut transmit_buf,
+                        gso,
                     )?;
                 }
             }
@@ -623,16 +737,7 @@ pub fn run_worker(
                     } else {
                         stats.bytes_sent += res as u64;
                         conn.out_queue.pop_front();
-                        if let Some(front) = conn.out_queue.front() {
-                            conn.sending = true;
-                            uring::push_send_slice(
-                                &submitter,
-                                &mut sq,
-                                conn_idx,
-                                conn.generation,
-                                front,
-                            )?;
-                        }
+                        push_front_send(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
                 OP_RECV => {
@@ -673,8 +778,10 @@ pub fn run_worker(
                                         }
                                     }
                                     Some(DatagramEvent::Response(transmit)) => {
-                                        conn.out_queue
-                                            .push_back(transmit_buf[..transmit.size].to_vec());
+                                        conn.out_queue.push_back(Datagram {
+                                            buf: transmit_buf[..transmit.size].to_vec(),
+                                            segment_size: 0,
+                                        });
                                     }
                                     Some(DatagramEvent::NewConnection(_)) | None => {}
                                 }
@@ -702,6 +809,7 @@ pub fn run_worker(
                             conn,
                             now,
                             &mut transmit_buf,
+                            gso,
                         )?;
                         if !alive {
                             conn_broken = true;
@@ -726,6 +834,7 @@ pub fn run_worker(
                     max_requests,
                     stop,
                     &mut transmit_buf,
+                    gso,
                 )?;
             }
         }
@@ -777,6 +886,7 @@ fn handle_broken(
     max_requests: u64,
     stop: bool,
     transmit_buf: &mut Vec<u8>,
+    gso: bool,
 ) -> Result<()> {
     if conn.h3_ready {
         conn.fail_inflight(stats);
@@ -803,7 +913,7 @@ fn handle_broken(
     conn.quic = Some(quic);
     uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
     conn.recv_armed = true;
-    pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf)?;
+    pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
 
