@@ -705,17 +705,17 @@ fn run_worker(
     }
 
     // 初回リクエスト投入 (接続確立も io_uring 経由の非同期 connect)
-    for i in 0..conns.len() {
+    for (i, conn) in conns.iter_mut().enumerate() {
         if started >= max_requests {
             break;
         }
         started += 1;
-        conns[i].begin_request();
+        conn.begin_request();
         start_connect(
             &submitter,
             &mut sq,
             i,
-            &mut conns[i],
+            conn,
             &target.addr,
             &raw_addr,
             &connect_timeout,
