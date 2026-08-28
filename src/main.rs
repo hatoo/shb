@@ -455,6 +455,7 @@ struct Stats {
     errors: u64,
     connect_errors: u64,
     bytes_received: u64,
+    bytes_sent: u64,
     latencies_ns: Vec<u64>,
     status_counts: Box<[u64; 600]>,
 }
@@ -466,6 +467,7 @@ impl Default for Stats {
             errors: 0,
             connect_errors: 0,
             bytes_received: 0,
+            bytes_sent: 0,
             latencies_ns: Vec::new(),
             status_counts: Box::new([0u64; 600]),
         }
@@ -487,6 +489,7 @@ impl Stats {
         self.errors += other.errors;
         self.connect_errors += other.connect_errors;
         self.bytes_received += other.bytes_received;
+        self.bytes_sent += other.bytes_sent;
         self.latencies_ns.extend(other.latencies_ns);
         for (a, b) in self
             .status_counts
@@ -749,6 +752,7 @@ fn run_worker(
                         request_finished = true;
                         keep_conn = false;
                     } else {
+                        stats.bytes_sent += res as u64;
                         let conn = &mut conns[conn_idx];
                         conn.send_offset += res as usize;
                         if conn.send_offset < target.request_bytes.len() {
@@ -916,9 +920,11 @@ fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) {
     );
     println!("Requests/sec: {:.1}", stats.completed as f64 / secs);
     println!(
-        "Transfer:     {:.2} MB/s ({} bytes total)",
+        "Transfer:     recv {:.2} MB/s ({} bytes), sent {:.2} MB/s ({} bytes)",
         stats.bytes_received as f64 / secs / (1024.0 * 1024.0),
-        stats.bytes_received
+        stats.bytes_received,
+        stats.bytes_sent as f64 / secs / (1024.0 * 1024.0),
+        stats.bytes_sent
     );
 
     let lines: Vec<String> = stats
@@ -981,7 +987,9 @@ fn print_json_report(args: &Args, threads: usize, stats: &Stats, elapsed: Durati
         },
         "requestsPerSec": stats.completed as f64 / secs,
         "bytesReceived": stats.bytes_received,
-        "bytesPerSec": stats.bytes_received as f64 / secs,
+        "bytesReceivedPerSec": stats.bytes_received as f64 / secs,
+        "bytesSent": stats.bytes_sent,
+        "bytesSentPerSec": stats.bytes_sent as f64 / secs,
         "statusCodes": status_codes,
         "latencySeconds": latency,
     });
