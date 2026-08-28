@@ -155,7 +155,19 @@ impl Conn {
 }
 
 /// Queue the request bytes for sending on this connection
-fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
+///
+/// For HEAD the decoder must be told the request method: the response has
+/// headers only, regardless of Content-Length (RFC 9112 Section 6.3). The
+/// decoder clears the method at each message boundary, so set it per request.
+fn queue_request(conn: &mut Conn, request: &[u8], is_head: bool) -> Result<()> {
+    if is_head {
+        // The decoder clears request_method during its lazy Complete ->
+        // StartLine transition, which would wipe a method set before it.
+        // Force the transition now (a no-op on an empty buffer), then set
+        // the method for the upcoming response
+        let _ = conn.decoder.decode_headers();
+        conn.decoder.set_request_method("HEAD");
+    }
     match &mut conn.tls {
         Some(tls) => tls.write_plaintext(request),
         None => {
@@ -235,6 +247,8 @@ pub fn run_worker(
             1u64 << CONN_IDX_BITS
         );
     }
+
+    let is_head = target.method == "HEAD";
 
     // Declare buf_ring / conns before the ring. Reverse drop order then
     // destroys the ring first (its teardown waits for in-flight operations to
@@ -372,7 +386,7 @@ pub fn run_worker(
                         // connect; the first request on a TLS connection does
                         // include the handshake)
                         conn.request_start = Instant::now();
-                        queue_request(conn, &target.request_bytes)?;
+                        queue_request(conn, &target.request_bytes, is_head)?;
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
@@ -528,7 +542,7 @@ pub fn run_worker(
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
-                        queue_request(conn, &target.request_bytes)?;
+                        queue_request(conn, &target.request_bytes, is_head)?;
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     } else {
                         conn.close();

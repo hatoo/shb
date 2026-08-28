@@ -50,10 +50,11 @@ fn build_request_headers(target: &Target) -> Vec<HeaderField> {
     let authority: &'static [u8] =
         Box::leak(target.authority.clone().into_bytes().into_boxed_slice());
     let path: &'static [u8] = Box::leak(target.path.clone().into_bytes().into_boxed_slice());
+    let method: &'static [u8] = Box::leak(target.method.clone().into_bytes().into_boxed_slice());
     let scheme: &'static [u8] = if target.tls { b"https" } else { b"http" };
 
     vec![
-        HeaderField::from_static(b":method", b"GET"),
+        HeaderField::from_static(b":method", method),
         HeaderField::from_static(b":scheme", scheme),
         HeaderField::from_static(b":authority", authority),
         HeaderField::from_static(b":path", path),
@@ -656,4 +657,36 @@ pub fn run_worker(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::parse_target;
+
+    fn header_value<'a>(headers: &'a [HeaderField], name: &[u8]) -> &'a [u8] {
+        headers
+            .iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.value())
+            .expect("header must exist")
+    }
+
+    #[test]
+    fn request_headers_reflect_the_target() {
+        let target = parse_target("https://127.0.0.1:3443/abc?q=1", "DELETE").unwrap();
+        let headers = build_request_headers(&target);
+        assert_eq!(header_value(&headers, b":method"), b"DELETE");
+        assert_eq!(header_value(&headers, b":scheme"), b"https");
+        assert_eq!(header_value(&headers, b":authority"), b"127.0.0.1:3443");
+        assert_eq!(header_value(&headers, b":path"), b"/abc?q=1");
+    }
+
+    #[test]
+    fn plain_http_uses_the_http_scheme() {
+        let target = parse_target("http://127.0.0.1/", "GET").unwrap();
+        let headers = build_request_headers(&target);
+        assert_eq!(header_value(&headers, b":scheme"), b"http");
+        assert_eq!(header_value(&headers, b":method"), b"GET");
+    }
 }

@@ -41,6 +41,10 @@ pub struct Args {
     #[arg(short = 'z', long, value_parser = humantime::parse_duration)]
     pub duration: Option<Duration>,
 
+    /// HTTP method
+    #[arg(short = 'm', long, default_value = "GET")]
+    pub method: String,
+
     /// Connection establishment timeout (e.g. 5s, 500ms)
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     pub connect_timeout: Duration,
@@ -79,7 +83,7 @@ fn default_threads() -> usize {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let target = parse_target(&args.url)?;
+    let target = parse_target(&args.url, &args.method)?;
 
     // Print the report even when interrupted with Ctrl-C: the handler sets a
     // flag, workers notice it within ~100ms and return their stats normally
