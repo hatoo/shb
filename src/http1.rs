@@ -1,109 +1,147 @@
-use std::net::SocketAddr;
+//! HTTP/1.1 benchmark worker
+
+use std::net::TcpStream;
+use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use io_uring::{IoUring, Submitter, cqueue, opcode, squeue, types};
+use io_uring::{Submitter, cqueue, squeue, types};
+use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, ResponseDecoder};
 
 use crate::buf_ring::BufRing;
-use crate::conn::{Conn, ParseOutcome, make_socket};
 use crate::stats::Stats;
 use crate::target::Target;
+use crate::uring::{
+    self, BUF_GROUP, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND,
+    TIMEOUT_USER_DATA,
+};
 
-/// Buffer group ID of the provided buffer ring (one per worker)
-const BUF_GROUP: u16 = 0;
-const TIMEOUT_USER_DATA: u64 = u64::MAX;
-
-// user_data layout: low 2 bits are the operation kind, the next CONN_IDX_BITS
-// bits are the connection index, and the rest is the reconnect generation
-const OP_SEND: u64 = 0;
-const OP_RECV: u64 = 1;
-const OP_CONNECT: u64 = 2;
-const OP_CONNECT_TIMEOUT: u64 = 3;
-const CONN_IDX_BITS: u64 = 20;
-
-fn user_data(conn_idx: usize, generation: u64, op: u64) -> u64 {
-    (generation << (2 + CONN_IDX_BITS)) | ((conn_idx as u64) << 2) | op
+/// Progress of receiving a response
+enum ParseOutcome {
+    /// One response completed; keep_alive is true if the connection can be reused
+    Complete { keep_alive: bool },
+    /// Not enough data; keep receiving
+    NeedMoreData,
 }
 
-fn push_sqe(
-    submitter: &Submitter<'_>,
-    sq: &mut squeue::SubmissionQueue<'_>,
-    entry: squeue::Entry,
-) -> Result<()> {
-    unsafe {
-        if sq.push(&entry).is_err() {
-            // Publish the tail, let the kernel consume, refresh the head, retry
-            sq.sync();
-            submitter.submit().context("io_uring submit failed")?;
-            sq.sync();
-            sq.push(&entry)
-                .map_err(|_| anyhow::anyhow!("submission queue full after submit"))?;
+/// Metadata of the current response, extracted from the decoded headers
+///
+/// The ResponseHead is consumed by decode_headers, so keep only the values
+/// needed until the response completes.
+struct ResponseMeta {
+    body_kind: BodyKind,
+    keep_alive: bool,
+    /// Status code (tallied on completion)
+    status_code: u16,
+}
+
+struct Conn {
+    fd: RawFd,
+    /// Whether the TCP connection is established (true after a successful Connect CQE)
+    connected: bool,
+    decoder: ResponseDecoder,
+    /// Resume position for partial sends
+    send_offset: usize,
+    /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
+    recv_armed: bool,
+    /// Reconnect generation. Incremented on every close; CQEs from an old
+    /// generation (e.g. a cancelled multishot recv) are identified via
+    /// user_data and ignored
+    generation: u64,
+    /// Metadata of the current response (None = headers not decoded yet)
+    resp: Option<ResponseMeta>,
+    request_start: Instant,
+}
+
+impl Conn {
+    fn new() -> Self {
+        Conn {
+            fd: -1,
+            connected: false,
+            decoder: ResponseDecoder::new(),
+            send_offset: 0,
+            recv_armed: false,
+            generation: 0,
+            resp: None,
+            request_start: Instant::now(),
         }
     }
-    Ok(())
-}
 
-/// Push two linked SQEs within a single submission
-///
-/// An IOSQE_IO_LINK chain must not cross a submission boundary, so submit
-/// first to make room when fewer than 2 slots are free.
-fn push_sqe_pair(
-    submitter: &Submitter<'_>,
-    sq: &mut squeue::SubmissionQueue<'_>,
-    first: squeue::Entry,
-    second: squeue::Entry,
-) -> Result<()> {
-    unsafe {
-        if sq.capacity() - sq.len() < 2 {
-            sq.sync();
-            submitter.submit().context("io_uring submit failed")?;
-            sq.sync();
+    fn close(&mut self) {
+        if self.fd >= 0 {
+            // Close by turning the fd back into a TcpStream and dropping it
+            drop(unsafe { TcpStream::from_raw_fd(self.fd) });
+            self.fd = -1;
         }
-        sq.push(&first)
-            .map_err(|_| anyhow::anyhow!("submission queue full"))?;
-        sq.push(&second)
-            .map_err(|_| anyhow::anyhow!("submission queue full"))?;
+        self.connected = false;
+        self.recv_armed = false;
+        // Bump the generation so CQEs of operations on the old connection are ignored
+        self.generation += 1;
     }
-    Ok(())
+
+    /// Advance the decoder state machine after feeding received data
+    fn parse(&mut self) -> Result<ParseOutcome> {
+        let meta = match &self.resp {
+            Some(meta) => meta,
+            None => match self
+                .decoder
+                .decode_headers()
+                .map_err(|e| anyhow::anyhow!("decode error: {e:?}"))?
+            {
+                None => return Ok(ParseOutcome::NeedMoreData),
+                Some((head, body_kind)) => &*self.resp.insert(ResponseMeta {
+                    body_kind,
+                    // A close-delimited body ends with the connection closing,
+                    // so keep-alive is impossible regardless of the Connection header
+                    keep_alive: head.is_keep_alive()
+                        && !matches!(body_kind, BodyKind::CloseDelimited),
+                    status_code: head.status_code(),
+                }),
+            },
+        };
+
+        match meta.body_kind {
+            BodyKind::None => Ok(ParseOutcome::Complete {
+                keep_alive: meta.keep_alive,
+            }),
+            BodyKind::Tunnel => bail!("unexpected tunnel response"),
+            _ => {
+                let keep_alive = meta.keep_alive;
+                loop {
+                    let progress = if let Some(body) = self.decoder.peek_body() {
+                        let len = body.len();
+                        self.decoder
+                            .consume_body(len)
+                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
+                    } else {
+                        self.decoder
+                            .progress()
+                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
+                    };
+                    match progress {
+                        BodyProgress::Complete { .. } => {
+                            return Ok(ParseOutcome::Complete { keep_alive });
+                        }
+                        BodyProgress::Advanced => continue,
+                        BodyProgress::NeedData => return Ok(ParseOutcome::NeedMoreData),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reset per-request state for the next request
+    fn begin_request(&mut self) {
+        self.send_offset = 0;
+        self.resp = None;
+        self.request_start = Instant::now();
+    }
+
+    fn status_code(&self) -> u16 {
+        self.resp.as_ref().map_or(0, |m| m.status_code)
+    }
 }
 
-/// Start an async connect (a Connect SQE + a LinkTimeout as the connect timeout)
-///
-/// The created fd is registered into the fixed file slot of the connection
-/// index; all subsequent SQEs refer to it as `types::Fixed(conn_idx)`.
-fn start_connect(
-    submitter: &Submitter<'_>,
-    sq: &mut squeue::SubmissionQueue<'_>,
-    conn_idx: usize,
-    conn: &mut Conn,
-    addr: &SocketAddr,
-    raw_addr: &socket2::SockAddr,
-    timeout: &types::Timespec,
-) -> Result<()> {
-    conn.fd = make_socket(addr)?;
-    // Overwriting the slot also releases the registered reference to the old fd
-    submitter
-        .register_files_update(conn_idx as u32, &[conn.fd])
-        .context("register_files_update failed")?;
-    let connect = opcode::Connect::new(
-        types::Fixed(conn_idx as u32),
-        raw_addr.as_ptr().cast::<libc::sockaddr>(),
-        raw_addr.len(),
-    )
-    .build()
-    .flags(squeue::Flags::IO_LINK)
-    .user_data(user_data(conn_idx, conn.generation, OP_CONNECT));
-    let link_timeout = opcode::LinkTimeout::new(timeout as *const types::Timespec)
-        .build()
-        .user_data(user_data(conn_idx, conn.generation, OP_CONNECT_TIMEOUT));
-    push_sqe_pair(submitter, sq, connect, link_timeout)
-}
-
-/// Send the request
-///
-/// Note: WriteFixed + a registered buffer was also tried, but the socket write
-/// path is slower than the send path and fixed buffers gain nothing for ~100B
-/// sends, measuring about 4% worse (2026-08). Keep using Send.
 fn push_send(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
@@ -111,38 +149,27 @@ fn push_send(
     conn: &Conn,
     request: &[u8],
 ) -> Result<()> {
-    let remaining = &request[conn.send_offset..];
-    let entry = opcode::Send::new(
-        types::Fixed(conn_idx as u32),
-        remaining.as_ptr(),
-        remaining.len() as u32,
+    uring::push_send_slice(
+        submitter,
+        sq,
+        conn_idx,
+        conn.generation,
+        &request[conn.send_offset..],
     )
-    .build()
-    .user_data(user_data(conn_idx, conn.generation, OP_SEND));
-    push_sqe(submitter, sq, entry)
 }
 
-/// Arm a multishot recv
-///
-/// A single submission keeps delivering a CQE per receive while the MORE flag
-/// stays set, so no per-response Recv SQE is needed. The kernel picks receive
-/// buffers from the provided buffer ring and reports the buffer ID in the CQE
-/// flags.
 fn push_recv_multi(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
     conn_idx: usize,
     conn: &mut Conn,
 ) -> Result<()> {
-    let entry = opcode::RecvMulti::new(types::Fixed(conn_idx as u32), BUF_GROUP)
-        .build()
-        .user_data(user_data(conn_idx, conn.generation, OP_RECV));
-    push_sqe(submitter, sq, entry)?;
+    uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
     conn.recv_armed = true;
     Ok(())
 }
 
-/// Benchmark loop of a single worker thread
+/// Benchmark loop of a single HTTP/1.1 worker thread
 ///
 /// Owns a dedicated io_uring and set of connections; shares no state with
 /// other threads.
@@ -175,23 +202,7 @@ pub fn run_worker(
     }
 
     let entries = (connections * 2).next_power_of_two().max(256) as u32;
-    // SINGLE_ISSUER: promise the kernel that only this thread touches the ring
-    // COOP_TASKRUN / DEFER_TASKRUN: run socket-completion task work in batches
-    // at io_uring_enter instead of interrupting at arbitrary times (kernel 6.1+)
-    // NO_SQARRAY: drop the SQ indirection array (kernel 6.6+)
-    // CQSIZE: avoid CQ overflow from bursts of multishot recv CQEs
-    let mut ring = IoUring::builder()
-        .setup_single_issuer()
-        .setup_coop_taskrun()
-        .setup_defer_taskrun()
-        .setup_no_sqarray()
-        .setup_cqsize(entries * 4)
-        .build(entries)
-        .or_else(|_| {
-            // Fallback for older kernels
-            IoUring::new(entries)
-        })
-        .context("failed to create io_uring")?;
+    let mut ring = uring::build_ring(entries)?;
 
     // Keep the Submitter alive so enter can use the registered ring fd
     // (submitter/sq/cq are disjoint borrows of the ring; the ring itself is
@@ -229,10 +240,10 @@ pub fn run_worker(
     // Duration mode: the deadline is detected solely via the io_uring Timeout CQE
     let timespec = duration_limit.map(|d| Box::new(types::Timespec::from(d)));
     if let Some(ts) = &timespec {
-        let entry = opcode::Timeout::new(&**ts as *const types::Timespec)
+        let entry = io_uring::opcode::Timeout::new(&**ts as *const types::Timespec)
             .build()
             .user_data(TIMEOUT_USER_DATA);
-        push_sqe(&submitter, &mut sq, entry)?;
+        uring::push_sqe(&submitter, &mut sq, entry)?;
     }
 
     // Kick off the initial requests (connection setup is async via io_uring too)
@@ -242,11 +253,11 @@ pub fn run_worker(
         }
         started += 1;
         conn.begin_request();
-        start_connect(
+        conn.fd = uring::start_connect(
             &submitter,
             &mut sq,
             i,
-            conn,
+            conn.generation,
             &target.addr,
             &raw_addr,
             &connect_timeout,
@@ -279,9 +290,7 @@ pub fn run_worker(
                 stop = true;
                 continue;
             }
-            let op = ud & 0b11;
-            let conn_idx = ((ud >> 2) & ((1 << CONN_IDX_BITS) - 1)) as usize;
-            let generation = ud >> (2 + CONN_IDX_BITS);
+            let (op, conn_idx, generation) = uring::decode_user_data(ud);
 
             // Ignore CQEs of operations from an old generation (a closed
             // connection). If an old multishot recv completed with a buffer
@@ -367,7 +376,9 @@ pub fn run_worker(
                         if conn.decoder.is_close_delimited() {
                             conn.decoder.mark_eof();
                             match conn.parse() {
-                                Ok(ParseOutcome::Complete { .. }) => stats.record_success(conn),
+                                Ok(ParseOutcome::Complete { .. }) => {
+                                    stats.record_success(conn.status_code(), conn.request_start);
+                                }
                                 _ => stats.errors += 1,
                             }
                         } else {
@@ -388,7 +399,7 @@ pub fn run_worker(
                         } else {
                             match conn.parse() {
                                 Ok(ParseOutcome::Complete { keep_alive }) => {
-                                    stats.record_success(conn);
+                                    stats.record_success(conn.status_code(), conn.request_start);
                                     request_finished = true;
                                     keep_conn = keep_alive;
                                 }
@@ -422,17 +433,20 @@ pub fn run_worker(
                     } else {
                         conn.close();
                         conn.decoder.reset();
-                        if let Err(e) = start_connect(
+                        match uring::start_connect(
                             &submitter,
                             &mut sq,
                             conn_idx,
-                            conn,
+                            conn.generation,
                             &target.addr,
                             &raw_addr,
                             &connect_timeout,
                         ) {
-                            eprintln!("reconnect failed: {e}");
-                            break 'outer;
+                            Ok(fd) => conn.fd = fd,
+                            Err(e) => {
+                                eprintln!("reconnect failed: {e}");
+                                break 'outer;
+                            }
                         }
                     }
                 } else if !keep_conn {

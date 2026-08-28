@@ -5,6 +5,12 @@ use shiguredo_http11::Request;
 
 pub struct Target {
     pub addr: SocketAddr,
+    /// Host part of the URL (with the port, when explicit); used for the
+    /// HTTP/1.1 Host header and the HTTP/2 :authority pseudo-header
+    pub authority: String,
+    /// Request path (with query); used for the HTTP/2 :path pseudo-header
+    pub path: String,
+    /// Pre-encoded HTTP/1.1 request
     pub request_bytes: Vec<u8>,
 }
 
@@ -51,6 +57,8 @@ pub fn parse_target(url: &str) -> Result<Target> {
 
     Ok(Target {
         addr,
+        authority: authority.to_string(),
+        path: path.to_string(),
         request_bytes,
     })
 }

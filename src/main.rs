@@ -1,9 +1,10 @@
 mod buf_ring;
-mod conn;
+mod http1;
+mod http2;
 mod report;
 mod stats;
 mod target;
-mod worker;
+mod uring;
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,6 @@ use clap::Parser;
 use crate::report::{print_json_report, print_report};
 use crate::stats::Stats;
 use crate::target::parse_target;
-use crate::worker::run_worker;
 
 #[derive(Parser)]
 #[command(name = "shb", about = "io_uring HTTP/1.1 benchmarker")]
@@ -44,6 +44,10 @@ pub struct Args {
     /// Print the report as JSON
     #[arg(short = 'j', long)]
     pub json: bool,
+
+    /// Use HTTP/2 (h2c with prior knowledge)
+    #[arg(long)]
+    pub http2: bool,
 }
 
 /// Default number of threads (number of CPUs)
@@ -80,6 +84,12 @@ fn main() -> Result<()> {
                     + u64::from((i as u64) < args.requests % threads as u64)
             })
             .collect()
+    };
+
+    let run_worker = if args.http2 {
+        http2::run_worker
+    } else {
+        http1::run_worker
     };
 
     let bench_start = Instant::now();

@@ -240,6 +240,7 @@ dependencies = [
  "libc",
  "serde_json",
  "shiguredo_http11",
+ "shiguredo_http2",
  "socket2",
 ]
 
@@ -248,6 +249,12 @@ name = "shiguredo_http11"
 version = "2026.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521929c2893005420ccee04aada685000c967cbcae36cd46117b40bf5495e5ab"
+
+[[package]]
+name = "shiguredo_http2"
+version = "2026.1.0-canary.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeefac9d28889b164475919a39a20cb0038902edfb7e8b83b8df5920fc75218c"
 
 [[package]]
 name = "socket2"

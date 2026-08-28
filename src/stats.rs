@@ -1,4 +1,4 @@
-use crate::conn::Conn;
+use std::time::Instant;
 
 pub struct Stats {
     pub completed: u64,
@@ -25,13 +25,13 @@ impl Default for Stats {
 }
 
 impl Stats {
-    pub fn record_success(&mut self, conn: &Conn) {
+    pub fn record_success(&mut self, status_code: u16, request_start: Instant) {
         self.completed += 1;
-        if let Some(meta) = &conn.resp {
-            self.status_counts[meta.status_code as usize] += 1;
+        if (status_code as usize) < self.status_counts.len() {
+            self.status_counts[status_code as usize] += 1;
         }
         self.latencies_ns
-            .push(conn.request_start.elapsed().as_nanos() as u64);
+            .push(request_start.elapsed().as_nanos() as u64);
     }
 
     pub fn merge(&mut self, other: Stats) {

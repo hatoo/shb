@@ -9,6 +9,10 @@ pub fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duratio
     let secs = elapsed.as_secs_f64();
     let total = stats.completed + stats.errors;
     println!("URL:          {}", args.url);
+    println!(
+        "Protocol:     {}",
+        if args.http2 { "HTTP/2" } else { "HTTP/1.1" }
+    );
     println!("Threads:      {threads}");
     println!("Connections:  {}", args.connections);
     println!(
@@ -78,6 +82,7 @@ pub fn print_json_report(
     });
     let report = serde_json::json!({
         "url": args.url,
+        "protocol": if args.http2 { "HTTP/2" } else { "HTTP/1.1" },
         "threads": threads,
         "connections": args.connections,
         "durationSeconds": secs,
