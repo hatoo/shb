@@ -45,7 +45,7 @@ pub fn parse_target(
     url: &str,
     method: &str,
     header_args: &[String],
-    body: Option<&str>,
+    body: Option<&[u8]>,
 ) -> Result<Target> {
     let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
@@ -115,7 +115,7 @@ pub fn parse_target(
         ));
     }
     let authority = host_override.unwrap_or_else(|| authority.to_string());
-    let body: Vec<u8> = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
+    let body: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
 
     // Validates the method as an RFC 9110 token; the HTTP/2 and HTTP/3
     // workers rely on this when building their :method pseudo-headers

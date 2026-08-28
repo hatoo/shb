@@ -473,3 +473,40 @@ fn h3_custom_header_and_body() {
     ]);
     assert_all_ok(&report, 20, "201");
 }
+
+#[test]
+fn h1_body_from_file() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("shb_body_{}.txt", std::process::id()));
+    std::fs::write(&path, b"filebody").expect("write body file");
+    let arg = format!("@{}", path.display());
+    let report = shb_json(&[
+        "-m", "POST", "-H", "X-Echo: filebody", "-d", &arg, "-n", "20", "-c", "2", "-t", "1", &url,
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_all_ok(&report, 20, "201");
+}
+
+#[test]
+fn h1_body_from_file_strips_newlines() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("shb_body_nl_{}.txt", std::process::id()));
+    // curl strips CR/LF from @file data, so the server should receive " abc"
+    std::fs::write(&path, b"a\r\nb\nc").expect("write body file");
+    let arg = format!("@{}", path.display());
+    let report = shb_json(&[
+        "-m", "POST", "-H", "X-Echo: abc", "-d", &arg, "-n", "10", "-c", "2", "-t", "1", &url,
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_all_ok(&report, 10, "201");
+}
+
+#[test]
+fn body_from_missing_file_is_rejected() {
+    let stderr = shb_fail(&["-d", "@/no/such/shb/file", "-n", "1", "http://127.0.0.1:9/"]);
+    assert!(stderr.contains("file"), "stderr: {stderr}");
+}

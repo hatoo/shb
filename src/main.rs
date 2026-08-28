@@ -11,7 +11,7 @@ mod uring;
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::report::{print_json_report, print_report};
@@ -49,7 +49,8 @@ pub struct Args {
     #[arg(short = 'H', long = "header", value_name = "HEADER")]
     pub headers: Vec<String>,
 
-    /// HTTP request body
+    /// HTTP request body. @file reads the file, @- reads stdin (like curl;
+    /// carriage returns and newlines are stripped from file/stdin data)
     #[arg(short = 'd', long = "data", value_name = "BODY")]
     pub body: Option<String>,
 
@@ -89,6 +90,30 @@ fn default_threads() -> usize {
     num_cpus::get_physical().max(1)
 }
 
+/// Resolve the -d value like curl: `@file` reads a file, `@-` reads stdin,
+/// anything else is the literal body. For `@` sources curl strips carriage
+/// returns and newlines, so we do the same.
+fn resolve_body(arg: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let Some(arg) = arg else {
+        return Ok(None);
+    };
+    let Some(source) = arg.strip_prefix('@') else {
+        return Ok(Some(arg.as_bytes().to_vec()));
+    };
+    let mut data = Vec::new();
+    if source == "-" {
+        std::io::stdin()
+            .read_to_end(&mut data)
+            .context("failed to read body from stdin")?;
+    } else {
+        data =
+            std::fs::read(source).with_context(|| format!("failed to read body file {source}"))?;
+    }
+    data.retain(|&b| b != b'\r' && b != b'\n');
+    Ok(Some(data))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // curl semantics: -d implies POST unless a method was given explicitly
@@ -96,7 +121,8 @@ fn main() -> Result<()> {
         .method
         .clone()
         .unwrap_or_else(|| if args.body.is_some() { "POST" } else { "GET" }.to_string());
-    let target = parse_target(&args.url, &method, &args.headers, args.body.as_deref())?;
+    let body = resolve_body(args.body.as_deref())?;
+    let target = parse_target(&args.url, &method, &args.headers, body.as_deref())?;
 
     // Print the report even when interrupted with Ctrl-C: the handler sets a
     // flag, workers notice it within ~100ms and return their stats normally
