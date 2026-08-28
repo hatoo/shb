@@ -25,19 +25,19 @@ pub struct Args {
     pub url: String,
 
     /// Number of concurrent connections
-    #[arg(short, long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(short, long, default_value_t = 50, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub connections: usize,
 
     /// Total number of requests
-    #[arg(short = 'n', long, default_value_t = 100_000)]
+    #[arg(short = 'n', long, default_value_t = 200, conflicts_with = "duration")]
     pub requests: u64,
 
     /// Run for this long instead of a fixed request count (e.g. 10s, 1m30s)
     #[arg(short = 'z', long, value_parser = humantime::parse_duration)]
     pub duration: Option<Duration>,
 
-    /// Connection establishment timeout (e.g. 3s, 500ms)
-    #[arg(long, default_value = "3s", value_parser = humantime::parse_duration)]
+    /// Connection establishment timeout (e.g. 5s, 500ms)
+    #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     pub connect_timeout: Duration,
 
     /// Number of worker threads
@@ -63,9 +63,9 @@ pub struct Args {
     pub parallel: usize,
 }
 
-/// Default number of threads (number of CPUs)
+/// Default number of threads (number of physical CPU cores)
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    num_cpus::get_physical().max(1)
 }
 
 fn main() -> Result<()> {
