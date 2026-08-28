@@ -42,6 +42,26 @@ pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
     Ok(socket.into_raw_fd())
 }
 
+/// Upper bound for a single submit_and_wait so workers notice a Ctrl-C
+/// shutdown request promptly even when completely idle. During active
+/// benchmarking CQEs arrive far more often, so this timeout almost never
+/// fires.
+const WAIT_TIMEOUT: types::Timespec = types::Timespec::new().nsec(100_000_000);
+
+/// Submit pending SQEs and wait for at least one CQE, bounded by
+/// [`WAIT_TIMEOUT`]
+///
+/// A timeout (ETIME) and a signal interruption (EINTR) both return Ok with no
+/// completions; the caller's loop then re-checks its stop conditions.
+pub fn submit_and_wait_timeout(submitter: &Submitter<'_>) -> Result<()> {
+    let args = types::SubmitArgs::new().timespec(&WAIT_TIMEOUT);
+    match submitter.submit_with_args(1, &args) {
+        Ok(_) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME) | Some(libc::EINTR)) => Ok(()),
+        Err(e) => Err(e).context("submit_and_wait failed"),
+    }
+}
+
 /// Re-arm TCP_QUICKACK so our ACKs go out immediately
 ///
 /// With many concurrent HTTP/2 streams the peer may have Nagle enabled and

@@ -2,6 +2,7 @@ mod buf_ring;
 mod http1;
 mod http2;
 mod report;
+mod shutdown;
 mod stats;
 mod target;
 mod uring;
@@ -68,6 +69,10 @@ fn default_threads() -> usize {
 fn main() -> Result<()> {
     let args = Args::parse();
     let target = parse_target(&args.url)?;
+
+    // Print the report even when interrupted with Ctrl-C: the handler sets a
+    // flag, workers notice it within ~100ms and return their stats normally
+    shutdown::install();
 
     let duration_limit = args.duration;
 

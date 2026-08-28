@@ -271,11 +271,12 @@ pub fn run_worker(
         if stats.completed + stats.errors >= max_requests {
             break;
         }
+        if crate::shutdown::requested() {
+            break;
+        }
         // Publish the tail of pushed SQEs before submitting
         sq.sync();
-        submitter
-            .submit_and_wait(1)
-            .context("submit_and_wait failed")?;
+        uring::submit_and_wait_timeout(&submitter)?;
 
         cq.sync();
         cqe_buf.clear();
