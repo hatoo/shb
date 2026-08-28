@@ -99,11 +99,25 @@ fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::Cli
         .context("rustls config not usable for QUIC (TLS 1.3 required)")?;
     let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
     let mut transport = quinn_proto::TransportConfig::default();
+    // Benchmark-friendly congestion behavior: a large initial window skips
+    // slow start (loopback/LAN loss is negligible)
+    let mut cubic = quinn_proto::congestion::CubicConfig::default();
+    cubic.initial_window(10 * 1024 * 1024);
+    // Allow MTU discovery to grow datagrams well past the Ethernet default;
+    // on loopback this greatly reduces per-packet costs for large bodies
+    let mut mtud = quinn_proto::MtuDiscoveryConfig::default();
+    mtud.upper_bound(65527);
     transport
         .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
         .stream_receive_window(VarInt::from_u32(RECEIVE_WINDOW))
         // Server push (server-initiated bidi streams) does not exist in HTTP/3
         .max_concurrent_bidi_streams(VarInt::from_u32(0))
+        .congestion_controller_factory(Arc::new(cubic))
+        .initial_mtu(1452)
+        .mtu_discovery_config(Some(mtud))
+        // The spec default of 333ms only matters before the first RTT sample,
+        // but a small value speeds up connection ramp-up on fast networks
+        .initial_rtt(Duration::from_millis(1))
         // Doubles as the connect timeout: a handshake that gets no response
         // dies when the idle timeout fires
         .max_idle_timeout(Some(

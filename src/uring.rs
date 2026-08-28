@@ -76,6 +76,10 @@ pub fn make_udp_socket(addr: &SocketAddr) -> Result<RawFd> {
         None,
     )
     .context("socket() failed")?;
+    // Large socket buffers absorb bursts (silently clamped to
+    // net.core.{r,w}mem_max); best effort
+    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
     socket
         .connect(&socket2::SockAddr::from(*addr))
         .context("UDP connect failed")?;
