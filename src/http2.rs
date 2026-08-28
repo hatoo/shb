@@ -17,11 +17,12 @@ use crate::uring::{
 };
 
 /// Stream-level receive window advertised via SETTINGS_INITIAL_WINDOW_SIZE.
-/// Large enough that per-stream WINDOW_UPDATEs are rare for typical bodies.
-const STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+/// Matches h2load's default of (1 << 30) - 1, effectively disabling
+/// flow-control stalls for responses up to 1GB.
+const STREAM_WINDOW: u32 = (1 << 30) - 1;
 /// Connection-level receive window advertised at connection setup.
-/// The slack absorbs replenishment inaccuracies (e.g. padded DATA frames).
-const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+/// Matches h2load's default of (1 << 30) - 1.
+const CONNECTION_WINDOW: u32 = (1 << 30) - 1;
 
 fn make_limits() -> Result<Limits> {
     Limits::builder()
@@ -53,6 +54,8 @@ struct InFlight {
     start: Instant,
     /// Status code from :status (0 = not received yet)
     status: u16,
+    /// Stream-level receive-window consumption not yet replenished
+    window_debt: usize,
 }
 
 struct Conn {
@@ -70,6 +73,8 @@ struct Conn {
     recv_armed: bool,
     /// GOAWAY received: no new streams, reconnect once in-flight streams drain
     goaway: bool,
+    /// Connection-level receive-window consumption not yet replenished
+    window_debt: usize,
     /// Reconnect generation. Incremented on every close; CQEs from an old
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
@@ -90,6 +95,7 @@ impl Conn {
             sending: false,
             recv_armed: false,
             goaway: false,
+            window_debt: 0,
             generation: 0,
             streams: Vec::new(),
         }
@@ -105,6 +111,7 @@ impl Conn {
         self.recv_armed = false;
         self.sending = false;
         self.goaway = false;
+        self.window_debt = 0;
         self.out.clear();
         self.out_off = 0;
         self.h2 = None;
@@ -146,6 +153,7 @@ fn fill_streams(
                     stream_id,
                     start: Instant::now(),
                     status: 0,
+                    window_debt: 0,
                 });
                 *started += 1;
             }
@@ -184,9 +192,6 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
         return false;
     };
     let mut alive = true;
-    // Bytes counted against the connection-level receive window that we must
-    // hand back via WINDOW_UPDATE
-    let mut conn_consumed: usize = 0;
     while let Some(event) = h2.poll_event() {
         match event {
             Event::HeadersReceived {
@@ -215,15 +220,20 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
                 data,
                 end_stream,
             } => {
-                conn_consumed += data.len();
+                conn.window_debt += data.len();
                 if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
                     if end_stream {
                         let inflight = conn.streams.swap_remove(pos);
                         stats.record_success(inflight.status, inflight.start);
-                    } else if !data.is_empty() {
-                        // Replenish the stream-level window; best effort, the
-                        // stream may already be gone
-                        let _ = h2.send_window_update(stream_id, data.len() as u32);
+                    } else {
+                        // Replenish the stream-level window once half of it
+                        // has been consumed (like nghttp2's auto updates)
+                        let inflight = &mut conn.streams[pos];
+                        inflight.window_debt += data.len();
+                        if inflight.window_debt >= (STREAM_WINDOW / 2) as usize {
+                            let _ = h2.send_window_update(stream_id, inflight.window_debt as u32);
+                            inflight.window_debt = 0;
+                        }
                     }
                 }
             }
@@ -232,7 +242,7 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
                 connection_window_consumed,
                 ..
             } => {
-                conn_consumed += connection_window_consumed;
+                conn.window_debt += connection_window_consumed;
                 if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
                     conn.streams.swap_remove(pos);
                     stats.errors += 1;
@@ -242,7 +252,7 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
                 connection_window_consumed,
                 ..
             } => {
-                conn_consumed += connection_window_consumed;
+                conn.window_debt += connection_window_consumed;
             }
             Event::GoawayReceived { .. } => {
                 conn.goaway = true;
@@ -253,9 +263,11 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
             _ => {}
         }
     }
-    // Replenish the connection-level window in one batch
-    if conn_consumed > 0 {
-        let _ = h2.send_window_update(StreamId::Connection, conn_consumed as u32);
+    // Replenish the connection-level window once half of it has been consumed
+    // (like nghttp2's auto updates)
+    if conn.window_debt >= (CONNECTION_WINDOW / 2) as usize {
+        let _ = h2.send_window_update(StreamId::Connection, conn.window_debt as u32);
+        conn.window_debt = 0;
     }
     alive
 }
