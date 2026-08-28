@@ -543,10 +543,7 @@ fn run_worker(
     }
     let mut started: u64 = 0;
 
-    let worker_start = Instant::now();
-    let deadline = duration_limit.map(|d| worker_start + d);
-
-    // duration モード: Timeout CQE で確実に起床する
+    // duration モード: 期限は io_uring の Timeout CQE のみで検知する
     let timespec = duration_limit.map(|d| Box::new(types::Timespec::from(d)));
     if let Some(ts) = &timespec {
         let entry = opcode::Timeout::new(&**ts as *const types::Timespec)
@@ -715,11 +712,6 @@ fn run_worker(
         }
 
         if stop {
-            break;
-        }
-        if let Some(dl) = deadline
-            && Instant::now() >= dl
-        {
             break;
         }
     }
