@@ -38,14 +38,24 @@ fn make_limits() -> Result<Limits> {
 }
 
 /// Request pseudo-headers, built once and cloned per request
-fn build_request_headers(target: &Target) -> Result<Vec<HeaderField>> {
-    Ok(vec![
-        HeaderField::new(":method", "GET").map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        HeaderField::new(":scheme", "http").map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        HeaderField::new(":authority", &target.authority)
-            .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        HeaderField::new(":path", &target.path).map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-    ])
+///
+/// Like h2load's pre-built nva arrays, the template is constructed once with
+/// `Cow::Borrowed` contents (`from_static` over intentionally leaked strings),
+/// so the per-request clone copies pointers instead of allocating.
+fn build_request_headers(target: &Target) -> Vec<HeaderField> {
+    // Leaked once per worker; negligible and lives for the whole run anyway.
+    // The values already passed parse_target's HTTP/1.1 validation (and DNS
+    // resolution for the authority), so from_static's checks cannot fire.
+    let authority: &'static [u8] =
+        Box::leak(target.authority.clone().into_bytes().into_boxed_slice());
+    let path: &'static [u8] = Box::leak(target.path.clone().into_bytes().into_boxed_slice());
+
+    vec![
+        HeaderField::from_static(b":method", b"GET"),
+        HeaderField::from_static(b":scheme", b"http"),
+        HeaderField::from_static(b":authority", authority),
+        HeaderField::from_static(b":path", path),
+    ]
 }
 
 /// An in-flight request (one open stream)
@@ -296,7 +306,7 @@ pub fn run_worker(
     }
 
     let limits = make_limits()?;
-    let request_headers = build_request_headers(target)?;
+    let request_headers = build_request_headers(target);
 
     // Declare buf_ring / conns before the ring. Reverse drop order then
     // destroys the ring first (its teardown waits for in-flight operations to
