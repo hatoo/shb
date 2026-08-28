@@ -36,6 +36,15 @@ struct Args {
     /// Connection establishment timeout in seconds
     #[arg(long, default_value_t = 3.0)]
     connect_timeout: f64,
+
+    /// Number of worker threads
+    #[arg(short = 't', long, default_value_t = default_threads())]
+    threads: usize,
+}
+
+/// スレッド数のデフォルト値 (CPU 数)
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// io_uring の Connect SQE に渡す sockaddr。SQE 完了まで移動しないよう保持する
@@ -421,6 +430,17 @@ impl Stats {
         self.latencies_ns
             .push(conn.request_start.elapsed().as_nanos() as u64);
     }
+
+    fn merge(&mut self, other: Stats) {
+        self.completed += other.completed;
+        self.errors += other.errors;
+        self.connect_errors += other.connect_errors;
+        self.bytes_received += other.bytes_received;
+        self.latencies_ns.extend(other.latencies_ns);
+        for (a, b) in self.status_counts.iter_mut().zip(other.status_counts.iter()) {
+            *a += *b;
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -428,38 +448,105 @@ fn main() -> Result<()> {
     if args.connections == 0 {
         bail!("--connections must be >= 1");
     }
+    if args.threads == 0 {
+        bail!("--threads must be >= 1");
+    }
     let target = parse_target(&args.url)?;
 
     let duration_limit = args.duration.map(Duration::from_secs_f64);
-    // duration モードでは requests は上限なし扱い
-    let max_requests = if duration_limit.is_some() {
-        u64::MAX
+
+    // 1 スレッドには最低 1 コネクション割り当てる
+    let threads = args.threads.min(args.connections);
+
+    // コネクション数とリクエスト数をスレッドに分配する (余りは先頭から 1 ずつ)
+    let conns_per_thread: Vec<usize> = (0..threads)
+        .map(|i| args.connections / threads + usize::from(i < args.connections % threads))
+        .collect();
+    let requests_per_thread: Vec<u64> = if duration_limit.is_some() {
+        // duration モードでは requests は上限なし扱い
+        vec![u64::MAX; threads]
     } else {
-        args.requests
+        (0..threads)
+            .map(|i| {
+                args.requests / threads as u64 + u64::from((i as u64) < args.requests % threads as u64)
+            })
+            .collect()
     };
 
-    let entries = (args.connections * 2).next_power_of_two().max(256) as u32;
+    let bench_start = Instant::now();
+    let results: Vec<Result<Stats>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let target = &target;
+                let connections = conns_per_thread[i];
+                let max_requests = requests_per_thread[i];
+                let connect_timeout = args.connect_timeout;
+                s.spawn(move || {
+                    run_worker(
+                        target,
+                        connections,
+                        max_requests,
+                        duration_limit,
+                        connect_timeout,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| match h.join() {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("worker thread panicked")),
+            })
+            .collect()
+    });
+    let elapsed = bench_start.elapsed();
+
+    let mut stats = Stats::default();
+    for result in results {
+        stats.merge(result?);
+    }
+
+    print_report(&args, threads, &stats, elapsed);
+    Ok(())
+}
+
+/// 1 ワーカースレッド分のベンチマークループ
+///
+/// 専用の io_uring とコネクション群を持ち、他スレッドと状態を共有しない。
+fn run_worker(
+    target: &Target,
+    connections: usize,
+    max_requests: u64,
+    duration_limit: Option<Duration>,
+    connect_timeout_secs: f64,
+) -> Result<Stats> {
+    if connections == 0 || max_requests == 0 {
+        return Ok(Stats::default());
+    }
+
+    let entries = (connections * 2).next_power_of_two().max(256) as u32;
     let mut ring = IoUring::new(entries).context("failed to create io_uring")?;
 
-    let mut conns: Vec<Conn> = Vec::with_capacity(args.connections);
-    for _ in 0..args.connections {
+    let mut conns: Vec<Conn> = Vec::with_capacity(connections);
+    for _ in 0..connections {
         conns.push(Conn::new());
     }
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
     let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
     let connect_timeout = Box::new(types::Timespec::from(Duration::from_secs_f64(
-        args.connect_timeout,
+        connect_timeout_secs,
     )));
 
     let mut stats = Stats::default();
     if duration_limit.is_none() {
-        stats.latencies_ns.reserve(args.requests as usize);
+        stats.latencies_ns.reserve(max_requests as usize);
     }
     let mut started: u64 = 0;
 
-    let bench_start = Instant::now();
-    let deadline = duration_limit.map(|d| bench_start + d);
+    let worker_start = Instant::now();
+    let deadline = duration_limit.map(|d| worker_start + d);
 
     // duration モード: Timeout CQE で確実に起床する
     let timespec = duration_limit.map(|d| Box::new(types::Timespec::from(d)));
@@ -639,19 +726,18 @@ fn main() -> Result<()> {
         }
     }
 
-    let elapsed = bench_start.elapsed();
     for conn in &mut conns {
         conn.close();
     }
 
-    print_report(&args, &stats, elapsed);
-    Ok(())
+    Ok(stats)
 }
 
-fn print_report(args: &Args, stats: &Stats, elapsed: Duration) {
+fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
     let total = stats.completed + stats.errors;
     println!("URL:          {}", args.url);
+    println!("Threads:      {threads}");
     println!("Connections:  {}", args.connections);
     println!(
         "Requests:     {} ({} ok, {} errors, of which {} connect) in {:.3}s",
