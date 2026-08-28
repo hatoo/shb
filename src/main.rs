@@ -326,6 +326,9 @@ fn push_sqe_pair(ring: &mut IoUring, first: squeue::Entry, second: squeue::Entry
 }
 
 /// 非同期 connect を開始する (Connect SQE + 接続タイムアウトの LinkTimeout)
+///
+/// 作成した fd はコネクション番号の固定ファイルスロットに登録し、
+/// 以降の SQE はすべて `types::Fixed(conn_idx)` で参照する。
 fn start_connect(
     ring: &mut IoUring,
     conn_idx: usize,
@@ -335,10 +338,18 @@ fn start_connect(
     timeout: &types::Timespec,
 ) -> Result<()> {
     conn.fd = make_socket(addr)?;
-    let connect = opcode::Connect::new(types::Fd(conn.fd), raw_addr.as_ptr(), raw_addr.len)
-        .build()
-        .flags(squeue::Flags::IO_LINK)
-        .user_data(user_data(conn_idx, OP_CONNECT));
+    // スロット上書きにより旧 fd への登録参照も解放される
+    ring.submitter()
+        .register_files_update(conn_idx as u32, &[conn.fd])
+        .context("register_files_update failed")?;
+    let connect = opcode::Connect::new(
+        types::Fixed(conn_idx as u32),
+        raw_addr.as_ptr(),
+        raw_addr.len,
+    )
+    .build()
+    .flags(squeue::Flags::IO_LINK)
+    .user_data(user_data(conn_idx, OP_CONNECT));
     let link_timeout = opcode::LinkTimeout::new(timeout as *const types::Timespec)
         .build()
         .user_data(user_data(conn_idx, OP_CONNECT_TIMEOUT));
@@ -348,7 +359,7 @@ fn start_connect(
 fn push_send(ring: &mut IoUring, conn_idx: usize, conn: &Conn, request: &[u8]) -> Result<()> {
     let remaining = &request[conn.send_offset..];
     let entry = opcode::Send::new(
-        types::Fd(conn.fd),
+        types::Fixed(conn_idx as u32),
         remaining.as_ptr(),
         remaining.len() as u32,
     )
@@ -372,9 +383,13 @@ fn push_recv(ring: &mut IoUring, conn_idx: usize, conn: &mut Conn) -> Result<()>
         .decoder
         .mut_buf(len)
         .map_err(|e| anyhow::anyhow!("mut_buf failed: {e:?}"))?;
-    let entry = opcode::Recv::new(types::Fd(conn.fd), buf.as_mut_ptr(), buf.len() as u32)
-        .build()
-        .user_data(user_data(conn_idx, OP_RECV));
+    let entry = opcode::Recv::new(
+        types::Fixed(conn_idx as u32),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+    )
+    .build()
+    .user_data(user_data(conn_idx, OP_RECV));
     push_sqe(ring, entry)
 }
 
@@ -514,7 +529,25 @@ fn run_worker(
     }
 
     let entries = (connections * 2).next_power_of_two().max(256) as u32;
-    let mut ring = IoUring::new(entries).context("failed to create io_uring")?;
+    // SINGLE_ISSUER: このリングは本スレッドしか触らない前提をカーネルに伝える
+    // COOP_TASKRUN / DEFER_TASKRUN: ソケット完了の task work を任意タイミングの
+    // 割り込みではなく io_uring_enter 時にまとめて実行させる (要 kernel 6.1+)
+    let mut ring = IoUring::builder()
+        .setup_single_issuer()
+        .setup_coop_taskrun()
+        .setup_defer_taskrun()
+        .build(entries)
+        .or_else(|_| {
+            // 古いカーネル向けフォールバック
+            IoUring::new(entries)
+        })
+        .context("failed to create io_uring")?;
+
+    // コネクションごとに固定ファイルスロットを確保し、SQE では
+    // types::Fixed(conn_idx) を使って fd 参照カウント操作を省く
+    ring.submitter()
+        .register_files_sparse(connections as u32)
+        .context("register_files_sparse failed")?;
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
     let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
