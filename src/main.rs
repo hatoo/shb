@@ -18,7 +18,7 @@ use crate::stats::Stats;
 use crate::target::parse_target;
 
 #[derive(Parser)]
-#[command(name = "shb", about = "io_uring HTTP/1.1 benchmarker")]
+#[command(name = "shb", about = "io_uring HTTP/1.1 & HTTP/2 benchmarker")]
 pub struct Args {
     /// Target URL, e.g. http://127.0.0.1:8080/ or https://example.com/
     /// (TLS trusts every certificate: this is a benchmarker)
@@ -48,7 +48,7 @@ pub struct Args {
     #[arg(short = 'j', long)]
     pub json: bool,
 
-    /// Use HTTP/2 (h2c with prior knowledge)
+    /// Use HTTP/2 (prior knowledge on http://, ALPN "h2" on https://)
     #[arg(long)]
     pub http2: bool,
 

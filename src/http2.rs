@@ -1,4 +1,4 @@
-//! HTTP/2 (h2c, prior knowledge) benchmark worker
+//! HTTP/2 benchmark worker (h2c prior knowledge, or ALPN "h2" over TLS)
 
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
@@ -308,9 +308,10 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
 
 /// Benchmark loop of a single HTTP/2 worker thread
 ///
-/// Speaks h2c with prior knowledge (no Upgrade dance): the client preface is
-/// sent immediately after the TCP connect. Up to `parallel` streams are kept
-/// in flight per connection.
+/// On http:// speaks h2c with prior knowledge (no Upgrade dance): the client
+/// preface is sent immediately after the TCP connect. On https:// the
+/// protocol is negotiated via ALPN "h2". Up to `parallel` streams are kept in
+/// flight per connection.
 pub fn run_worker(
     target: &Target,
     tls_setup: Option<&TlsSetup>,
