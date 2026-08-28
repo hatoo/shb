@@ -38,27 +38,37 @@ fn make_limits() -> Result<Limits> {
         .map_err(|e| anyhow::anyhow!("invalid HTTP/2 limits: {e:?}"))
 }
 
-/// Request pseudo-headers, built once and cloned per request
+/// Request headers, built once and cloned per request
 ///
 /// Like h2load's pre-built nva arrays, the template is constructed once with
 /// `Cow::Borrowed` contents (`from_static` over intentionally leaked strings),
-/// so the per-request clone copies pointers instead of allocating.
-fn build_request_headers(target: &Target) -> Vec<HeaderField> {
-    // Leaked once per worker; negligible and lives for the whole run anyway.
-    // The values already passed parse_target's HTTP/1.1 validation (and DNS
-    // resolution for the authority), so from_static's checks cannot fire.
+/// so the per-request clone copies pointers instead of allocating. Custom
+/// header names are lowercased (required by HTTP/2) and validated with
+/// `HeaderField::new` first so user input cannot trip from_static's panics.
+fn build_request_headers(target: &Target) -> Result<Vec<HeaderField>> {
     let authority: &'static [u8] =
         Box::leak(target.authority.clone().into_bytes().into_boxed_slice());
     let path: &'static [u8] = Box::leak(target.path.clone().into_bytes().into_boxed_slice());
     let method: &'static [u8] = Box::leak(target.method.clone().into_bytes().into_boxed_slice());
     let scheme: &'static [u8] = if target.tls { b"https" } else { b"http" };
 
-    vec![
+    let mut fields = vec![
         HeaderField::from_static(b":method", method),
         HeaderField::from_static(b":scheme", scheme),
         HeaderField::from_static(b":authority", authority),
         HeaderField::from_static(b":path", path),
-    ]
+    ];
+    for (name, value) in &target.headers {
+        if crate::target::is_connection_specific(name) {
+            continue;
+        }
+        let name = name.to_ascii_lowercase();
+        HeaderField::new(&name, value).map_err(|e| anyhow::anyhow!("header {name:?}: {e:?}"))?;
+        let name: &'static [u8] = Box::leak(name.into_bytes().into_boxed_slice());
+        let value: &'static [u8] = Box::leak(value.clone().into_bytes().into_boxed_slice());
+        fields.push(HeaderField::from_static(name, value));
+    }
+    Ok(fields)
 }
 
 /// An in-flight request (one open stream)
@@ -152,6 +162,7 @@ impl Conn {
 fn fill_streams(
     conn: &mut Conn,
     request_headers: &[HeaderField],
+    body: &[u8],
     parallel: usize,
     started: &mut u64,
     max_requests: u64,
@@ -164,8 +175,11 @@ fn fill_streams(
         return;
     };
     while conn.streams.len() < parallel && *started < max_requests {
-        match h2.start_stream(request_headers.to_vec(), true) {
+        match h2.start_stream(request_headers.to_vec(), body.is_empty()) {
             Ok(stream_id) => {
+                if !body.is_empty() && h2.send_data(stream_id, body.to_vec(), true).is_err() {
+                    break;
+                }
                 conn.streams.push(InFlight {
                     stream_id,
                     start: Instant::now(),
@@ -333,7 +347,7 @@ pub fn run_worker(
     }
 
     let limits = make_limits()?;
-    let request_headers = build_request_headers(target);
+    let request_headers = build_request_headers(target)?;
 
     // Declare buf_ring / conns before the ring. Reverse drop order then
     // destroys the ring first (its teardown waits for in-flight operations to
@@ -474,6 +488,7 @@ pub fn run_worker(
                         fill_streams(
                             conn,
                             &request_headers,
+                            &target.body,
                             parallel,
                             &mut started,
                             max_requests,
@@ -584,6 +599,7 @@ pub fn run_worker(
                             fill_streams(
                                 conn,
                                 &request_headers,
+                                &target.body,
                                 parallel,
                                 &mut started,
                                 max_requests,

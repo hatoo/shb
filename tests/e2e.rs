@@ -10,12 +10,22 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use axum::Router;
-use axum::http::{Method, StatusCode};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::any;
 
 /// Status code by method so tests can verify the method actually reached the
-/// server: GET/HEAD -> 200, POST -> 201, DELETE -> 204, others -> 405
-async fn handler(method: Method) -> (StatusCode, &'static str) {
+/// server. A request carrying an `X-Echo` header must send a matching body,
+/// and vice versa, so a single 200/201/... response proves both arrived.
+async fn handler(method: Method, headers: HeaderMap, body: Bytes) -> (StatusCode, &'static str) {
+    // If the client sent our marker header, its value must equal the body
+    if let Some(echo) = headers.get("x-echo") {
+        if echo.as_bytes() != body.as_ref() {
+            return (StatusCode::BAD_REQUEST, "header/body mismatch");
+        }
+    } else if !body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "unexpected body");
+    }
     match method {
         // hyper strips the body for HEAD responses but keeps Content-Length,
         // which is exactly the case the h1 HEAD decoding must handle
@@ -251,13 +261,38 @@ fn h3_server_addr() -> SocketAddr {
                                 else {
                                     return;
                                 };
-                                let (status, body) = match *request.method() {
-                                    http::Method::GET | http::Method::HEAD => {
-                                        (http::StatusCode::OK, "hello world")
+                                // Drain the request body for the echo check
+                                let mut req_body = Vec::new();
+                                while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                                    use bytes::Buf;
+                                    while chunk.has_remaining() {
+                                        let c = chunk.chunk().to_vec();
+                                        let n = c.len();
+                                        req_body.extend_from_slice(&c);
+                                        chunk.advance(n);
                                     }
-                                    http::Method::POST => (http::StatusCode::CREATED, "created"),
-                                    http::Method::DELETE => (http::StatusCode::NO_CONTENT, ""),
-                                    _ => (http::StatusCode::METHOD_NOT_ALLOWED, ""),
+                                }
+                                let echo = request
+                                    .headers()
+                                    .get("x-echo")
+                                    .map(|v| v.as_bytes().to_vec());
+                                let (status, body) = match echo {
+                                    Some(ref e) if *e != req_body => {
+                                        (http::StatusCode::BAD_REQUEST, "")
+                                    }
+                                    None if !req_body.is_empty() => {
+                                        (http::StatusCode::BAD_REQUEST, "")
+                                    }
+                                    _ => match *request.method() {
+                                        http::Method::GET | http::Method::HEAD => {
+                                            (http::StatusCode::OK, "hello world")
+                                        }
+                                        http::Method::POST => {
+                                            (http::StatusCode::CREATED, "created")
+                                        }
+                                        http::Method::DELETE => (http::StatusCode::NO_CONTENT, ""),
+                                        _ => (http::StatusCode::METHOD_NOT_ALLOWED, ""),
+                                    },
                                 };
                                 let response = http::Response::builder()
                                     .status(status)
@@ -299,4 +334,142 @@ fn h3_method_is_sent_to_the_server() {
         "--http3", "-m", "POST", "-n", "30", "-c", "2", "-t", "1", &url,
     ]);
     assert_all_ok(&report, 30, "201");
+}
+
+#[test]
+fn h1_custom_header_and_body() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    // The server returns 400 unless the X-Echo header matches the body
+    let report = shb_json(&[
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: hello",
+        "-d",
+        "hello",
+        "-n",
+        "30",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 30, "201");
+}
+
+#[test]
+fn h1_host_header_override() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    // Overriding Host must not break the request against this server
+    let report = shb_json(&[
+        "-H",
+        "Host: example.com",
+        "-n",
+        "20",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 20, "200");
+}
+
+#[test]
+fn h1_body_defaults_to_post() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    // -d without -m should send POST (curl semantics) -> 201
+    let report = shb_json(&[
+        "-H",
+        "X-Echo: abc",
+        "-d",
+        "abc",
+        "-n",
+        "20",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 20, "201");
+}
+
+#[test]
+fn h1_mismatched_body_is_rejected_by_server() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    // Echo header present but body differs -> server returns 400
+    let report = shb_json(&[
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: hello",
+        "-d",
+        "world",
+        "-n",
+        "10",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_eq!(report["statusCodes"]["400"], 10, "report: {report}");
+}
+
+#[test]
+fn h2_custom_header_and_body() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&[
+        "--http2",
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: hi",
+        "-d",
+        "hi",
+        "-n",
+        "30",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 30, "201");
+}
+
+#[test]
+fn invalid_header_format_is_rejected() {
+    let stderr = shb_fail(&["-H", "no-colon-here", "-n", "1", "http://127.0.0.1:9/"]);
+    assert!(stderr.contains("header"), "stderr: {stderr}");
+}
+
+#[test]
+fn h3_custom_header_and_body() {
+    let addr = h3_server_addr();
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&[
+        "--http3",
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: h3body",
+        "-d",
+        "h3body",
+        "-n",
+        "20",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 20, "201");
 }

@@ -41,9 +41,17 @@ pub struct Args {
     #[arg(short = 'z', long, value_parser = humantime::parse_duration)]
     pub duration: Option<Duration>,
 
-    /// HTTP method
-    #[arg(short = 'm', long, default_value = "GET")]
-    pub method: String,
+    /// HTTP method (defaults to GET, or POST when -d is given, like curl)
+    #[arg(short = 'm', long)]
+    pub method: Option<String>,
+
+    /// Custom HTTP header (repeatable). Example: -H "Accept: application/json"
+    #[arg(short = 'H', long = "header", value_name = "HEADER")]
+    pub headers: Vec<String>,
+
+    /// HTTP request body
+    #[arg(short = 'd', long = "data", value_name = "BODY")]
+    pub body: Option<String>,
 
     /// Connection establishment timeout (e.g. 5s, 500ms)
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
@@ -83,7 +91,12 @@ fn default_threads() -> usize {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let target = parse_target(&args.url, &args.method)?;
+    // curl semantics: -d implies POST unless a method was given explicitly
+    let method = args
+        .method
+        .clone()
+        .unwrap_or_else(|| if args.body.is_some() { "POST" } else { "GET" }.to_string());
+    let target = parse_target(&args.url, &method, &args.headers, args.body.as_deref())?;
 
     // Print the report even when interrupted with Ctrl-C: the handler sets a
     // flag, workers notice it within ~100ms and return their stats normally

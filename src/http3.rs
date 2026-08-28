@@ -82,7 +82,7 @@ fn probe_gso(addr: &std::net::SocketAddr) -> bool {
 }
 
 fn build_request_headers(target: &Target) -> Result<Vec<Header>> {
-    Ok(vec![
+    let mut headers = vec![
         Header::new(b":method", target.method.as_bytes())
             .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
         Header::new(b":scheme", b"https").map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
@@ -90,7 +90,18 @@ fn build_request_headers(target: &Target) -> Result<Vec<Header>> {
             .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
         Header::new(b":path", target.path.as_bytes())
             .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-    ])
+    ];
+    for (name, value) in &target.headers {
+        if crate::target::is_connection_specific(name) {
+            continue;
+        }
+        // Field names must be lowercase in HTTP/3, like HTTP/2
+        headers.push(
+            Header::new(name.to_ascii_lowercase(), value)
+                .map_err(|e| anyhow::anyhow!("header {name:?}: {e:?}"))?,
+        );
+    }
+    Ok(headers)
 }
 
 fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::ClientConfig> {
@@ -298,6 +309,7 @@ fn read_quic_stream(
 fn fill_streams(
     conn: &mut Conn,
     request_headers: &[Header],
+    body: &[u8],
     parallel: usize,
     started: &mut u64,
     max_requests: u64,
@@ -315,8 +327,12 @@ fn fill_streams(
             break;
         };
         let hsid = h3
-            .send_request(request_headers, true)
+            .send_request(request_headers, body.is_empty())
             .map_err(|e| anyhow::anyhow!("send_request failed: {e:?}"))?;
+        if !body.is_empty() {
+            h3.send_body(hsid, body, true)
+                .map_err(|e| anyhow::anyhow!("send_body failed: {e:?}"))?;
+        }
         if u64::from(qsid) != hsid {
             bail!(
                 "stream id mismatch: QUIC {} vs H3 {}",
@@ -421,6 +437,7 @@ fn drive(
     conn: &mut Conn,
     stats: &mut Stats,
     request_headers: &[Header],
+    body: &[u8],
     parallel: usize,
     started: &mut u64,
     max_requests: u64,
@@ -544,7 +561,15 @@ fn drive(
         }
 
         // 4. Open new requests and push H3 bytes into QUIC
-        fill_streams(conn, request_headers, parallel, started, max_requests, stop)?;
+        fill_streams(
+            conn,
+            request_headers,
+            body,
+            parallel,
+            started,
+            max_requests,
+            stop,
+        )?;
         if let (Some(quic), Some(h3)) = (conn.quic.as_mut(), conn.h3.as_mut()) {
             pump_h3_to_quic(quic, h3)?;
         }
@@ -680,6 +705,7 @@ pub fn run_worker(
                     conn,
                     &mut stats,
                     &request_headers,
+                    &target.body,
                     parallel,
                     &mut started,
                     max_requests,
@@ -811,6 +837,7 @@ pub fn run_worker(
                             conn,
                             &mut stats,
                             &request_headers,
+                            &target.body,
                             parallel,
                             &mut started,
                             max_requests,
