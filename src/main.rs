@@ -5,6 +5,7 @@ mod report;
 mod shutdown;
 mod stats;
 mod target;
+mod tls;
 mod uring;
 
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ use crate::target::parse_target;
 #[derive(Parser)]
 #[command(name = "shb", about = "io_uring HTTP/1.1 benchmarker")]
 pub struct Args {
-    /// Target URL (http only), e.g. http://127.0.0.1:8080/
+    /// Target URL, e.g. http://127.0.0.1:8080/ or https://example.com/
+    /// (TLS trusts every certificate: this is a benchmarker)
     pub url: String,
 
     /// Number of concurrent connections
@@ -74,6 +76,14 @@ fn main() -> Result<()> {
     // flag, workers notice it within ~100ms and return their stats normally
     shutdown::install();
 
+    // Shared TLS configuration (https URLs only); ALPN follows the protocol
+    let tls_setup = if target.tls {
+        let alpn: &[u8] = if args.http2 { b"h2" } else { b"http/1.1" };
+        Some(tls::setup(&target.host, alpn)?)
+    } else {
+        None
+    };
+
     let duration_limit = args.duration;
 
     // Each thread gets at least one connection
@@ -105,10 +115,12 @@ fn main() -> Result<()> {
                 let connect_timeout = args.connect_timeout;
                 let http2 = args.http2;
                 let parallel = args.parallel;
+                let tls = tls_setup.as_ref();
                 s.spawn(move || {
                     if http2 {
                         http2::run_worker(
                             target,
+                            tls,
                             connections,
                             max_requests,
                             duration_limit,
@@ -118,6 +130,7 @@ fn main() -> Result<()> {
                     } else {
                         http1::run_worker(
                             target,
+                            tls,
                             connections,
                             max_requests,
                             duration_limit,

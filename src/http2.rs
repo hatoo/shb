@@ -11,6 +11,7 @@ use shiguredo_http2::{Connection, ErrorCode, Event, HeaderField, Limits, StreamI
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
+use crate::tls::{TlsSession, TlsSetup};
 use crate::uring::{
     self, BUF_GROUP, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND,
     TIMEOUT_USER_DATA,
@@ -49,10 +50,11 @@ fn build_request_headers(target: &Target) -> Vec<HeaderField> {
     let authority: &'static [u8] =
         Box::leak(target.authority.clone().into_bytes().into_boxed_slice());
     let path: &'static [u8] = Box::leak(target.path.clone().into_bytes().into_boxed_slice());
+    let scheme: &'static [u8] = if target.tls { b"https" } else { b"http" };
 
     vec![
         HeaderField::from_static(b":method", b"GET"),
-        HeaderField::from_static(b":scheme", b"http"),
+        HeaderField::from_static(b":scheme", scheme),
         HeaderField::from_static(b":authority", authority),
         HeaderField::from_static(b":path", path),
     ]
@@ -74,6 +76,8 @@ struct Conn {
     connected: bool,
     /// HTTP/2 connection state machine (recreated per TCP connection)
     h2: Option<Connection>,
+    /// TLS session (https URLs only; recreated per TCP connection)
+    tls: Option<TlsSession>,
     /// Bytes currently being sent; must stay untouched while a Send is in flight
     out: Vec<u8>,
     out_off: usize,
@@ -100,6 +104,7 @@ impl Conn {
             fd: -1,
             connected: false,
             h2: None,
+            tls: None,
             out: Vec::new(),
             out_off: 0,
             sending: false,
@@ -125,6 +130,7 @@ impl Conn {
         self.out.clear();
         self.out_off = 0;
         self.h2 = None;
+        self.tls = None;
         self.streams.clear();
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation += 1;
@@ -186,11 +192,29 @@ fn flush(
     let Some(h2) = conn.h2.as_mut() else {
         return Ok(());
     };
-    if let Some(buf) = h2.poll_output() {
-        conn.out = buf;
-        conn.out_off = 0;
-        conn.sending = true;
-        uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
+    match &mut conn.tls {
+        Some(tls) => {
+            // Encrypt the h2 output; the ciphertext may also contain pending
+            // handshake messages even when h2 has nothing to say
+            if let Some(buf) = h2.poll_output() {
+                tls.write_plaintext(&buf)?;
+            }
+            let ciphertext = tls.take_ciphertext()?;
+            if !ciphertext.is_empty() {
+                conn.out = ciphertext;
+                conn.out_off = 0;
+                conn.sending = true;
+                uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
+            }
+        }
+        None => {
+            if let Some(buf) = h2.poll_output() {
+                conn.out = buf;
+                conn.out_off = 0;
+                conn.sending = true;
+                uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
+            }
+        }
     }
     Ok(())
 }
@@ -289,6 +313,7 @@ fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
 /// in flight per connection.
 pub fn run_worker(
     target: &Target,
+    tls_setup: Option<&TlsSetup>,
     connections: usize,
     max_requests: u64,
     duration_limit: Option<Duration>,
@@ -377,6 +402,8 @@ pub fn run_worker(
     }
 
     let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
+    // Reusable buffer for decrypted plaintext (TLS mode)
+    let mut scratch = vec![0u8; 64 * 1024];
     let mut stop = false;
 
     'outer: loop {
@@ -432,8 +459,12 @@ pub fn run_worker(
                         // Arm a connection-lifetime multishot recv right away
                         uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                         conn.recv_armed = true;
-                        // h2c prior knowledge: send the client preface + SETTINGS
-                        // and the first requests in a single flush
+                        if let Some(setup) = tls_setup {
+                            conn.tls = Some(TlsSession::new(setup)?);
+                        }
+                        // Prior knowledge: send the client preface + SETTINGS
+                        // and the first requests in a single flush (in TLS mode
+                        // they are buffered until the handshake completes)
                         let mut h2 = Connection::client(limits.clone());
                         h2.initiate()
                             .map_err(|e| anyhow::anyhow!("h2 initiate failed: {e:?}"))?;
@@ -516,9 +547,27 @@ pub fn run_worker(
                         uring::set_quickack(conn.fd);
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
+                        // In TLS mode decrypt into scratch and feed the
+                        // plaintext; otherwise feed the socket bytes directly
                         let feed_ok = {
                             let h2 = conn.h2.as_mut().context("recv without h2 connection")?;
-                            h2.feed(buf_ring.data(bid, res as usize)).is_ok()
+                            match &mut conn.tls {
+                                Some(tls) => tls
+                                    .feed(buf_ring.data(bid, res as usize))
+                                    .and_then(|_| {
+                                        loop {
+                                            let n = tls.read_plaintext(&mut scratch)?;
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            h2.feed(&scratch[..n])
+                                                .map_err(|e| anyhow::anyhow!("h2 feed: {e:?}"))?;
+                                        }
+                                        Ok(())
+                                    })
+                                    .is_ok(),
+                                None => h2.feed(buf_ring.data(bid, res as usize)).is_ok(),
+                            }
                         };
                         buf_ring.recycle(bid);
                         let process_ok =
@@ -583,13 +632,22 @@ pub fn run_worker(
         {
             let _ = h2.send_goaway(ErrorCode::NoError, Vec::new());
             if let Some(buf) = h2.poll_output() {
-                unsafe {
-                    libc::send(
-                        conn.fd,
-                        buf.as_ptr() as *const libc::c_void,
-                        buf.len(),
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    );
+                let bytes = match &mut conn.tls {
+                    Some(tls) => {
+                        let _ = tls.write_plaintext(&buf);
+                        tls.take_ciphertext().unwrap_or_default()
+                    }
+                    None => buf,
+                };
+                if !bytes.is_empty() {
+                    unsafe {
+                        libc::send(
+                            conn.fd,
+                            bytes.as_ptr() as *const libc::c_void,
+                            bytes.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        );
+                    }
                 }
             }
         }

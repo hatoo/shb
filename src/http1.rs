@@ -11,6 +11,7 @@ use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, ResponseDecoder};
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
+use crate::tls::{TlsSession, TlsSetup};
 use crate::uring::{
     self, BUF_GROUP, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND,
     TIMEOUT_USER_DATA,
@@ -40,8 +41,13 @@ struct Conn {
     /// Whether the TCP connection is established (true after a successful Connect CQE)
     connected: bool,
     decoder: ResponseDecoder,
-    /// Resume position for partial sends
-    send_offset: usize,
+    /// TLS session (https URLs only; recreated per TCP connection)
+    tls: Option<TlsSession>,
+    /// Bytes currently being sent; must stay untouched while a Send is in flight
+    out: Vec<u8>,
+    out_off: usize,
+    /// Whether a Send SQE is in flight for `out`
+    sending: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
     /// Reconnect generation. Incremented on every close; CQEs from an old
@@ -59,7 +65,10 @@ impl Conn {
             fd: -1,
             connected: false,
             decoder: ResponseDecoder::new(),
-            send_offset: 0,
+            tls: None,
+            out: Vec::new(),
+            out_off: 0,
+            sending: false,
             recv_armed: false,
             generation: 0,
             resp: None,
@@ -75,6 +84,10 @@ impl Conn {
         }
         self.connected = false;
         self.recv_armed = false;
+        self.sending = false;
+        self.tls = None;
+        self.out.clear();
+        self.out_off = 0;
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation += 1;
     }
@@ -132,7 +145,6 @@ impl Conn {
 
     /// Reset per-request state for the next request
     fn begin_request(&mut self) {
-        self.send_offset = 0;
         self.resp = None;
         self.request_start = Instant::now();
     }
@@ -142,20 +154,53 @@ impl Conn {
     }
 }
 
-fn push_send(
+/// Queue the request bytes for sending on this connection
+fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
+    match &mut conn.tls {
+        Some(tls) => tls.write_plaintext(request),
+        None => {
+            // The previous request was fully sent before its response could
+            // complete, so `out` is drained by now
+            conn.out.clear();
+            conn.out.extend_from_slice(request);
+            conn.out_off = 0;
+            Ok(())
+        }
+    }
+}
+
+/// Submit pending output unless a send is already in flight
+///
+/// TLS mode drains the pending ciphertext (handshake messages included)
+/// into `out` first.
+fn flush(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
     conn_idx: usize,
-    conn: &Conn,
-    request: &[u8],
+    conn: &mut Conn,
 ) -> Result<()> {
-    uring::push_send_slice(
-        submitter,
-        sq,
-        conn_idx,
-        conn.generation,
-        &request[conn.send_offset..],
-    )
+    if conn.sending {
+        return Ok(());
+    }
+    if let Some(tls) = &mut conn.tls {
+        let ciphertext = tls.take_ciphertext()?;
+        if !ciphertext.is_empty() {
+            conn.out = ciphertext;
+            conn.out_off = 0;
+            conn.sending = true;
+            uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
+        }
+    } else if conn.out_off < conn.out.len() {
+        conn.sending = true;
+        uring::push_send_slice(
+            submitter,
+            sq,
+            conn_idx,
+            conn.generation,
+            &conn.out[conn.out_off..],
+        )?;
+    }
+    Ok(())
 }
 
 fn push_recv_multi(
@@ -175,6 +220,7 @@ fn push_recv_multi(
 /// other threads.
 pub fn run_worker(
     target: &Target,
+    tls_setup: Option<&TlsSetup>,
     connections: usize,
     max_requests: u64,
     duration_limit: Option<Duration>,
@@ -265,6 +311,8 @@ pub fn run_worker(
     }
 
     let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
+    // Reusable buffer for decrypted plaintext (TLS mode)
+    let mut scratch = vec![0u8; 64 * 1024];
     let mut stop = false;
 
     'outer: loop {
@@ -319,9 +367,15 @@ pub fn run_worker(
                         conn.connected = true;
                         // Arm a connection-lifetime multishot recv right away
                         push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
-                        // Latency is measured from send start (excludes connection setup)
+                        if let Some(setup) = tls_setup {
+                            conn.tls = Some(TlsSession::new(setup)?);
+                        }
+                        // Latency is measured from send start (excludes TCP
+                        // connect; the first request on a TLS connection does
+                        // include the handshake)
                         conn.request_start = Instant::now();
-                        push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
+                        queue_request(conn, &target.request_bytes)?;
+                        flush(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -338,12 +392,23 @@ pub fn run_worker(
                     } else {
                         stats.bytes_sent += res as u64;
                         let conn = &mut conns[conn_idx];
-                        conn.send_offset += res as usize;
-                        if conn.send_offset < target.request_bytes.len() {
-                            push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
-                        } else if !conn.recv_armed {
-                            // Re-arm if the multishot ended (e.g. due to ENOBUFS)
-                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                        conn.out_off += res as usize;
+                        if conn.out_off < conn.out.len() {
+                            uring::push_send_slice(
+                                &submitter,
+                                &mut sq,
+                                conn_idx,
+                                conn.generation,
+                                &conn.out[conn.out_off..],
+                            )?;
+                        } else {
+                            conn.sending = false;
+                            // TLS may have produced more ciphertext meanwhile
+                            flush(&submitter, &mut sq, conn_idx, conn)?;
+                            if !conn.recv_armed {
+                                // Re-arm if the multishot ended (e.g. due to ENOBUFS)
+                                push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                            }
                         }
                     }
                 }
@@ -391,7 +456,28 @@ pub fn run_worker(
                         stats.bytes_received += res as u64;
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
-                        let feed_result = conn.decoder.feed(buf_ring.data(bid, res as usize));
+                        // In TLS mode decrypt into scratch and feed the
+                        // plaintext; otherwise feed the socket bytes directly
+                        let feed_result: Result<()> = match &mut conn.tls {
+                            Some(tls) => {
+                                tls.feed(buf_ring.data(bid, res as usize)).and_then(|_| {
+                                    loop {
+                                        let n = tls.read_plaintext(&mut scratch)?;
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        conn.decoder
+                                            .feed(&scratch[..n])
+                                            .map_err(|e| anyhow::anyhow!("decode feed: {e:?}"))?;
+                                    }
+                                    Ok(())
+                                })
+                            }
+                            None => conn
+                                .decoder
+                                .feed(buf_ring.data(bid, res as usize))
+                                .map_err(|e| anyhow::anyhow!("decode feed: {e:?}")),
+                        };
                         buf_ring.recycle(bid);
                         if feed_result.is_err() {
                             stats.errors += 1;
@@ -415,6 +501,9 @@ pub fn run_worker(
                                     keep_conn = false;
                                 }
                             }
+                            // The TLS handshake may need to send its next
+                            // flight even though no request completed
+                            flush(&submitter, &mut sq, conn_idx, conn)?;
                         }
                     }
                 }
@@ -430,7 +519,8 @@ pub fn run_worker(
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
-                        push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
+                        queue_request(conn, &target.request_bytes)?;
+                        flush(&submitter, &mut sq, conn_idx, conn)?;
                     } else {
                         conn.close();
                         conn.decoder.reset();
