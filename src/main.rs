@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use io_uring::{IoUring, cqueue, opcode, squeue, types};
+use io_uring::{IoUring, Submitter, cqueue, opcode, squeue, types};
 use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, Request, ResponseDecoder};
 
 /// provided buffer ring の 1 バッファのサイズ
@@ -382,12 +382,18 @@ fn user_data(conn_idx: usize, generation: u64, op: u64) -> u64 {
     (generation << (2 + CONN_IDX_BITS)) | ((conn_idx as u64) << 2) | op
 }
 
-fn push_sqe(ring: &mut IoUring, entry: squeue::Entry) -> Result<()> {
+fn push_sqe(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    entry: squeue::Entry,
+) -> Result<()> {
     unsafe {
-        if ring.submission().push(&entry).is_err() {
-            ring.submit().context("io_uring submit failed")?;
-            ring.submission()
-                .push(&entry)
+        if sq.push(&entry).is_err() {
+            // tail を公開して kernel に消化させ、head を取り直して再試行
+            sq.sync();
+            submitter.submit().context("io_uring submit failed")?;
+            sq.sync();
+            sq.push(&entry)
                 .map_err(|_| anyhow::anyhow!("submission queue full after submit"))?;
         }
     }
@@ -398,16 +404,18 @@ fn push_sqe(ring: &mut IoUring, entry: squeue::Entry) -> Result<()> {
 ///
 /// IOSQE_IO_LINK のチェーンはサブミッション境界を跨げないため、
 /// 空きが 2 スロット未満なら先に submit して空ける。
-fn push_sqe_pair(ring: &mut IoUring, first: squeue::Entry, second: squeue::Entry) -> Result<()> {
+fn push_sqe_pair(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    first: squeue::Entry,
+    second: squeue::Entry,
+) -> Result<()> {
     unsafe {
-        {
-            let sq = ring.submission();
-            if sq.capacity() - sq.len() < 2 {
-                drop(sq);
-                ring.submit().context("io_uring submit failed")?;
-            }
+        if sq.capacity() - sq.len() < 2 {
+            sq.sync();
+            submitter.submit().context("io_uring submit failed")?;
+            sq.sync();
         }
-        let mut sq = ring.submission();
         sq.push(&first)
             .map_err(|_| anyhow::anyhow!("submission queue full"))?;
         sq.push(&second)
@@ -421,7 +429,8 @@ fn push_sqe_pair(ring: &mut IoUring, first: squeue::Entry, second: squeue::Entry
 /// 作成した fd はコネクション番号の固定ファイルスロットに登録し、
 /// 以降の SQE はすべて `types::Fixed(conn_idx)` で参照する。
 fn start_connect(
-    ring: &mut IoUring,
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
     conn_idx: usize,
     conn: &mut Conn,
     addr: &SocketAddr,
@@ -430,7 +439,7 @@ fn start_connect(
 ) -> Result<()> {
     conn.fd = make_socket(addr)?;
     // スロット上書きにより旧 fd への登録参照も解放される
-    ring.submitter()
+    submitter
         .register_files_update(conn_idx as u32, &[conn.fd])
         .context("register_files_update failed")?;
     let connect = opcode::Connect::new(
@@ -444,10 +453,21 @@ fn start_connect(
     let link_timeout = opcode::LinkTimeout::new(timeout as *const types::Timespec)
         .build()
         .user_data(user_data(conn_idx, conn.generation, OP_CONNECT_TIMEOUT));
-    push_sqe_pair(ring, connect, link_timeout)
+    push_sqe_pair(submitter, sq, connect, link_timeout)
 }
 
-fn push_send(ring: &mut IoUring, conn_idx: usize, conn: &Conn, request: &[u8]) -> Result<()> {
+/// リクエストを送信する
+///
+/// 注: WriteFixed + registered buffer も試したが、ソケットの write 経路は
+/// send 経路より遅く、100B 程度の送信では固定バッファの利得もないため
+/// 約 4% の悪化だった (2026-08 計測)。Send のままにすること。
+fn push_send(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &Conn,
+    request: &[u8],
+) -> Result<()> {
     let remaining = &request[conn.send_offset..];
     let entry = opcode::Send::new(
         types::Fixed(conn_idx as u32),
@@ -456,7 +476,7 @@ fn push_send(ring: &mut IoUring, conn_idx: usize, conn: &Conn, request: &[u8]) -
     )
     .build()
     .user_data(user_data(conn_idx, conn.generation, OP_SEND));
-    push_sqe(ring, entry)
+    push_sqe(submitter, sq, entry)
 }
 
 /// multishot recv を投入する
@@ -464,11 +484,16 @@ fn push_send(ring: &mut IoUring, conn_idx: usize, conn: &Conn, request: &[u8]) -
 /// 一度の投入で、MORE フラグが立つ間は受信のたびに CQE が届き続けるため、
 /// レスポンスごとの Recv SQE が不要になる。受信バッファは provided buffer
 /// ring からカーネルが選び、CQE の flags でバッファ ID が通知される。
-fn push_recv_multi(ring: &mut IoUring, conn_idx: usize, conn: &mut Conn) -> Result<()> {
+fn push_recv_multi(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+) -> Result<()> {
     let entry = opcode::RecvMulti::new(types::Fixed(conn_idx as u32), BUF_GROUP)
         .build()
         .user_data(user_data(conn_idx, conn.generation, OP_RECV));
-    push_sqe(ring, entry)?;
+    push_sqe(submitter, sq, entry)?;
     conn.recv_armed = true;
     Ok(())
 }
@@ -625,10 +650,14 @@ fn run_worker(
     // SINGLE_ISSUER: このリングは本スレッドしか触らない前提をカーネルに伝える
     // COOP_TASKRUN / DEFER_TASKRUN: ソケット完了の task work を任意タイミングの
     // 割り込みではなく io_uring_enter 時にまとめて実行させる (要 kernel 6.1+)
+    // NO_SQARRAY: SQ の間接配列を除去 (要 kernel 6.6+)
+    // CQSIZE: multishot recv がバーストで積む CQE のオーバーフローを防ぐ
     let mut ring = IoUring::builder()
         .setup_single_issuer()
         .setup_coop_taskrun()
         .setup_defer_taskrun()
+        .setup_no_sqarray()
+        .setup_cqsize(entries * 4)
         .build(entries)
         .or_else(|_| {
             // 古いカーネル向けフォールバック
@@ -636,15 +665,22 @@ fn run_worker(
         })
         .context("failed to create io_uring")?;
 
+    // Submitter を持続させて enter に registered ring fd を使えるようにする
+    // (submitter/sq/cq は ring から分離borrowされ、以後 ring 本体は触らない)
+    let (mut submitter, mut sq, mut cq) = ring.split();
+
+    // enter ごとのリング fd の fdget/fput を省く (5.18+、失敗しても動作は同じ)
+    let _ = submitter.register_ring_fd();
+
     // コネクションごとに固定ファイルスロットを確保し、SQE では
     // types::Fixed(conn_idx) を使って fd 参照カウント操作を省く
-    ring.submitter()
+    submitter
         .register_files_sparse(connections as u32)
         .context("register_files_sparse failed")?;
 
     // provided buffer ring を登録する (要 kernel 5.19+、RecvMulti は 6.0+)
     unsafe {
-        ring.submitter()
+        submitter
             .register_buf_ring_with_flags(buf_ring.ring_ptr as u64, buf_ring.entries, BUF_GROUP, 0)
             .context("register_buf_ring failed")?;
     }
@@ -665,7 +701,7 @@ fn run_worker(
         let entry = opcode::Timeout::new(&**ts as *const types::Timespec)
             .build()
             .user_data(TIMEOUT_USER_DATA);
-        push_sqe(&mut ring, entry)?;
+        push_sqe(&submitter, &mut sq, entry)?;
     }
 
     // 初回リクエスト投入 (接続確立も io_uring 経由の非同期 connect)
@@ -676,7 +712,8 @@ fn run_worker(
         started += 1;
         conns[i].begin_request();
         start_connect(
-            &mut ring,
+            &submitter,
+            &mut sq,
             i,
             &mut conns[i],
             &target.addr,
@@ -685,19 +722,26 @@ fn run_worker(
         )?;
     }
 
-    let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize);
+    let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
     let mut stop = false;
 
     'outer: loop {
         if stats.completed + stats.errors >= max_requests {
             break;
         }
-        ring.submit_and_wait(1).context("submit_and_wait failed")?;
+        // push 済み SQE の tail を公開してから submit する
+        sq.sync();
+        submitter
+            .submit_and_wait(1)
+            .context("submit_and_wait failed")?;
 
+        cq.sync();
         cqe_buf.clear();
-        for cqe in ring.completion() {
+        for cqe in &mut cq {
             cqe_buf.push((cqe.user_data(), cqe.result(), cqe.flags()));
         }
+        // 消費した CQE の head を公開する
+        cq.sync();
 
         for &(ud, res, flags) in &cqe_buf {
             if ud == TIMEOUT_USER_DATA {
@@ -732,10 +776,10 @@ fn run_worker(
                         let conn = &mut conns[conn_idx];
                         conn.connected = true;
                         // 接続と同時にコネクション寿命の multishot recv を張る
-                        push_recv_multi(&mut ring, conn_idx, conn)?;
+                        push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         // レイテンシは送信開始から測る (接続確立時間は含めない)
                         conn.request_start = Instant::now();
-                        push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
+                        push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -752,10 +796,10 @@ fn run_worker(
                         let conn = &mut conns[conn_idx];
                         conn.send_offset += res as usize;
                         if conn.send_offset < target.request_bytes.len() {
-                            push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
+                            push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                         } else if !conn.recv_armed {
                             // ENOBUFS 等で multishot が終了していた場合の再投入
-                            push_recv_multi(&mut ring, conn_idx, conn)?;
+                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
                     }
                 }
@@ -773,7 +817,7 @@ fn run_worker(
                         if res == -libc::ENOBUFS {
                             // バッファ枯渇で multishot が止まっただけ。
                             // このバッチの処理でバッファは返却されるので再投入する
-                            push_recv_multi(&mut ring, conn_idx, conn)?;
+                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         } else {
                             stats.errors += 1;
                             request_finished = true;
@@ -815,7 +859,7 @@ fn run_worker(
                                 }
                                 Ok(ParseOutcome::NeedMoreData) => {
                                     if !conn.recv_armed {
-                                        push_recv_multi(&mut ring, conn_idx, conn)?;
+                                        push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                                     }
                                 }
                                 Err(_) => {
@@ -837,14 +881,15 @@ fn run_worker(
                     conn.begin_request();
                     if keep_conn && conn.connected {
                         if !conn.recv_armed {
-                            push_recv_multi(&mut ring, conn_idx, conn)?;
+                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
-                        push_send(&mut ring, conn_idx, conn, &target.request_bytes)?;
+                        push_send(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                     } else {
                         conn.close();
                         conn.decoder.reset();
                         if let Err(e) = start_connect(
-                            &mut ring,
+                            &submitter,
+                            &mut sq,
                             conn_idx,
                             conn,
                             &target.addr,
