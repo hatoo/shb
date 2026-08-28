@@ -42,6 +42,25 @@ pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
     Ok(socket.into_raw_fd())
 }
 
+/// Re-arm TCP_QUICKACK so our ACKs go out immediately
+///
+/// With many concurrent HTTP/2 streams the peer may have Nagle enabled and
+/// wait for our ACK before sending its next small segment; our delayed ACK
+/// (up to ~40ms) then stalls the whole pipeline. Quickack mode is not
+/// permanent, so call this after every receive batch. Best effort.
+pub fn set_quickack(fd: RawFd) {
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Create the io_uring for a worker
 ///
 /// SINGLE_ISSUER: promise the kernel that only this thread touches the ring

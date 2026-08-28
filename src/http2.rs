@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use io_uring::{Submitter, cqueue, squeue, types};
-use shiguredo_http2::{Connection, Event, HeaderField, Limits, StreamId, WindowSize};
+use shiguredo_http2::{Connection, ErrorCode, Event, HeaderField, Limits, StreamId, WindowSize};
 
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
@@ -47,6 +47,14 @@ fn build_request_headers(target: &Target) -> Result<Vec<HeaderField>> {
     ])
 }
 
+/// An in-flight request (one open stream)
+struct InFlight {
+    stream_id: StreamId,
+    start: Instant,
+    /// Status code from :status (0 = not received yet)
+    status: u16,
+}
+
 struct Conn {
     fd: RawFd,
     /// Whether the TCP connection is established (true after a successful Connect CQE)
@@ -60,15 +68,15 @@ struct Conn {
     sending: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
+    /// GOAWAY received: no new streams, reconnect once in-flight streams drain
+    goaway: bool,
     /// Reconnect generation. Incremented on every close; CQEs from an old
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
     generation: u64,
-    /// Stream ID of the in-flight request (one request at a time per connection)
-    stream: Option<StreamId>,
-    /// Status code of the in-flight request (0 = not received yet)
-    status_code: u16,
-    request_start: Instant,
+    /// In-flight requests, up to the configured parallelism (linear scan;
+    /// the list is small)
+    streams: Vec<InFlight>,
 }
 
 impl Conn {
@@ -81,10 +89,9 @@ impl Conn {
             out_off: 0,
             sending: false,
             recv_armed: false,
+            goaway: false,
             generation: 0,
-            stream: None,
-            status_code: 0,
-            request_start: Instant::now(),
+            streams: Vec::new(),
         }
     }
 
@@ -97,24 +104,53 @@ impl Conn {
         self.connected = false;
         self.recv_armed = false;
         self.sending = false;
+        self.goaway = false;
         self.out.clear();
         self.out_off = 0;
         self.h2 = None;
-        self.stream = None;
+        self.streams.clear();
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation += 1;
     }
 
-    /// Open a new stream for the next request
-    fn start_request(&mut self, request_headers: &[HeaderField]) -> Result<()> {
-        let h2 = self.h2.as_mut().context("no h2 connection")?;
-        let stream_id = h2
-            .start_stream(request_headers.to_vec(), true)
-            .map_err(|e| anyhow::anyhow!("start_stream failed: {e:?}"))?;
-        self.stream = Some(stream_id);
-        self.status_code = 0;
-        self.request_start = Instant::now();
-        Ok(())
+    /// Count all in-flight requests as errors (used when the connection dies)
+    fn fail_inflight(&mut self, stats: &mut Stats) {
+        stats.errors += self.streams.len() as u64;
+        self.streams.clear();
+    }
+}
+
+/// Open new streams until the parallelism target or the request budget is hit
+///
+/// Stops early when start_stream refuses (e.g. the peer's
+/// SETTINGS_MAX_CONCURRENT_STREAMS limit); filling is retried after
+/// completions.
+fn fill_streams(
+    conn: &mut Conn,
+    request_headers: &[HeaderField],
+    parallel: usize,
+    started: &mut u64,
+    max_requests: u64,
+    stop: bool,
+) {
+    if stop || conn.goaway {
+        return;
+    }
+    let Some(h2) = conn.h2.as_mut() else {
+        return;
+    };
+    while conn.streams.len() < parallel && *started < max_requests {
+        match h2.start_stream(request_headers.to_vec(), true) {
+            Ok(stream_id) => {
+                conn.streams.push(InFlight {
+                    stream_id,
+                    start: Instant::now(),
+                    status: 0,
+                });
+                *started += 1;
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -141,27 +177,13 @@ fn flush(
     Ok(())
 }
 
-/// What happened to the in-flight request after processing h2 events
-struct EventOutcome {
-    /// The in-flight request finished
-    finished: bool,
-    /// It finished successfully (response fully received)
-    success: bool,
-    /// The TCP connection can be reused for the next request
-    keep_conn: bool,
-}
-
-/// Drain h2 events, replenish flow-control windows, and report the outcome of
-/// the in-flight request
-fn process_events(conn: &mut Conn) -> EventOutcome {
-    let mut outcome = EventOutcome {
-        finished: false,
-        success: false,
-        keep_conn: true,
-    };
+/// Drain h2 events, replenish flow-control windows, and record completed
+/// requests. Returns false if the connection is broken (connection error).
+fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
     let Some(h2) = conn.h2.as_mut() else {
-        return outcome;
+        return false;
     };
+    let mut alive = true;
     // Bytes counted against the connection-level receive window that we must
     // hand back via WINDOW_UPDATE
     let mut conn_consumed: usize = 0;
@@ -173,18 +195,18 @@ fn process_events(conn: &mut Conn) -> EventOutcome {
                 end_stream,
                 ..
             } => {
-                if Some(stream_id) == conn.stream {
+                if let Some(inflight) = conn.streams.iter_mut().find(|s| s.stream_id == stream_id) {
                     for field in &headers {
                         if field.name() == b":status" {
-                            conn.status_code = std::str::from_utf8(field.value())
+                            inflight.status = std::str::from_utf8(field.value())
                                 .ok()
                                 .and_then(|s| s.parse().ok())
                                 .unwrap_or(0);
                         }
                     }
                     if end_stream {
-                        outcome.finished = true;
-                        outcome.success = true;
+                        stats.record_success(inflight.status, inflight.start);
+                        conn.streams.retain(|s| s.stream_id != stream_id);
                     }
                 }
             }
@@ -194,10 +216,10 @@ fn process_events(conn: &mut Conn) -> EventOutcome {
                 end_stream,
             } => {
                 conn_consumed += data.len();
-                if Some(stream_id) == conn.stream {
+                if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
                     if end_stream {
-                        outcome.finished = true;
-                        outcome.success = true;
+                        let inflight = conn.streams.swap_remove(pos);
+                        stats.record_success(inflight.status, inflight.start);
                     } else if !data.is_empty() {
                         // Replenish the stream-level window; best effort, the
                         // stream may already be gone
@@ -211,9 +233,9 @@ fn process_events(conn: &mut Conn) -> EventOutcome {
                 ..
             } => {
                 conn_consumed += connection_window_consumed;
-                if Some(stream_id) == conn.stream && !outcome.finished {
-                    outcome.finished = true;
-                    outcome.success = false;
+                if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
+                    conn.streams.swap_remove(pos);
+                    stats.errors += 1;
                 }
             }
             Event::DataDiscarded {
@@ -223,14 +245,10 @@ fn process_events(conn: &mut Conn) -> EventOutcome {
                 conn_consumed += connection_window_consumed;
             }
             Event::GoawayReceived { .. } => {
-                outcome.keep_conn = false;
+                conn.goaway = true;
             }
             Event::ConnectionError { .. } => {
-                outcome.keep_conn = false;
-                if !outcome.finished {
-                    outcome.finished = true;
-                    outcome.success = false;
-                }
+                alive = false;
             }
             _ => {}
         }
@@ -239,20 +257,21 @@ fn process_events(conn: &mut Conn) -> EventOutcome {
     if conn_consumed > 0 {
         let _ = h2.send_window_update(StreamId::Connection, conn_consumed as u32);
     }
-    outcome
+    alive
 }
 
 /// Benchmark loop of a single HTTP/2 worker thread
 ///
 /// Speaks h2c with prior knowledge (no Upgrade dance): the client preface is
-/// sent immediately after the TCP connect. One request is in flight per
-/// connection at a time.
+/// sent immediately after the TCP connect. Up to `parallel` streams are kept
+/// in flight per connection.
 pub fn run_worker(
     target: &Target,
     connections: usize,
     max_requests: u64,
     duration_limit: Option<Duration>,
     connect_timeout: Duration,
+    parallel: usize,
 ) -> Result<Stats> {
     if connections == 0 || max_requests == 0 {
         return Ok(Stats::default());
@@ -305,6 +324,9 @@ pub fn run_worker(
     if duration_limit.is_none() {
         stats.latencies_ns.reserve(max_requests as usize);
     }
+    // Number of streams opened (requests actually begun). Failed connect
+    // attempts also consume one unit of the request budget so that -n
+    // terminates when the server is unreachable.
     let mut started: u64 = 0;
 
     // Duration mode: the deadline is detected solely via the io_uring Timeout CQE
@@ -316,12 +338,11 @@ pub fn run_worker(
         uring::push_sqe(&submitter, &mut sq, entry)?;
     }
 
-    // Kick off the initial requests (connection setup is async via io_uring too)
+    // Kick off the initial connects (streams are opened on connect completion)
     for (i, conn) in conns.iter_mut().enumerate() {
-        if started >= max_requests {
+        if (i as u64) >= max_requests {
             break;
         }
-        started += 1;
         conn.fd = uring::start_connect(
             &submitter,
             &mut sq,
@@ -371,8 +392,8 @@ pub fn run_worker(
                 continue;
             }
 
-            let mut request_finished = false;
-            let mut keep_conn = true;
+            // The connection died (or refused); reconnect if budget remains
+            let mut conn_broken = false;
 
             match op {
                 OP_CONNECT => {
@@ -380,8 +401,8 @@ pub fn run_worker(
                         // e.g. ECONNREFUSED, or ECANCELED when the LinkTimeout fired
                         stats.errors += 1;
                         stats.connect_errors += 1;
-                        request_finished = true;
-                        keep_conn = false;
+                        started += 1;
+                        conn_broken = true;
                     } else {
                         let conn = &mut conns[conn_idx];
                         conn.connected = true;
@@ -389,12 +410,19 @@ pub fn run_worker(
                         uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                         conn.recv_armed = true;
                         // h2c prior knowledge: send the client preface + SETTINGS
-                        // and the first request in a single flush
+                        // and the first requests in a single flush
                         let mut h2 = Connection::client(limits.clone());
                         h2.initiate()
                             .map_err(|e| anyhow::anyhow!("h2 initiate failed: {e:?}"))?;
                         conn.h2 = Some(h2);
-                        conn.start_request(&request_headers)?;
+                        fill_streams(
+                            conn,
+                            &request_headers,
+                            parallel,
+                            &mut started,
+                            max_requests,
+                            stop,
+                        );
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
@@ -403,20 +431,18 @@ pub fn run_worker(
                 }
                 OP_SEND => {
                     if res < 0 {
-                        stats.errors += 1;
-                        request_finished = true;
-                        keep_conn = false;
+                        conns[conn_idx].fail_inflight(&mut stats);
+                        conn_broken = true;
                     } else {
                         stats.bytes_sent += res as u64;
                         let conn = &mut conns[conn_idx];
                         conn.out_off += res as usize;
                         if conn.out_off < conn.out.len() {
-                            let remaining_gen = conn.generation;
                             uring::push_send_slice(
                                 &submitter,
                                 &mut sq,
                                 conn_idx,
-                                remaining_gen,
+                                conn.generation,
                                 &conn.out[conn.out_off..],
                             )?;
                         } else {
@@ -450,20 +476,21 @@ pub fn run_worker(
                             uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                             conn.recv_armed = true;
                         } else {
-                            stats.errors += 1;
-                            request_finished = true;
-                            keep_conn = false;
+                            conn.fail_inflight(&mut stats);
+                            conn_broken = true;
                         }
                     } else if res == 0 {
                         if let Some(bid) = cqueue::buffer_select(flags) {
                             buf_ring.recycle(bid);
                         }
-                        // EOF mid-request is always an error for HTTP/2
-                        stats.errors += 1;
-                        request_finished = true;
-                        keep_conn = false;
+                        // EOF mid-connection: fail whatever is still in flight
+                        conn.fail_inflight(&mut stats);
+                        conn_broken = true;
                     } else {
                         stats.bytes_received += res as u64;
+                        // Keep our ACKs immediate so a Nagle-enabled peer is
+                        // never stuck waiting on our delayed ACK
+                        uring::set_quickack(conn.fd);
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
                         let feed_ok = {
@@ -473,23 +500,22 @@ pub fn run_worker(
                         buf_ring.recycle(bid);
                         let process_ok =
                             feed_ok && conn.h2.as_mut().is_some_and(|h2| h2.process().is_ok());
-                        if !process_ok {
-                            stats.errors += 1;
-                            request_finished = true;
-                            keep_conn = false;
+                        if !process_ok || !process_events(conn, &mut stats) {
+                            conn.fail_inflight(&mut stats);
+                            conn_broken = true;
+                        } else if conn.goaway && conn.streams.is_empty() {
+                            // GOAWAY and every in-flight stream has drained
+                            conn_broken = true;
                         } else {
-                            let outcome = process_events(conn);
-                            keep_conn = outcome.keep_conn;
-                            if outcome.finished {
-                                if outcome.success {
-                                    stats.record_success(conn.status_code, conn.request_start);
-                                } else {
-                                    stats.errors += 1;
-                                }
-                                conn.stream = None;
-                                request_finished = true;
-                            }
-                            // Send window updates / ACKs generated above
+                            fill_streams(
+                                conn,
+                                &request_headers,
+                                parallel,
+                                &mut started,
+                                max_requests,
+                                stop,
+                            );
+                            // Send window updates / ACKs / new request HEADERS
                             flush(&submitter, &mut sq, conn_idx, conn)?;
                         }
                     }
@@ -497,37 +523,25 @@ pub fn run_worker(
                 _ => unreachable!(),
             }
 
-            if request_finished {
+            if conn_broken {
                 let conn = &mut conns[conn_idx];
+                conn.close();
                 if !stop && started < max_requests {
-                    started += 1;
-                    if keep_conn && conn.connected && conn.h2.is_some() {
-                        if !conn.recv_armed {
-                            uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
-                            conn.recv_armed = true;
-                        }
-                        conn.start_request(&request_headers)?;
-                        flush(&submitter, &mut sq, conn_idx, conn)?;
-                    } else {
-                        conn.close();
-                        match uring::start_connect(
-                            &submitter,
-                            &mut sq,
-                            conn_idx,
-                            conn.generation,
-                            &target.addr,
-                            &raw_addr,
-                            &connect_timeout,
-                        ) {
-                            Ok(fd) => conn.fd = fd,
-                            Err(e) => {
-                                eprintln!("reconnect failed: {e}");
-                                break 'outer;
-                            }
+                    match uring::start_connect(
+                        &submitter,
+                        &mut sq,
+                        conn_idx,
+                        conn.generation,
+                        &target.addr,
+                        &raw_addr,
+                        &connect_timeout,
+                    ) {
+                        Ok(fd) => conn.fd = fd,
+                        Err(e) => {
+                            eprintln!("reconnect failed: {e}");
+                            break 'outer;
                         }
                     }
-                } else if !keep_conn {
-                    conn.close();
                 }
             }
         }
@@ -537,7 +551,25 @@ pub fn run_worker(
         }
     }
 
+    // Best-effort GOAWAY before closing so servers do not log our teardown as
+    // a connection error. The frame is tiny, so a non-blocking send on the raw
+    // fd is enough; if the socket buffer is full we just close as before.
     for conn in &mut conns {
+        if conn.connected
+            && let Some(h2) = conn.h2.as_mut()
+        {
+            let _ = h2.send_goaway(ErrorCode::NoError, Vec::new());
+            if let Some(buf) = h2.poll_output() {
+                unsafe {
+                    libc::send(
+                        conn.fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    );
+                }
+            }
+        }
         conn.close();
     }
 

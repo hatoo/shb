@@ -48,6 +48,10 @@ pub struct Args {
     /// Use HTTP/2 (h2c with prior knowledge)
     #[arg(long)]
     pub http2: bool,
+
+    /// Number of concurrent streams per connection (HTTP/2 only)
+    #[arg(short = 'p', long, default_value_t = 1)]
+    pub parallel: usize,
 }
 
 /// Default number of threads (number of CPUs)
@@ -62,6 +66,12 @@ fn main() -> Result<()> {
     }
     if args.threads == 0 {
         bail!("--threads must be >= 1");
+    }
+    if args.parallel == 0 {
+        bail!("--parallel must be >= 1");
+    }
+    if args.parallel > 1 && !args.http2 {
+        bail!("--parallel requires --http2");
     }
     let target = parse_target(&args.url)?;
 
@@ -86,12 +96,6 @@ fn main() -> Result<()> {
             .collect()
     };
 
-    let run_worker = if args.http2 {
-        http2::run_worker
-    } else {
-        http1::run_worker
-    };
-
     let bench_start = Instant::now();
     let results: Vec<Result<Stats>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
@@ -100,14 +104,27 @@ fn main() -> Result<()> {
                 let connections = conns_per_thread[i];
                 let max_requests = requests_per_thread[i];
                 let connect_timeout = args.connect_timeout;
+                let http2 = args.http2;
+                let parallel = args.parallel;
                 s.spawn(move || {
-                    run_worker(
-                        target,
-                        connections,
-                        max_requests,
-                        duration_limit,
-                        connect_timeout,
-                    )
+                    if http2 {
+                        http2::run_worker(
+                            target,
+                            connections,
+                            max_requests,
+                            duration_limit,
+                            connect_timeout,
+                            parallel,
+                        )
+                    } else {
+                        http1::run_worker(
+                            target,
+                            connections,
+                            max_requests,
+                            duration_limit,
+                            connect_timeout,
+                        )
+                    }
                 })
             })
             .collect();
