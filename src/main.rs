@@ -40,6 +40,10 @@ struct Args {
     /// Number of worker threads
     #[arg(short = 't', long, default_value_t = default_threads())]
     threads: usize,
+
+    /// Print the report as JSON
+    #[arg(short = 'j', long)]
+    json: bool,
 }
 
 /// スレッド数のデフォルト値 (CPU 数)
@@ -611,7 +615,11 @@ fn main() -> Result<()> {
         stats.merge(result?);
     }
 
-    print_report(&args, threads, &stats, elapsed);
+    if args.json {
+        print_json_report(&args, threads, &stats, elapsed)?;
+    } else {
+        print_report(&args, threads, &stats, elapsed);
+    }
     Ok(())
 }
 
@@ -918,6 +926,36 @@ fn run_worker(
     Ok(stats)
 }
 
+/// レイテンシ要約 (秒)
+struct LatencySummary {
+    min: f64,
+    mean: f64,
+    p50: f64,
+    p90: f64,
+    p99: f64,
+    max: f64,
+}
+
+fn latency_summary(latencies_ns: &[u64]) -> Option<LatencySummary> {
+    if latencies_ns.is_empty() {
+        return None;
+    }
+    let mut lat = latencies_ns.to_vec();
+    lat.sort_unstable();
+    let pct = |p: f64| -> f64 {
+        let idx = ((lat.len() as f64 * p).ceil() as usize).saturating_sub(1);
+        lat[idx.min(lat.len() - 1)] as f64 / 1e9
+    };
+    Some(LatencySummary {
+        min: lat[0] as f64 / 1e9,
+        mean: lat.iter().sum::<u64>() as f64 / lat.len() as f64 / 1e9,
+        p50: pct(0.50),
+        p90: pct(0.90),
+        p99: pct(0.99),
+        max: lat[lat.len() - 1] as f64 / 1e9,
+    })
+}
+
 fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
     let total = stats.completed + stats.errors;
@@ -949,23 +987,56 @@ fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) {
         }
     }
 
-    if !stats.latencies_ns.is_empty() {
-        let mut lat = stats.latencies_ns.clone();
-        lat.sort_unstable();
-        let pct = |p: f64| -> f64 {
-            let idx = ((lat.len() as f64 * p).ceil() as usize).saturating_sub(1);
-            lat[idx.min(lat.len() - 1)] as f64 / 1e6
-        };
-        let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64 / 1e6;
+    if let Some(l) = latency_summary(&stats.latencies_ns) {
         println!("Latency (ms):");
         println!(
             "  min {:.3}  mean {:.3}  p50 {:.3}  p90 {:.3}  p99 {:.3}  max {:.3}",
-            lat[0] as f64 / 1e6,
-            mean,
-            pct(0.50),
-            pct(0.90),
-            pct(0.99),
-            lat[lat.len() - 1] as f64 / 1e6,
+            l.min * 1e3,
+            l.mean * 1e3,
+            l.p50 * 1e3,
+            l.p90 * 1e3,
+            l.p99 * 1e3,
+            l.max * 1e3,
         );
     }
+}
+
+fn print_json_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) -> Result<()> {
+    let secs = elapsed.as_secs_f64();
+    let status_codes: serde_json::Map<String, serde_json::Value> = stats
+        .status_counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(code, &n)| (code.to_string(), n.into()))
+        .collect();
+    let latency = latency_summary(&stats.latencies_ns).map(|l| {
+        serde_json::json!({
+            "min": l.min,
+            "mean": l.mean,
+            "p50": l.p50,
+            "p90": l.p90,
+            "p99": l.p99,
+            "max": l.max,
+        })
+    });
+    let report = serde_json::json!({
+        "url": args.url,
+        "threads": threads,
+        "connections": args.connections,
+        "durationSeconds": secs,
+        "requests": {
+            "total": stats.completed + stats.errors,
+            "ok": stats.completed,
+            "errors": stats.errors,
+            "connectErrors": stats.connect_errors,
+        },
+        "requestsPerSec": stats.completed as f64 / secs,
+        "bytesReceived": stats.bytes_received,
+        "bytesPerSec": stats.bytes_received as f64 / secs,
+        "statusCodes": status_codes,
+        "latencySeconds": latency,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
