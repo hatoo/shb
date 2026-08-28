@@ -1,6 +1,6 @@
 use std::mem;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -51,70 +51,18 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-/// io_uring の Connect SQE に渡す sockaddr。SQE 完了まで移動しないよう保持する
-struct SockAddrRaw {
-    storage: libc::sockaddr_storage,
-    len: libc::socklen_t,
-}
-
-impl SockAddrRaw {
-    fn new(addr: &SocketAddr) -> Self {
-        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-        let len = match addr {
-            SocketAddr::V4(a) => {
-                let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
-                sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_port = a.port().to_be();
-                sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
-                mem::size_of::<libc::sockaddr_in>()
-            }
-            SocketAddr::V6(a) => {
-                let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
-                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                sin6.sin6_port = a.port().to_be();
-                sin6.sin6_addr.s6_addr = a.ip().octets();
-                sin6.sin6_flowinfo = a.flowinfo();
-                sin6.sin6_scope_id = a.scope_id();
-                mem::size_of::<libc::sockaddr_in6>()
-            }
-        };
-        SockAddrRaw {
-            storage,
-            len: len as libc::socklen_t,
-        }
-    }
-
-    fn as_ptr(&self) -> *const libc::sockaddr {
-        &self.storage as *const _ as *const libc::sockaddr
-    }
-}
-
 /// 未接続の TCP ソケットを作成し TCP_NODELAY を設定する
 fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
-    let domain = match addr {
-        SocketAddr::V4(_) => libc::AF_INET,
-        SocketAddr::V6(_) => libc::AF_INET6,
-    };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("socket() failed");
-    }
-    let one: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            &one as *const _ as *const libc::c_void,
-            mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        drop(unsafe { TcpStream::from_raw_fd(fd) });
-        return Err(err).context("setsockopt(TCP_NODELAY) failed");
-    }
-    Ok(fd)
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(*addr),
+        socket2::Type::STREAM,
+        None,
+    )
+    .context("socket() failed")?;
+    socket
+        .set_tcp_nodelay(true)
+        .context("setsockopt(TCP_NODELAY) failed")?;
+    Ok(socket.into_raw_fd())
 }
 
 /// multishot recv 用の provided buffer ring
@@ -438,7 +386,7 @@ fn start_connect(
     conn_idx: usize,
     conn: &mut Conn,
     addr: &SocketAddr,
-    raw_addr: &SockAddrRaw,
+    raw_addr: &socket2::SockAddr,
     timeout: &types::Timespec,
 ) -> Result<()> {
     conn.fd = make_socket(addr)?;
@@ -448,8 +396,8 @@ fn start_connect(
         .context("register_files_update failed")?;
     let connect = opcode::Connect::new(
         types::Fixed(conn_idx as u32),
-        raw_addr.as_ptr(),
-        raw_addr.len,
+        raw_addr.as_ptr().cast::<libc::sockaddr>(),
+        raw_addr.len(),
     )
     .build()
     .flags(squeue::Flags::IO_LINK)
@@ -694,7 +642,7 @@ fn run_worker(
     }
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
-    let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
+    let raw_addr = Box::new(socket2::SockAddr::from(target.addr));
     let connect_timeout = Box::new(types::Timespec::from(connect_timeout));
 
     let mut stats = Stats::default();

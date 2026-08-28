@@ -240,6 +240,7 @@ dependencies = [
  "libc",
  "serde_json",
  "shiguredo_http11",
+ "socket2",
 ]
 
 [[package]]
@@ -247,6 +248,16 @@ name = "shiguredo_http11"
 version = "2026.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521929c2893005420ccee04aada685000c967cbcae36cd46117b40bf5495e5ab"
+
+[[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "strsim"
