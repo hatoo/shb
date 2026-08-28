@@ -173,6 +173,16 @@ enum ParseOutcome {
     NeedMoreData,
 }
 
+/// デコード済みヘッダーから抜き出した、現在のレスポンスのメタ情報
+///
+/// ResponseHead は decode_headers で消費されるため、完了時まで必要な値だけ残す。
+struct ResponseMeta {
+    body_kind: BodyKind,
+    keep_alive: bool,
+    /// ステータスコード (完了時に集計する)
+    status_code: u16,
+}
+
 struct Conn {
     fd: RawFd,
     /// TCP 接続が確立済みか (Connect CQE 成功で true)
@@ -184,15 +194,9 @@ struct Conn {
     recv_window: usize,
     /// 直前の recv で確保した枠のサイズ (枠を使い切ったか判定用)
     last_recv_len: usize,
-    /// 現在のレスポンスのヘッダーをデコード済みか
-    head_done: bool,
-    body_kind: BodyKind,
-    keep_alive: bool,
-    /// 現在のレスポンスのステータスコード (完了時に集計する)
-    status_code: u16,
+    /// 現在のレスポンスのメタ情報 (None = ヘッダー未デコード)
+    resp: Option<ResponseMeta>,
     request_start: Instant,
-    /// このコネクションが現在リクエストを処理中か
-    active: bool,
 }
 
 impl Conn {
@@ -204,12 +208,8 @@ impl Conn {
             send_offset: 0,
             recv_window: RECV_WINDOW_INIT,
             last_recv_len: 0,
-            head_done: false,
-            body_kind: BodyKind::None,
-            keep_alive: true,
-            status_code: 0,
+            resp: None,
             request_start: Instant::now(),
-            active: false,
         }
     }
 
@@ -224,58 +224,57 @@ impl Conn {
 
     /// 受信済みデータをデコーダーに与えた後の状態遷移を進める
     fn parse(&mut self) -> Result<ParseOutcome> {
-        if !self.head_done {
-            match self
+        let meta = match &self.resp {
+            Some(meta) => meta,
+            None => match self
                 .decoder
                 .decode_headers()
                 .map_err(|e| anyhow::anyhow!("decode error: {e:?}"))?
             {
                 None => return Ok(ParseOutcome::NeedMoreData),
-                Some((head, body_kind)) => {
-                    self.head_done = true;
-                    self.body_kind = body_kind;
-                    self.keep_alive = response_keep_alive(&head, body_kind);
-                    self.status_code = head.status_code();
-                }
-            }
-        }
+                Some((head, body_kind)) => &*self.resp.insert(ResponseMeta {
+                    body_kind,
+                    keep_alive: response_keep_alive(&head, body_kind),
+                    status_code: head.status_code(),
+                }),
+            },
+        };
 
-        match self.body_kind {
+        match meta.body_kind {
             BodyKind::None => Ok(ParseOutcome::Complete {
-                keep_alive: self.keep_alive,
+                keep_alive: meta.keep_alive,
             }),
             BodyKind::Tunnel => bail!("unexpected tunnel response"),
-            _ => loop {
-                let progress = if let Some(body) = self.decoder.peek_body() {
-                    let len = body.len();
-                    self.decoder
-                        .consume_body(len)
-                        .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
-                } else {
-                    self.decoder
-                        .progress()
-                        .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
-                };
-                match progress {
-                    BodyProgress::Complete { .. } => {
-                        return Ok(ParseOutcome::Complete {
-                            keep_alive: self.keep_alive,
-                        });
+            _ => {
+                let keep_alive = meta.keep_alive;
+                loop {
+                    let progress = if let Some(body) = self.decoder.peek_body() {
+                        let len = body.len();
+                        self.decoder
+                            .consume_body(len)
+                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
+                    } else {
+                        self.decoder
+                            .progress()
+                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
+                    };
+                    match progress {
+                        BodyProgress::Complete { .. } => {
+                            return Ok(ParseOutcome::Complete { keep_alive });
+                        }
+                        BodyProgress::Advanced => continue,
+                        BodyProgress::NeedData => return Ok(ParseOutcome::NeedMoreData),
                     }
-                    BodyProgress::Advanced => continue,
-                    BodyProgress::NeedData => return Ok(ParseOutcome::NeedMoreData),
                 }
-            },
+            }
         }
     }
 
     /// 次のリクエストに向けて状態をリセット
     fn begin_request(&mut self) {
         self.send_offset = 0;
-        self.head_done = false;
-        self.body_kind = BodyKind::None;
+        self.resp = None;
         self.request_start = Instant::now();
-        self.active = true;
     }
 }
 
@@ -426,7 +425,9 @@ impl Default for Stats {
 impl Stats {
     fn record_success(&mut self, conn: &Conn) {
         self.completed += 1;
-        self.status_counts[conn.status_code as usize] += 1;
+        if let Some(meta) = &conn.resp {
+            self.status_counts[meta.status_code as usize] += 1;
+        }
         self.latencies_ns
             .push(conn.request_start.elapsed().as_nanos() as u64);
     }
@@ -640,7 +641,8 @@ fn run_worker(
                         keep_conn = false;
                     } else if res == 0 {
                         // EOF: close-delimited ボディなら正常完了
-                        if conn.head_done && conn.decoder.is_close_delimited() {
+                        // (is_close_delimited はヘッダーデコード済みを含意する)
+                        if conn.decoder.is_close_delimited() {
                             conn.decoder.mark_eof();
                             match conn.parse() {
                                 Ok(ParseOutcome::Complete { .. }) => stats.record_success(conn),
@@ -684,7 +686,6 @@ fn run_worker(
 
             if request_finished {
                 let conn = &mut conns[conn_idx];
-                conn.active = false;
                 if !stop && started < max_requests {
                     started += 1;
                     conn.begin_request();
