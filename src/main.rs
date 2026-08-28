@@ -1,6 +1,7 @@
 mod buf_ring;
 mod http1;
 mod http2;
+mod http3;
 mod report;
 mod shutdown;
 mod stats;
@@ -10,7 +11,7 @@ mod uring;
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::report::{print_json_report, print_report};
@@ -18,7 +19,11 @@ use crate::stats::Stats;
 use crate::target::parse_target;
 
 #[derive(Parser)]
-#[command(name = "shb", about = "io_uring HTTP/1.1 & HTTP/2 benchmarker")]
+#[command(
+    name = "shb",
+    about = "io_uring HTTP/1.1 / HTTP/2 / HTTP/3 benchmarker"
+)]
+#[command(group = clap::ArgGroup::new("proto").args(["http2", "http3"]).multiple(false))]
 pub struct Args {
     /// Target URL, e.g. http://127.0.0.1:8080/ or https://example.com/
     /// (TLS trusts every certificate: this is a benchmarker)
@@ -52,13 +57,17 @@ pub struct Args {
     #[arg(long)]
     pub http2: bool,
 
-    /// Number of concurrent streams per connection (HTTP/2 only)
+    /// Use HTTP/3 over QUIC (https:// URLs only)
+    #[arg(long)]
+    pub http3: bool,
+
+    /// Number of concurrent streams per connection (HTTP/2 and HTTP/3)
     #[arg(
         short = 'p',
         long,
         default_value_t = 1,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
-        requires = "http2"
+        requires = "proto"
     )]
     pub parallel: usize,
 }
@@ -76,8 +85,13 @@ fn main() -> Result<()> {
     // flag, workers notice it within ~100ms and return their stats normally
     shutdown::install();
 
-    // Shared TLS configuration (https URLs only); ALPN follows the protocol
-    let tls_setup = if target.tls {
+    if args.http3 && !target.tls {
+        bail!("--http3 requires an https:// URL");
+    }
+
+    // Shared TLS configuration for the TCP protocols (https URLs only); the
+    // HTTP/3 worker builds its own QUIC TLS configuration
+    let tls_setup = if target.tls && !args.http3 {
         let alpn: &[u8] = if args.http2 { b"h2" } else { b"http/1.1" };
         Some(tls::setup(&target.host, alpn)?)
     } else {
@@ -114,10 +128,20 @@ fn main() -> Result<()> {
                 let max_requests = requests_per_thread[i];
                 let connect_timeout = args.connect_timeout;
                 let http2 = args.http2;
+                let http3 = args.http3;
                 let parallel = args.parallel;
                 let tls = tls_setup.as_ref();
                 s.spawn(move || {
-                    if http2 {
+                    if http3 {
+                        http3::run_worker(
+                            target,
+                            connections,
+                            max_requests,
+                            duration_limit,
+                            connect_timeout,
+                            parallel,
+                        )
+                    } else if http2 {
                         http2::run_worker(
                             target,
                             tls,

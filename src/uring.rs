@@ -46,20 +46,40 @@ pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
 /// shutdown request promptly even when completely idle. During active
 /// benchmarking CQEs arrive far more often, so this timeout almost never
 /// fires.
-const WAIT_TIMEOUT: types::Timespec = types::Timespec::new().nsec(100_000_000);
+pub const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Submit pending SQEs and wait for at least one CQE, bounded by
-/// [`WAIT_TIMEOUT`]
+/// Submit pending SQEs and wait for at least one CQE, bounded by `max_wait`
 ///
 /// A timeout (ETIME) and a signal interruption (EINTR) both return Ok with no
 /// completions; the caller's loop then re-checks its stop conditions.
-pub fn submit_and_wait_timeout(submitter: &Submitter<'_>) -> Result<()> {
-    let args = types::SubmitArgs::new().timespec(&WAIT_TIMEOUT);
+pub fn submit_and_wait_timeout(
+    submitter: &Submitter<'_>,
+    max_wait: std::time::Duration,
+) -> Result<()> {
+    let ts = types::Timespec::from(max_wait);
+    let args = types::SubmitArgs::new().timespec(&ts);
     match submitter.submit_with_args(1, &args) {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME) | Some(libc::EINTR)) => Ok(()),
         Err(e) => Err(e).context("submit_and_wait failed"),
     }
+}
+
+/// Create a UDP socket connected to `addr` (for QUIC)
+///
+/// UDP connect just sets the default peer, so doing it synchronously here is
+/// fine; no io_uring Connect round-trip is needed.
+pub fn make_udp_socket(addr: &SocketAddr) -> Result<RawFd> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(*addr),
+        socket2::Type::DGRAM,
+        None,
+    )
+    .context("socket() failed")?;
+    socket
+        .connect(&socket2::SockAddr::from(*addr))
+        .context("UDP connect failed")?;
+    Ok(socket.into_raw_fd())
 }
 
 /// Re-arm TCP_QUICKACK so our ACKs go out immediately

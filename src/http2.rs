@@ -416,7 +416,7 @@ pub fn run_worker(
         }
         // Publish the tail of pushed SQEs before submitting
         sq.sync();
-        uring::submit_and_wait_timeout(&submitter)?;
+        uring::submit_and_wait_timeout(&submitter, uring::WAIT_TIMEOUT)?;
 
         cq.sync();
         cqe_buf.clear();

@@ -57,10 +57,10 @@ impl ServerCertVerifier for TrustAll {
     }
 }
 
-/// Build the shared client configuration
+/// Build a trust-everything rustls client configuration
 ///
-/// `alpn` is the single protocol to offer (`b"h2"` or `b"http/1.1"`).
-pub fn setup(host: &str, alpn: &[u8]) -> Result<TlsSetup> {
+/// `alpn` is the single protocol to offer (`b"h3"`, `b"h2"` or `b"http/1.1"`).
+pub fn client_config(alpn: &[u8]) -> Result<Arc<ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -69,9 +69,15 @@ pub fn setup(host: &str, alpn: &[u8]) -> Result<TlsSetup> {
         .with_custom_certificate_verifier(Arc::new(TrustAll(provider)))
         .with_no_client_auth();
     config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Build the shared client configuration for the TCP-based protocols
+pub fn setup(host: &str, alpn: &[u8]) -> Result<TlsSetup> {
+    let config = client_config(alpn)?;
     let server_name = ServerName::try_from(host.to_string()).context("invalid TLS server name")?;
     Ok(TlsSetup {
-        config: Arc::new(config),
+        config,
         server_name,
     })
 }
