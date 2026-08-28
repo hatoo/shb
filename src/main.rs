@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use io_uring::{IoUring, opcode, squeue, types};
-use shiguredo_http11::{BodyKind, BodyProgress, Request, ResponseDecoder};
+use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, Request, ResponseDecoder};
 
 /// recv 書き込み枠の初期値。mut_buf はゼロ初期化を伴うため小さく始め、
 /// 枠を使い切った recv が続く間だけ倍増させる (上限 RECV_WINDOW_MAX)
@@ -234,7 +234,10 @@ impl Conn {
                 None => return Ok(ParseOutcome::NeedMoreData),
                 Some((head, body_kind)) => &*self.resp.insert(ResponseMeta {
                     body_kind,
-                    keep_alive: response_keep_alive(&head, body_kind),
+                    // close-delimited ボディは Connection ヘッダーに関わらず
+                    // 接続終了がボディ終端なので keep-alive 不可
+                    keep_alive: head.is_keep_alive()
+                        && !matches!(body_kind, BodyKind::CloseDelimited),
                     status_code: head.status_code(),
                 }),
             },
@@ -275,31 +278,6 @@ impl Conn {
         self.send_offset = 0;
         self.resp = None;
         self.request_start = Instant::now();
-    }
-}
-
-fn response_keep_alive(head: &shiguredo_http11::ResponseHead, body_kind: BodyKind) -> bool {
-    if matches!(body_kind, BodyKind::CloseDelimited) {
-        return false;
-    }
-    let mut connection_close = false;
-    let mut connection_keep_alive = false;
-    for (name, value) in head.headers() {
-        if *name == "connection" {
-            for token in value.split(',') {
-                let token = token.trim();
-                if token.eq_ignore_ascii_case("close") {
-                    connection_close = true;
-                } else if token.eq_ignore_ascii_case("keep-alive") {
-                    connection_keep_alive = true;
-                }
-            }
-        }
-    }
-    if head.version() == "HTTP/1.0" {
-        connection_keep_alive && !connection_close
-    } else {
-        !connection_close
     }
 }
 
@@ -526,13 +504,17 @@ fn run_worker(
         return Ok(Stats::default());
     }
 
-    let entries = (connections * 2).next_power_of_two().max(256) as u32;
-    let mut ring = IoUring::new(entries).context("failed to create io_uring")?;
-
+    // conns は ring より先に宣言する。逆順 drop により ring (teardown 時に
+    // in-flight オペレーションのキャンセル完了を待つ) が先に破棄され、
+    // in-flight recv が書き込むデコーダーバッファ (conns 内) の解放後に
+    // kernel が書き込む use-after-free を防ぐ。
     let mut conns: Vec<Conn> = Vec::with_capacity(connections);
     for _ in 0..connections {
         conns.push(Conn::new());
     }
+
+    let entries = (connections * 2).next_power_of_two().max(256) as u32;
+    let mut ring = IoUring::new(entries).context("failed to create io_uring")?;
 
     // Connect SQE が参照する sockaddr / Timespec は完了まで安定したアドレスに置く
     let raw_addr = Box::new(SockAddrRaw::new(&target.addr));
