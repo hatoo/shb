@@ -483,7 +483,19 @@ fn h1_body_from_file() {
     std::fs::write(&path, b"filebody").expect("write body file");
     let arg = format!("@{}", path.display());
     let report = shb_json(&[
-        "-m", "POST", "-H", "X-Echo: filebody", "-d", &arg, "-n", "20", "-c", "2", "-t", "1", &url,
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: filebody",
+        "-d",
+        &arg,
+        "-n",
+        "20",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
     ]);
     let _ = std::fs::remove_file(&path);
     assert_all_ok(&report, 20, "201");
@@ -499,7 +511,19 @@ fn h1_body_from_file_strips_newlines() {
     std::fs::write(&path, b"a\r\nb\nc").expect("write body file");
     let arg = format!("@{}", path.display());
     let report = shb_json(&[
-        "-m", "POST", "-H", "X-Echo: abc", "-d", &arg, "-n", "10", "-c", "2", "-t", "1", &url,
+        "-m",
+        "POST",
+        "-H",
+        "X-Echo: abc",
+        "-d",
+        &arg,
+        "-n",
+        "10",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
     ]);
     let _ = std::fs::remove_file(&path);
     assert_all_ok(&report, 10, "201");
