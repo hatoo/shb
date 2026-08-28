@@ -8,7 +8,7 @@ mod uring;
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 
 use crate::report::{print_json_report, print_report};
@@ -22,7 +22,7 @@ pub struct Args {
     pub url: String,
 
     /// Number of concurrent connections
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub connections: usize,
 
     /// Total number of requests
@@ -38,7 +38,7 @@ pub struct Args {
     pub connect_timeout: Duration,
 
     /// Number of worker threads
-    #[arg(short = 't', long, default_value_t = default_threads())]
+    #[arg(short = 't', long, default_value_t = default_threads(), value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub threads: usize,
 
     /// Print the report as JSON
@@ -50,7 +50,13 @@ pub struct Args {
     pub http2: bool,
 
     /// Number of concurrent streams per connection (HTTP/2 only)
-    #[arg(short = 'p', long, default_value_t = 1)]
+    #[arg(
+        short = 'p',
+        long,
+        default_value_t = 1,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+        requires = "http2"
+    )]
     pub parallel: usize,
 }
 
@@ -61,18 +67,6 @@ fn default_threads() -> usize {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.connections == 0 {
-        bail!("--connections must be >= 1");
-    }
-    if args.threads == 0 {
-        bail!("--threads must be >= 1");
-    }
-    if args.parallel == 0 {
-        bail!("--parallel must be >= 1");
-    }
-    if args.parallel > 1 && !args.http2 {
-        bail!("--parallel requires --http2");
-    }
     let target = parse_target(&args.url)?;
 
     let duration_limit = args.duration;
