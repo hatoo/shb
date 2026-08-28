@@ -930,26 +930,3 @@ fn handle_broken(
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::target::parse_target;
-
-    #[test]
-    fn request_headers_reflect_the_target() {
-        let target = parse_target("https://127.0.0.1:3443/xyz", "PUT").unwrap();
-        let headers = build_request_headers(&target).unwrap();
-        let get = |name: &[u8]| {
-            headers
-                .iter()
-                .find(|h| h.name() == name)
-                .map(|h| h.value().to_vec())
-                .expect("header must exist")
-        };
-        assert_eq!(get(b":method"), b"PUT");
-        assert_eq!(get(b":scheme"), b"https");
-        assert_eq!(get(b":authority"), b"127.0.0.1:3443");
-        assert_eq!(get(b":path"), b"/xyz");
-    }
-}

@@ -18,3 +18,13 @@ shiguredo_http11 = "=2026.7.0-canary.2"
 shiguredo_http2 = "2026.1.0-canary.13"
 shiguredo_http3 = "=2026.1.0-canary.8"
 socket2 = "0.6.5"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["http2"] }
+bytes = "1.12.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.5.0"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rcgen = "0.14.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }

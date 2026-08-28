@@ -1,0 +1,302 @@
+//! End-to-end tests: run the compiled shb binary against local test servers
+//! and assert on the JSON report.
+//!
+//! - HTTP/1.1 and h2c (prior knowledge): one axum server (hyper auto mode)
+//! - HTTP/3: quinn + h3 with an rcgen self-signed certificate, which the
+//!   trust-everything client accepts
+
+use std::net::SocketAddr;
+use std::process::Command;
+use std::sync::OnceLock;
+
+use axum::Router;
+use axum::http::{Method, StatusCode};
+use axum::routing::any;
+
+/// Status code by method so tests can verify the method actually reached the
+/// server: GET/HEAD -> 200, POST -> 201, DELETE -> 204, others -> 405
+async fn handler(method: Method) -> (StatusCode, &'static str) {
+    match method {
+        // hyper strips the body for HEAD responses but keeps Content-Length,
+        // which is exactly the case the h1 HEAD decoding must handle
+        Method::GET | Method::HEAD => (StatusCode::OK, "hello world"),
+        Method::POST => (StatusCode::CREATED, "created"),
+        Method::DELETE => (StatusCode::NO_CONTENT, ""),
+        _ => (StatusCode::METHOD_NOT_ALLOWED, ""),
+    }
+}
+
+/// Bound addresses of the shared test server: (IPv4, IPv6)
+fn server_addrs() -> (SocketAddr, SocketAddr) {
+    static SERVER: OnceLock<(SocketAddr, SocketAddr)> = OnceLock::new();
+    *SERVER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async move {
+                let app = Router::new()
+                    .route("/", any(handler))
+                    .route("/{*path}", any(handler));
+                let v4 = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind v4");
+                let v6 = tokio::net::TcpListener::bind("[::1]:0")
+                    .await
+                    .expect("bind v6");
+                tx.send((
+                    v4.local_addr().expect("v4 addr"),
+                    v6.local_addr().expect("v6 addr"),
+                ))
+                .expect("send addrs");
+                let _ = tokio::join!(axum::serve(v4, app.clone()), axum::serve(v6, app));
+            });
+        });
+        rx.recv().expect("server startup")
+    })
+}
+
+/// Run shb expecting success and return the parsed JSON report
+fn shb_json(args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_shb"))
+        .arg("-j")
+        .args(args)
+        .output()
+        .expect("run shb");
+    assert!(
+        output.status.success(),
+        "shb failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON report")
+}
+
+/// Run shb expecting failure and return stderr
+fn shb_fail(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shb"))
+        .args(args)
+        .output()
+        .expect("run shb");
+    assert!(!output.status.success(), "shb unexpectedly succeeded");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn assert_all_ok(report: &serde_json::Value, n: u64, status: &str) {
+    assert_eq!(report["requests"]["ok"], n, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 0, "report: {report}");
+    assert_eq!(report["statusCodes"][status], n, "report: {report}");
+}
+
+#[test]
+fn h1_get() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&["-n", "50", "-c", "4", "-t", "2", &url]);
+    assert_eq!(report["protocol"], "HTTP/1.1");
+    assert_all_ok(&report, 50, "200");
+}
+
+#[test]
+fn h1_url_without_path_defaults_to_root() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}");
+    let report = shb_json(&["-n", "20", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 20, "200");
+}
+
+#[test]
+fn h1_method_is_sent_to_the_server() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&["-m", "POST", "-n", "30", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 30, "201");
+    let report = shb_json(&["-m", "DELETE", "-n", "30", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 30, "204");
+}
+
+#[test]
+fn h1_head_with_content_length_and_no_body() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    // Keep-alive HEAD responses regress easily: the decoder must know the
+    // method to parse a header-only response with a Content-Length
+    let report = shb_json(&["-m", "HEAD", "-n", "50", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 50, "200");
+}
+
+#[test]
+fn h1_ipv6_literal() {
+    let (_, v6) = server_addrs();
+    let url = format!("http://[::1]:{}/", v6.port());
+    let report = shb_json(&["-n", "20", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 20, "200");
+}
+
+#[test]
+fn h1_duration_mode() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&["-z", "300ms", "-c", "2", "-t", "1", &url]);
+    assert_eq!(report["requests"]["errors"], 0, "report: {report}");
+    assert!(
+        report["requests"]["ok"].as_u64().unwrap() > 0,
+        "report: {report}"
+    );
+}
+
+#[test]
+fn h2_get() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&["--http2", "-p", "4", "-n", "50", "-c", "2", "-t", "1", &url]);
+    assert_eq!(report["protocol"], "HTTP/2");
+    assert_all_ok(&report, 50, "200");
+}
+
+#[test]
+fn h2_method_is_sent_to_the_server() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let report = shb_json(&[
+        "--http2", "-m", "POST", "-n", "30", "-c", "2", "-t", "1", &url,
+    ]);
+    assert_all_ok(&report, 30, "201");
+}
+
+#[test]
+fn invalid_scheme_is_rejected() {
+    let stderr = shb_fail(&["-n", "1", "ftp://127.0.0.1/"]);
+    assert!(stderr.contains("http"), "stderr: {stderr}");
+}
+
+#[test]
+fn invalid_method_is_rejected() {
+    let stderr = shb_fail(&["-m", "GE T", "-n", "1", "http://127.0.0.1:9/"]);
+    assert!(stderr.contains("method"), "stderr: {stderr}");
+}
+
+#[test]
+fn parallel_requires_a_multiplexed_protocol() {
+    let stderr = shb_fail(&["-p", "4", "-n", "1", "http://127.0.0.1:9/"]);
+    assert!(
+        stderr.contains("--http2") || stderr.contains("proto"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn http3_requires_https() {
+    let stderr = shb_fail(&["--http3", "-n", "1", "http://127.0.0.1:9/"]);
+    assert!(stderr.contains("https"), "stderr: {stderr}");
+}
+
+#[test]
+fn connect_error_is_counted() {
+    // Port 9 (discard) is almost certainly closed
+    let report = shb_json(&["-n", "4", "-c", "2", "-t", "1", "http://127.0.0.1:9/"]);
+    assert_eq!(report["requests"]["errors"], 4, "report: {report}");
+    assert_eq!(report["requests"]["connectErrors"], 4, "report: {report}");
+}
+
+/// Bound address of the shared HTTP/3 (QUIC) test server
+fn h3_server_addr() -> SocketAddr {
+    static SERVER: OnceLock<SocketAddr> = OnceLock::new();
+    *SERVER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async move {
+                let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                    .expect("self-signed cert");
+                let cert = certified.cert.der().clone();
+                let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    certified.signing_key.serialize_der(),
+                );
+                let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+                let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .expect("tls versions")
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert], key.into())
+                    .expect("server cert");
+                tls.alpn_protocols = vec![b"h3".to_vec()];
+                let quic_config =
+                    quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls))
+                        .expect("quic server config");
+                let server_config =
+                    quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_config));
+                let endpoint =
+                    quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("addr"))
+                        .expect("quic endpoint");
+                tx.send(endpoint.local_addr().expect("local addr"))
+                    .expect("send addr");
+                while let Some(incoming) = endpoint.accept().await {
+                    tokio::spawn(async move {
+                        let Ok(conn) = incoming.await else { return };
+                        let Ok(mut h3_conn) =
+                            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
+                        else {
+                            return;
+                        };
+                        while let Ok(Some(resolver)) = h3_conn.accept().await {
+                            tokio::spawn(async move {
+                                let Ok((request, mut stream)) = resolver.resolve_request().await
+                                else {
+                                    return;
+                                };
+                                let (status, body) = match *request.method() {
+                                    http::Method::GET | http::Method::HEAD => {
+                                        (http::StatusCode::OK, "hello world")
+                                    }
+                                    http::Method::POST => (http::StatusCode::CREATED, "created"),
+                                    http::Method::DELETE => (http::StatusCode::NO_CONTENT, ""),
+                                    _ => (http::StatusCode::METHOD_NOT_ALLOWED, ""),
+                                };
+                                let response = http::Response::builder()
+                                    .status(status)
+                                    .body(())
+                                    .expect("response");
+                                if stream.send_response(response).await.is_err() {
+                                    return;
+                                }
+                                if !body.is_empty() {
+                                    let _ = stream
+                                        .send_data(bytes::Bytes::from_static(body.as_bytes()))
+                                        .await;
+                                }
+                                let _ = stream.finish().await;
+                            });
+                        }
+                    });
+                }
+            });
+        });
+        rx.recv().expect("h3 server startup")
+    })
+}
+
+#[test]
+fn h3_get() {
+    let addr = h3_server_addr();
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&["--http3", "-p", "4", "-n", "50", "-c", "2", "-t", "1", &url]);
+    assert_eq!(report["protocol"], "HTTP/3");
+    assert_all_ok(&report, 50, "200");
+}
+
+#[test]
+fn h3_method_is_sent_to_the_server() {
+    let addr = h3_server_addr();
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&[
+        "--http3", "-m", "POST", "-n", "30", "-c", "2", "-t", "1", &url,
+    ]);
+    assert_all_ok(&report, 30, "201");
+}
