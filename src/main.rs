@@ -511,7 +511,11 @@ impl Stats {
         self.connect_errors += other.connect_errors;
         self.bytes_received += other.bytes_received;
         self.latencies_ns.extend(other.latencies_ns);
-        for (a, b) in self.status_counts.iter_mut().zip(other.status_counts.iter()) {
+        for (a, b) in self
+            .status_counts
+            .iter_mut()
+            .zip(other.status_counts.iter())
+        {
             *a += *b;
         }
     }
@@ -542,7 +546,8 @@ fn main() -> Result<()> {
     } else {
         (0..threads)
             .map(|i| {
-                args.requests / threads as u64 + u64::from((i as u64) < args.requests % threads as u64)
+                args.requests / threads as u64
+                    + u64::from((i as u64) < args.requests % threads as u64)
             })
             .collect()
     };
@@ -599,7 +604,10 @@ fn run_worker(
         return Ok(Stats::default());
     }
     if connections > 1 << CONN_IDX_BITS {
-        bail!("too many connections per thread (max {})", 1u64 << CONN_IDX_BITS);
+        bail!(
+            "too many connections per thread (max {})",
+            1u64 << CONN_IDX_BITS
+        );
     }
 
     // buf_ring / conns は ring より先に宣言する。逆順 drop により ring
@@ -637,12 +645,7 @@ fn run_worker(
     // provided buffer ring を登録する (要 kernel 5.19+、RecvMulti は 6.0+)
     unsafe {
         ring.submitter()
-            .register_buf_ring_with_flags(
-                buf_ring.ring_ptr as u64,
-                buf_ring.entries,
-                BUF_GROUP,
-                0,
-            )
+            .register_buf_ring_with_flags(buf_ring.ring_ptr as u64, buf_ring.entries, BUF_GROUP, 0)
             .context("register_buf_ring failed")?;
     }
 
@@ -795,8 +798,8 @@ fn run_worker(
                         keep_conn = false;
                     } else {
                         stats.bytes_received += res as u64;
-                        let bid = cqueue::buffer_select(flags)
-                            .context("recv CQE without buffer id")?;
+                        let bid =
+                            cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
                         let feed_result = conn.decoder.feed(buf_ring.data(bid, res as usize));
                         buf_ring.recycle(bid);
                         if feed_result.is_err() {
