@@ -207,7 +207,7 @@ every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | **476,233** | 458,287 | 425,420 |
+| HTTP/1.1 | 1000 connections | **993,170** | 856,476 | 796,238 |
 | HTTP/2 (h2c) | 32 conns × 32 streams | 889,303 | — | **923,191** |
 | HTTP/2 (h2c) | 100 conns × 100 streams | 1,028,441 | — | **1,242,151** |
 | HTTP/3 | 16 conns × 128 streams | 767,771 | — | **1,395,144** |
@@ -216,14 +216,16 @@ every tool. Numbers are requests/sec; higher is better.
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
 
 ```console
-$ shb    -z 10s -c 64 -t 16 http://127.0.0.1:3010/
-$ wrk    -d 10s -c 64 -t 16 http://127.0.0.1:3010/
-$ h2load --h1 -D 10 -c 64 -t 16 http://127.0.0.1:3010/
+$ shb    -z 10s -c 1000 -t 16 http://127.0.0.1:3010/
+$ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
+$ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 4 % over wrk and 12 % over h2load. Its
+**On HTTP/1.1 shb is ahead of both** — 16 % over wrk and 25 % over h2load. Its
 response path is a boundary scanner rather than a parser (see
-[How it works](#how-it-works)), which is worth ~10 % on its own.
+[How it works](#how-it-works)), which is worth ~10 % on its own. The three land
+much closer together at low connection counts, where the ceiling is a round
+trip rather than the client: at 64 connections it is 476k / 458k / 425k.
 
 **On HTTP/2 h2load is 4 % ahead at 32 × 32 and 21 % ahead at 100 × 100**, and
 **on HTTP/3 it is ~80 % ahead**. That gap is not in the io_uring layer — a CPU
