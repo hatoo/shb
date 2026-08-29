@@ -10,9 +10,8 @@ Protocol handling is Sans-I/O throughout, so the whole client is one
 completion-driven event loop per thread with no async runtime underneath. The
 HTTP/1.1 and HTTP/2 paths are written for this one job — see
 [How it works](#how-it-works) — while HTTP/3 uses [shiguredo_http3] over
-[quinn-proto], and [shiguredo_http11] builds the HTTP/1.1 requests.
+[quinn-proto].
 
-[shiguredo_http11]: https://github.com/shiguredo/http11-rs
 [shiguredo_http3]: https://github.com/shiguredo/http3-rs
 [quinn-proto]: https://github.com/quinn-rs/quinn
 
