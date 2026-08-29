@@ -410,7 +410,7 @@ pub fn run_worker(
                             Ok(_) => {
                                 stats.record_success(conn.parser.status(), conn.request_start);
                                 request_finished = true;
-                                keep_conn = !target.disable_keepalive;
+                                keep_conn = conn.parser.keep_alive() && !target.disable_keepalive;
                             }
                             Err(_) => {
                                 stats.errors += 1;

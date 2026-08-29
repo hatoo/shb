@@ -6,9 +6,10 @@
 //! other header without looking at it — no field-name validation, no UTF-8
 //! checks, no allocation per header line.
 //!
-//! Notably it does **not** interpret `Connection`, so keep-alive is assumed.
-//! A server that closes anyway is handled by the worker: the receive returns
-//! EOF and the connection is re-established.
+//! It does read `Connection` and the HTTP version, because getting connection
+//! reuse wrong is not a matter of speed: against an HTTP/1.0 server that closes
+//! after every response, assuming keep-alive makes every second request fail.
+//! That check costs one extra name comparison on lines starting with `c`.
 
 use anyhow::{Result, bail};
 
@@ -44,6 +45,10 @@ pub struct Parser {
     status: u16,
     /// Status code of the response currently being read
     current_status: u16,
+    /// Whether the connection can be reused after the response being read
+    current_keep_alive: bool,
+    /// Whether the connection can be reused after the last completed response
+    keep_alive: bool,
     /// Whether the request was a HEAD, whose response never has a body
     /// however it is framed (RFC 9112 Section 6.3)
     head_request: bool,
@@ -62,6 +67,8 @@ impl Parser {
             state: State::Head,
             status: 0,
             current_status: 0,
+            current_keep_alive: true,
+            keep_alive: true,
             head_request: false,
         }
     }
@@ -72,6 +79,8 @@ impl Parser {
         self.state = State::Head;
         self.status = 0;
         self.current_status = 0;
+        self.current_keep_alive = true;
+        self.keep_alive = true;
     }
 
     /// Tell the parser whether responses answer HEAD requests
@@ -82,6 +91,12 @@ impl Parser {
     /// Status code of the most recently completed response
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// Whether the connection may carry another request after the most
+    /// recently completed response
+    pub fn keep_alive(&self) -> bool {
+        self.keep_alive
     }
 
     /// Consume received bytes and return how many responses completed
@@ -118,6 +133,7 @@ impl Parser {
         if self.state == State::Body(Body::Eof) {
             self.state = State::Head;
             self.status = self.current_status;
+            self.keep_alive = false;
             true
         } else {
             false
@@ -131,11 +147,13 @@ impl Parser {
         loop {
             match self.state {
                 State::Head => {
-                    let Some((len, status, body)) = scan_head(&buf[pos..])? else {
+                    let Some((len, status, body, keep_alive)) = scan_head(&buf[pos..])? else {
                         return Ok((pos, done));
                     };
                     pos += len;
                     self.current_status = status;
+                    // A close-delimited body ends with the connection itself
+                    self.current_keep_alive = keep_alive && body != Body::Eof;
                     let body = if self.head_request || no_body_status(status) {
                         Body::Exact(0)
                     } else {
@@ -146,6 +164,7 @@ impl Parser {
                 State::Body(Body::Exact(0)) => {
                     self.state = State::Head;
                     self.status = self.current_status;
+                    self.keep_alive = self.current_keep_alive;
                     done += 1;
                 }
                 State::Body(Body::Exact(n)) => {
@@ -191,6 +210,7 @@ impl Parser {
                     if line.is_empty() {
                         self.state = State::Head;
                         self.status = self.current_status;
+                        self.keep_alive = self.current_keep_alive;
                         done += 1;
                     }
                 }
@@ -210,8 +230,10 @@ fn no_body_status(status: u16) -> bool {
 
 /// Scan a status line and header block
 ///
-/// Returns None when `buf` does not hold the whole block yet.
-fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body)>> {
+/// Returns None when `buf` does not hold the whole block yet, otherwise the
+/// length of the block, the status code, how the body is framed, and whether
+/// the connection may be reused.
+fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
     let Some(nl) = memchr(b'\n', buf) else {
         return Ok(None);
     };
@@ -219,9 +241,12 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body)>> {
     if buf.len() < 12 || !buf.starts_with(b"HTTP/1.") {
         bail!("not an HTTP/1.x response");
     }
+    let http_1_0 = buf[7] == b'0';
     let status = parse_status(&buf[9..12])?;
     let mut pos = nl + 1;
     let mut body = Body::Eof;
+    let mut close = false;
+    let mut keep_alive_token = false;
     loop {
         let Some(rel) = memchr(b'\n', &buf[pos..]) else {
             return Ok(None);
@@ -229,7 +254,14 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body)>> {
         let line = trim_cr(&buf[pos..pos + rel]);
         pos += rel + 1;
         if line.is_empty() {
-            return Ok(Some((pos, status, body)));
+            // HTTP/1.1 keeps the connection unless told otherwise; HTTP/1.0
+            // closes it unless told otherwise (RFC 9112 Section 9.3)
+            let keep_alive = if http_1_0 {
+                keep_alive_token && !close
+            } else {
+                !close
+            };
+            return Ok(Some((pos, status, body, keep_alive)));
         }
         // One case-insensitive byte decides whether a line is worth reading
         match line[0] | 0x20 {
@@ -237,6 +269,16 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body)>> {
                 // Chunked framing wins over Content-Length (RFC 9112 6.3)
                 if body != Body::ChunkSize {
                     body = Body::Exact(parse_u64(trim_ows(&line[15..]))?);
+                }
+            }
+            b'c' if ci_prefix(line, b"connection:") => {
+                for token in line[11..].split(|&b| b == b',') {
+                    let token = trim_ows(token);
+                    if ci_eq(token, b"close") {
+                        close = true;
+                    } else if ci_eq(token, b"keep-alive") {
+                        keep_alive_token = true;
+                    }
                 }
             }
             b't' if ci_prefix(line, b"transfer-encoding:")
@@ -324,6 +366,11 @@ fn trim_ows(mut b: &[u8]) -> &[u8] {
         }
     }
     b
+}
+
+/// Case-insensitive equality over ASCII
+fn ci_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x | 0x20 == *y)
 }
 
 /// Case-insensitive prefix test over ASCII
@@ -455,6 +502,57 @@ mod tests {
         let data = resp("HTTP/1.1 200 OK\nContent-Length: 5\n\nhel");
         assert_eq!(p.feed(&data).unwrap(), 0);
         assert!(!p.mark_eof());
+    }
+
+    #[test]
+    fn http_1_0_closes_unless_it_says_keep_alive() {
+        let mut p = Parser::new();
+        assert_eq!(
+            p.feed(&resp("HTTP/1.0 200 OK\nContent-Length: 2\n\nok"))
+                .unwrap(),
+            1
+        );
+        assert!(!p.keep_alive(), "HTTP/1.0 defaults to closing");
+
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.0 200 OK\nConnection: keep-alive\nContent-Length: 2\n\nok");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert!(p.keep_alive());
+    }
+
+    #[test]
+    fn http_1_1_keeps_unless_it_says_close() {
+        let mut p = Parser::new();
+        assert_eq!(
+            p.feed(&resp("HTTP/1.1 200 OK\nContent-Length: 2\n\nok"))
+                .unwrap(),
+            1
+        );
+        assert!(p.keep_alive());
+
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 200 OK\nconnection: Close\nContent-Length: 2\n\nok");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert!(!p.keep_alive(), "Connection: close must be honoured");
+    }
+
+    #[test]
+    fn connection_token_list_is_split() {
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 200 OK\nConnection: TE, Close\nContent-Length: 2\n\nok");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert!(!p.keep_alive());
+    }
+
+    #[test]
+    fn close_delimited_body_never_keeps_alive() {
+        let mut p = Parser::new();
+        assert_eq!(
+            p.feed(&resp("HTTP/1.1 200 OK\nServer: x\n\nbody")).unwrap(),
+            0
+        );
+        assert!(p.mark_eof());
+        assert!(!p.keep_alive());
     }
 
     #[test]

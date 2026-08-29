@@ -321,10 +321,11 @@ cheap:
   neither is looked up per operation.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
-  status line, `Content-Length` and `Transfer-Encoding` and steps over every
-  other header without looking at it. Lines are found with `memchr`, one
-  case-insensitive byte decides whether a line is worth reading, nothing is
-  allocated per response, and the scan runs straight over the receive buffer.
+  status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and
+  steps over every other header without looking at it. Lines are found with
+  `memchr`, one case-insensitive byte decides whether a line is worth reading,
+  nothing is allocated per response, and the scan runs straight over the
+  receive buffer.
 - **HTTP/3 sends with UDP GSO**, batching up to 64 QUIC packets into one
   `sendmsg` when the kernel supports it.
 - **`-z` deadlines and QUIC timers are io_uring timeouts**, so an idle worker
