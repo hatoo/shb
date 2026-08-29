@@ -6,6 +6,9 @@
 //! UDP socket, multishot recv = one CQE per datagram, one Send SQE per
 //! outgoing datagram).
 
+mod proto;
+mod qpack;
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, RawFd};
@@ -19,12 +22,13 @@ use quinn_proto::{
     ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event as QuicEvent, ReadError,
     StreamEvent, StreamId, VarInt, WriteError,
 };
-use shiguredo_http3::{ClientConnection, Event as H3Event, Header, Settings};
 
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
 use crate::uring::{self, BUF_GROUP, CONN_IDX_BITS, OP_RECV, OP_SEND, TIMEOUT_USER_DATA};
+
+use self::proto::{ResponseReader, UniReader};
 
 /// Receive windows, matching the h2 worker's h2load-style sizing
 const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
@@ -35,16 +39,11 @@ const UDP_SEGMENT: libc::c_int = 103;
 /// Max segments per UDP GSO send (kernel limit is 64)
 const GSO_SEGMENTS: usize = 64;
 
-/// Advertise a QPACK dynamic table so the server can index repeated response
-/// headers instead of Huffman-encoding full literals on every response
-/// (measured ~20% of client CPU without it)
-fn make_h3_settings() -> Settings {
-    let mut settings = Settings::new();
-    settings.qpack_max_table_capacity =
-        Some(shiguredo_http3::VarInt::new(4096).expect("valid varint"));
-    settings.qpack_blocked_streams = Some(shiguredo_http3::VarInt::new(128).expect("valid varint"));
-    settings
-}
+/// Largest datagram IPv4 can carry: 65535 less the IP and UDP headers
+///
+/// QUIC's own limit is 65527, which the kernel rejects with EMSGSIZE, so MTU
+/// discovery must not probe above this.
+const MAX_UDP_PAYLOAD: u16 = 65507;
 
 /// One outgoing UDP send: either a single datagram (segment_size == 0) or a
 /// GSO batch of equally sized segments with a shorter tail
@@ -81,27 +80,25 @@ fn probe_gso(addr: &std::net::SocketAddr) -> bool {
     ok
 }
 
-fn build_request_headers(target: &Target) -> Result<Vec<Header>> {
-    let mut headers = vec![
-        Header::new(b":method", target.method.as_bytes())
-            .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        Header::new(b":scheme", b"https").map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        Header::new(b":authority", target.authority.as_bytes())
-            .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-        Header::new(b":path", target.path.as_bytes())
-            .map_err(|e| anyhow::anyhow!("header: {e:?}"))?,
-    ];
-    for (name, value) in &target.headers {
-        if crate::target::is_connection_specific(name) {
-            continue;
-        }
-        // Field names must be lowercase in HTTP/3, like HTTP/2
-        headers.push(
-            Header::new(name.to_ascii_lowercase(), value)
-                .map_err(|e| anyhow::anyhow!("header {name:?}: {e:?}"))?,
-        );
-    }
-    Ok(headers)
+/// Build the QPACK field section sent for every request
+///
+/// Encoded once; nothing in it depends on the stream or the connection.
+fn build_field_section(target: &Target) -> Vec<u8> {
+    let headers: Vec<(String, String)> = target
+        .headers
+        .iter()
+        .filter(|(name, _)| !crate::target::is_connection_specific(name))
+        // Field names must be lower-case in HTTP/3, like HTTP/2
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    qpack::encode_request(
+        &target.method,
+        "https",
+        &target.authority,
+        &target.path,
+        &headers,
+        target.body.len(),
+    )
 }
 
 fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::ClientConfig> {
@@ -117,7 +114,7 @@ fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::Cli
     // Allow MTU discovery to grow datagrams well past the Ethernet default;
     // on loopback this greatly reduces per-packet costs for large bodies
     let mut mtud = quinn_proto::MtuDiscoveryConfig::default();
-    mtud.upper_bound(65527);
+    mtud.upper_bound(MAX_UDP_PAYLOAD);
     transport
         .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
         .stream_receive_window(VarInt::from_u32(RECEIVE_WINDOW))
@@ -143,17 +140,20 @@ fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::Cli
 struct InFlight {
     stream_id: u64,
     start: Instant,
-    /// Status code from :status (0 = not received yet)
-    status: u16,
+    /// Response frame reader for this stream
+    reader: ResponseReader,
+    /// Request bytes not yet accepted by the QUIC stream
+    unsent: Vec<u8>,
 }
 
 struct Conn {
     fd: RawFd,
     handle: Option<ConnectionHandle>,
     quic: Option<quinn_proto::Connection>,
-    h3: Option<ClientConnection>,
     /// QUIC handshake finished and the H3 control/QPACK streams are set up
     h3_ready: bool,
+    /// Peer-opened unidirectional streams, by QUIC stream id
+    uni: Vec<(u64, UniReader)>,
     /// GOAWAY received: no new streams on this connection
     goaway: bool,
     /// Outgoing datagrams; the front one is in flight while `sending`
@@ -176,8 +176,8 @@ impl Conn {
             fd: -1,
             handle: None,
             quic: None,
-            h3: None,
             h3_ready: false,
+            uni: Vec::new(),
             goaway: false,
             out_queue: VecDeque::new(),
             msg_state: Box::new(unsafe { std::mem::zeroed() }),
@@ -196,7 +196,7 @@ impl Conn {
         }
         self.handle = None;
         self.quic = None;
-        self.h3 = None;
+        self.uni.clear();
         self.h3_ready = false;
         self.goaway = false;
         self.out_queue.clear();
@@ -214,81 +214,54 @@ impl Conn {
     }
 }
 
-/// Copy pending H3 stream data into the QUIC send streams
+/// Push whatever of a request the QUIC stream would not take earlier
 ///
-/// The FIN is delivered by get_stream_data as `(empty, true)` once all data
-/// has been consumed, at which point the QUIC stream is finished.
-fn pump_h3_to_quic(quic: &mut quinn_proto::Connection, h3: &mut ClientConnection) -> Result<()> {
-    enum Step {
-        Wrote { n: usize, all: bool },
-        Fin,
-        Blocked,
-        Done,
-    }
-    let writable: Vec<u64> = h3.writable_streams().collect();
-    for sid in writable {
-        let qsid = StreamId::from(VarInt::from_u64(sid).context("stream id out of range")?);
-        loop {
-            let step = match h3.get_stream_data(sid) {
-                None => Step::Done,
-                Some((data, fin)) => {
-                    if data.is_empty() {
-                        if fin { Step::Fin } else { Step::Done }
-                    } else {
-                        match quic.send_stream(qsid).write(data) {
-                            Ok(n) => Step::Wrote {
-                                n,
-                                all: n == data.len(),
-                            },
-                            Err(WriteError::Blocked) => Step::Blocked,
-                            Err(e) => bail!("QUIC stream write failed: {e}"),
-                        }
-                    }
-                }
-            };
-            match step {
-                Step::Wrote { n, all } => {
-                    h3.consume_stream_data(sid, n);
-                    if !all {
-                        break;
-                    }
-                }
-                Step::Fin => {
+/// A fresh stream has its whole window free and requests are tiny, so this
+/// normally moves nothing; it exists so a peer with a small
+/// `initial_max_stream_data` cannot lose a request.
+fn flush_unsent(quic: &mut quinn_proto::Connection, streams: &mut [InFlight]) -> Result<()> {
+    for inflight in streams.iter_mut().filter(|s| !s.unsent.is_empty()) {
+        let qsid = StreamId::from(VarInt::from_u64(inflight.stream_id).context("stream id")?);
+        match quic.send_stream(qsid).write(&inflight.unsent) {
+            Ok(n) => {
+                inflight.unsent.drain(..n);
+                if inflight.unsent.is_empty() {
                     let _ = quic.send_stream(qsid).finish();
-                    break;
                 }
-                Step::Blocked | Step::Done => break,
             }
+            Err(WriteError::Blocked) => {}
+            Err(e) => bail!("QUIC stream write failed: {e}"),
         }
     }
     Ok(())
 }
 
-/// Read everything currently readable from a QUIC stream into the H3 layer
+/// Read everything currently readable from one QUIC stream
 ///
-/// Returns true if the stream was reset by the peer.
+/// Returns whether the peer reset the stream and whether it finished.
 fn read_quic_stream(
     quic: &mut quinn_proto::Connection,
-    h3: &mut ClientConnection,
     qsid: StreamId,
-) -> Result<bool> {
-    let sid = u64::from(qsid);
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<(bool, bool)> {
     let mut recv = quic.recv_stream(qsid);
     let mut chunks = match recv.read(true) {
         Ok(chunks) => chunks,
         // Already closed/finished: nothing more to deliver
-        Err(_) => return Ok(false),
+        Err(_) => return Ok((false, false)),
     };
-    let mut reset = false;
+    let (mut reset, mut fin) = (false, false);
+    let mut result = Ok(());
     loop {
         match chunks.next(usize::MAX) {
             Ok(Some(chunk)) => {
-                h3.feed_stream(sid, &chunk.bytes, false)
-                    .map_err(|e| anyhow::anyhow!("h3 feed: {e:?}"))?;
+                if let Err(e) = sink(&chunk.bytes) {
+                    result = Err(e);
+                    break;
+                }
             }
             Ok(None) => {
-                h3.feed_stream(sid, &[], true)
-                    .map_err(|e| anyhow::anyhow!("h3 feed fin: {e:?}"))?;
+                fin = true;
                 break;
             }
             Err(ReadError::Blocked) => break,
@@ -299,17 +272,17 @@ fn read_quic_stream(
         }
     }
     let _ = chunks.finalize();
-    Ok(reset)
+    result?;
+    Ok((reset, fin))
 }
 
 /// Open new request streams until the parallelism target or budget is hit
 ///
-/// Every h3 request must be paired with opening one QUIC bidi stream; both
-/// sides allocate ids in the standard 0, 4, 8, ... order, which is asserted.
+/// Each request is one QUIC bidirectional stream carrying a HEADERS frame
+/// (and a DATA frame when there is a body), then a FIN.
 fn fill_streams(
     conn: &mut Conn,
-    request_headers: &[Header],
-    body: &[u8],
+    request: &[u8],
     parallel: usize,
     started: &mut u64,
     max_requests: u64,
@@ -318,7 +291,7 @@ fn fill_streams(
     if stop || conn.goaway || !conn.h3_ready {
         return Ok(());
     }
-    let (Some(quic), Some(h3)) = (conn.quic.as_mut(), conn.h3.as_mut()) else {
+    let Some(quic) = conn.quic.as_mut() else {
         return Ok(());
     };
     while conn.streams.len() < parallel && *started < max_requests {
@@ -326,24 +299,19 @@ fn fill_streams(
         let Some(qsid) = quic.streams().open(Dir::Bi) else {
             break;
         };
-        let hsid = h3
-            .send_request(request_headers, body.is_empty())
-            .map_err(|e| anyhow::anyhow!("send_request failed: {e:?}"))?;
-        if !body.is_empty() {
-            h3.send_body(hsid, body, true)
-                .map_err(|e| anyhow::anyhow!("send_body failed: {e:?}"))?;
-        }
-        if u64::from(qsid) != hsid {
-            bail!(
-                "stream id mismatch: QUIC {} vs H3 {}",
-                u64::from(qsid),
-                hsid
-            );
+        let sent = match quic.send_stream(qsid).write(request) {
+            Ok(n) => n,
+            Err(WriteError::Blocked) => 0,
+            Err(e) => bail!("QUIC stream write failed: {e}"),
+        };
+        if sent == request.len() {
+            let _ = quic.send_stream(qsid).finish();
         }
         conn.streams.push(InFlight {
-            stream_id: hsid,
+            stream_id: u64::from(qsid),
             start: Instant::now(),
-            status: 0,
+            reader: ResponseReader::default(),
+            unsent: request[sent..].to_vec(),
         });
         *started += 1;
     }
@@ -436,8 +404,7 @@ fn drive(
     endpoint: &mut Endpoint,
     conn: &mut Conn,
     stats: &mut Stats,
-    request_headers: &[Header],
-    body: &[u8],
+    request: &[u8],
     parallel: usize,
     started: &mut u64,
     max_requests: u64,
@@ -454,36 +421,25 @@ fn drive(
         while let Some(event) = quic.poll() {
             match event {
                 QuicEvent::Connected => {
-                    // Set up the H3 control + QPACK streams; the client uni
-                    // streams get ids 2, 6, 10 in open order
-                    let mut h3 = ClientConnection::new(make_h3_settings());
-                    let control = quic.streams().open(Dir::Uni).context("no uni stream")?;
-                    let encoder = quic.streams().open(Dir::Uni).context("no uni stream")?;
-                    let decoder = quic.streams().open(Dir::Uni).context("no uni stream")?;
-                    let init = h3
-                        .init_h3_streams(control.into(), encoder.into(), decoder.into())
-                        .map_err(|e| anyhow::anyhow!("init_h3_streams: {e:?}"))?;
-                    // init_h3_streams hands the initial stream data (SETTINGS,
-                    // QPACK stream types) to the caller; write it to QUIC now.
-                    // The windows are fresh, so a short write cannot happen
-                    for (sid, data) in [
-                        (init.control_stream_id, &init.control_data),
-                        (init.encoder_stream_id, &init.encoder_data),
-                        (init.decoder_stream_id, &init.decoder_data),
-                    ] {
-                        if data.is_empty() {
-                            continue;
-                        }
-                        let qsid = StreamId::from(VarInt::from_u64(sid).context("bad stream id")?);
+                    // Set up the control and QPACK streams. The QPACK streams
+                    // stay empty for the rest of the connection - neither side
+                    // may insert - but RFC 9204 Section 4.2 requires opening
+                    // them all the same.
+                    let mut encoder = Vec::new();
+                    proto::put_varint(&mut encoder, proto::STREAM_QPACK_ENCODER);
+                    let mut decoder = Vec::new();
+                    proto::put_varint(&mut decoder, proto::STREAM_QPACK_DECODER);
+                    for prelude in [proto::control_stream_prelude(), encoder, decoder] {
+                        let qsid = quic.streams().open(Dir::Uni).context("no uni stream")?;
+                        // The windows are fresh, so a short write cannot happen
                         let n = quic
                             .send_stream(qsid)
-                            .write(data)
+                            .write(&prelude)
                             .map_err(|e| anyhow::anyhow!("H3 init write: {e}"))?;
-                        if n != data.len() {
+                        if n != prelude.len() {
                             bail!("short write of H3 init data");
                         }
                     }
-                    conn.h3 = Some(h3);
                     conn.h3_ready = true;
                 }
                 QuicEvent::ConnectionLost { .. } => {
@@ -502,79 +458,48 @@ fn drive(
             }
         }
 
-        // 2. Deliver readable QUIC stream data to the H3 layer
-        if let Some(h3) = conn.h3.as_mut() {
-            for qsid in readable {
-                if read_quic_stream(quic, h3, qsid)? {
-                    // Peer reset the stream: the request (if ours) failed
-                    let sid = u64::from(qsid);
-                    if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == sid) {
-                        conn.streams.swap_remove(pos);
-                        stats.errors += 1;
-                    }
+        // 2. Read the streams QUIC says have data, and record what finished
+        for qsid in readable {
+            let sid = u64::from(qsid);
+            // Client-initiated bidirectional streams (id & 3 == 0) are ours;
+            // peer-initiated unidirectional ones (id & 3 == 3) are its control
+            // and QPACK streams
+            if sid & 0x3 == 0 {
+                let Some(pos) = conn.streams.iter().position(|s| s.stream_id == sid) else {
+                    continue;
+                };
+                let reader = &mut conn.streams[pos].reader;
+                let (reset, fin) = read_quic_stream(quic, qsid, |data| reader.feed(data))?;
+                if reset {
+                    conn.streams.swap_remove(pos);
+                    stats.errors += 1;
+                } else if fin {
+                    let inflight = conn.streams.swap_remove(pos);
+                    stats.record_success(inflight.reader.status(), inflight.start);
                 }
+                continue;
             }
-
-            // 3. H3 events: response progress and completions
-            while let Some(event) = h3
-                .poll_event()
-                .map_err(|e| anyhow::anyhow!("h3 error: {e:?}"))?
-            {
-                match event {
-                    H3Event::Header {
-                        stream_id,
-                        name,
-                        value,
-                    } => {
-                        if name == b":status"
-                            && let Some(inflight) =
-                                conn.streams.iter_mut().find(|s| s.stream_id == stream_id)
-                        {
-                            inflight.status = std::str::from_utf8(&value)
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                        }
-                    }
-                    H3Event::StreamEnd { stream_id } => {
-                        if let Some(pos) =
-                            conn.streams.iter().position(|s| s.stream_id == stream_id)
-                        {
-                            let inflight = conn.streams.swap_remove(pos);
-                            stats.record_success(inflight.status, inflight.start);
-                        }
-                    }
-                    H3Event::StreamReset { stream_id, .. } => {
-                        if let Some(pos) =
-                            conn.streams.iter().position(|s| s.stream_id == stream_id)
-                        {
-                            conn.streams.swap_remove(pos);
-                            stats.errors += 1;
-                        }
-                    }
-                    H3Event::GoawayReceived { .. } => {
-                        conn.goaway = true;
-                    }
-                    _ => {}
+            let pos = match conn.uni.iter().position(|(id, _)| *id == sid) {
+                Some(pos) => pos,
+                None => {
+                    conn.uni.push((sid, UniReader::default()));
+                    conn.uni.len() - 1
                 }
+            };
+            let uni = &mut conn.uni[pos].1;
+            read_quic_stream(quic, qsid, |data| uni.feed(data))?;
+            if uni.goaway {
+                conn.goaway = true;
             }
         }
 
-        // 4. Open new requests and push H3 bytes into QUIC
-        fill_streams(
-            conn,
-            request_headers,
-            body,
-            parallel,
-            started,
-            max_requests,
-            stop,
-        )?;
-        if let (Some(quic), Some(h3)) = (conn.quic.as_mut(), conn.h3.as_mut()) {
-            pump_h3_to_quic(quic, h3)?;
+        // 3. Open new requests, and retry anything a stream would not take
+        fill_streams(conn, request, parallel, started, max_requests, stop)?;
+        if let Some(quic) = conn.quic.as_mut() {
+            flush_unsent(quic, &mut conn.streams)?;
         }
 
-        // 5. Endpoint event plumbing (CID rotation, drain notifications, ...)
+        // 4. Endpoint event plumbing (CID rotation, drain notifications, ...)
         if let (Some(quic), Some(handle)) = (conn.quic.as_mut(), conn.handle) {
             while let Some(endpoint_event) = quic.poll_endpoint_events() {
                 if let Some(conn_event) = endpoint.handle_event(handle, endpoint_event) {
@@ -607,7 +532,8 @@ pub fn run_worker(
         );
     }
 
-    let request_headers = build_request_headers(target)?;
+    let field_section = build_field_section(target);
+    let request = proto::request_bytes(&field_section, &target.body);
     let quic_config = make_quic_client_config(connect_timeout)?;
     let gso = probe_gso(&target.addr);
     let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
@@ -705,8 +631,7 @@ pub fn run_worker(
                     &mut endpoint,
                     conn,
                     &mut stats,
-                    &request_headers,
-                    &target.body,
+                    &request,
                     parallel,
                     &mut started,
                     max_requests,
@@ -767,7 +692,13 @@ pub fn run_worker(
                 OP_SEND => {
                     let conn = &mut conns[conn_idx];
                     conn.sending = false;
-                    if res < 0 {
+                    if res == -libc::EMSGSIZE {
+                        // An MTU probe the kernel will not carry. Dropping it
+                        // is exactly what the probe timing out expects, so
+                        // discard the datagram and keep the connection
+                        conn.out_queue.pop_front();
+                        push_front_send(&submitter, &mut sq, conn_idx, conn)?;
+                    } else if res < 0 {
                         // e.g. ECONNREFUSED delivered via the connected UDP socket
                         conn_broken = true;
                     } else {
@@ -832,8 +763,7 @@ pub fn run_worker(
                             &mut endpoint,
                             conn,
                             &mut stats,
-                            &request_headers,
-                            &target.body,
+                            &request,
                             parallel,
                             &mut started,
                             max_requests,

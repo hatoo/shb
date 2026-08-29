@@ -1109,16 +1109,9 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
- "shiguredo_http3",
  "socket2",
  "tokio",
 ]
-
-[[package]]
-name = "shiguredo_http3"
-version = "2026.1.0-canary.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2cf45c726f38acb9a236ea4ea1344cc3fadc64c6a8877a98ff51b01dd3bd837"
 
 [[package]]
 name = "shlex"
