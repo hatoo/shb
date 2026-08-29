@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*.*.*"]
+  pull_request:
+
+# Builds on every push and PR so a broken cross-compile shows up long before a
+# tag is cut; the binaries are only attached to a release on a v* tag.
+jobs:
+  build:
+    name: Build ${{ matrix.release_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            release_name: shb-linux-amd64
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            release_name: shb-linux-arm64
+            use_cross: true
+    env:
+      BUILD_CMD: cargo
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build with cross instead of cargo
+        if: matrix.use_cross
+        run: echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
+
+      # shb only needs io_uring at run time, so cross-compiling is fine
+      - name: Build
+        run: $BUILD_CMD build --profile dist --target ${{ matrix.target }} --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.release_name }}
+          path: target/${{ matrix.target }}/dist/shb
+
+      - name: Attach binary to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/${{ matrix.target }}/dist/shb
+          asset_name: ${{ matrix.release_name }}
+          tag: ${{ github.ref }}

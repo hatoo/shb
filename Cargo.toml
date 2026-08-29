@@ -42,3 +42,11 @@ http = "1.5.0"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 rcgen = "0.14.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+
+# Optimised build used for released binaries. Kept separate from `release`
+# so local `cargo build --release` stays fast.
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
