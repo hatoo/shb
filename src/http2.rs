@@ -1,4 +1,7 @@
 //! HTTP/2 benchmark worker (h2c prior knowledge, or ALPN "h2" over TLS)
+//!
+//! The protocol itself lives in [`conn`] and [`hpack`]; this module moves its
+//! bytes with io_uring and turns its events into statistics.
 
 mod conn;
 mod hpack;

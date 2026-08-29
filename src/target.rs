@@ -12,13 +12,14 @@ pub struct Target {
     /// the value of a `-H "Host: ..."` override, like curl. Used for the
     /// HTTP/1.1 Host header and the HTTP/2 and HTTP/3 :authority
     pub authority: String,
-    /// Request path (with query); used for the HTTP/2 :path pseudo-header
+    /// Request path (with query); the HTTP/1.1 request target and the
+    /// HTTP/2 and HTTP/3 :path pseudo-header
     pub path: String,
     /// HTTP method (validated as an RFC 9110 token by [`parse_target`])
     pub method: String,
     /// Custom headers in curl -H order (Host excluded; it becomes
-    /// [`Target::authority`]). Names keep the user's casing; the HTTP/2 and
-    /// HTTP/3 workers lowercase them
+    /// [`Target::authority`]). Names keep the user's casing, which HTTP/1.1
+    /// sends as given; the HTTP/2 and HTTP/3 workers lower-case them
     pub headers: Vec<(String, String)>,
     /// Request body (empty = no body)
     pub body: Vec<u8>,

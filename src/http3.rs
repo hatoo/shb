@@ -1,7 +1,8 @@
-//! HTTP/3 benchmark worker (QUIC via quinn-proto, H3/QPACK via shiguredo_http3)
+//! HTTP/3 benchmark worker (QUIC via quinn-proto, H3 and QPACK in [`proto`]
+//! and [`qpack`])
 //!
 //! Both layers are Sans I/O: quinn-proto turns UDP datagrams into QUIC stream
-//! data and shiguredo_http3 turns stream data into HTTP events. UDP datagrams
+//! data and this module turns stream data into completed requests. UDP datagrams
 //! are moved with the same io_uring machinery as the TCP workers (connected
 //! UDP socket, multishot recv = one CQE per datagram, one Send SQE per
 //! outgoing datagram).
@@ -30,7 +31,8 @@ use crate::uring::{self, BUF_GROUP, CONN_IDX_BITS, OP_RECV, OP_SEND, TIMEOUT_USE
 
 use self::proto::{ResponseReader, UniReader};
 
-/// Receive windows, matching the h2 worker's h2load-style sizing
+/// QUIC receive windows, large enough that flow control never stalls a
+/// benchmark whose responses are a few hundred bytes
 const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
 
 /// UDP_SEGMENT socket option (missing from libc for linux-gnu)

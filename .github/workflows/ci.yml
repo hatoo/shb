@@ -32,9 +32,10 @@ jobs:
       - name: Test
         run: cargo test --release
 
-      # The io_uring features in use (multishot recv / provided buffer ring /
-      # DEFER_TASKRUN) require kernel 6.6+. They work on the ubuntu-latest
-      # (24.04, kernel 6.8+) VM runners.
+      # Multishot recv and provided buffer rings need kernel 6.0; the setup
+      # flags and completion batching degrade gracefully without 6.6 and 6.12.
+      # The ubuntu-latest (24.04, kernel 6.8+) VM runners cover all but the
+      # batching.
       - name: Smoke test
         run: |
           python3 -m http.server 8000 &

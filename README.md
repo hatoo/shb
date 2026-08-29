@@ -28,9 +28,13 @@ three protocol stacks are written for this one job — see
 ## Requirements
 
 - **Linux 6.0 or newer.** shb uses io_uring multishot receive (6.0) and provided
-  buffer rings (5.19) on every connection. The remaining tuning flags —
-  `SINGLE_ISSUER`, `COOP_TASKRUN`, `DEFER_TASKRUN` (6.1) and `NO_SQARRAY` (6.6) —
-  are applied when available and silently skipped otherwise.
+  buffer rings (5.19) on every connection. The tuning flags — `SINGLE_ISSUER`,
+  `COOP_TASKRUN`, `DEFER_TASKRUN` (6.1) and `NO_SQARRAY` (6.6) — are asked for
+  together, and a ring is created without any of them if that fails.
+- **Linux 6.12 gets more throughput.** Waiting for a batch of completions per
+  `io_uring_enter` needs `min_wait_usec` to bound how long the kernel holds out
+  for a batch it cannot fill. Without it each wait returns on the first
+  completion, which is correct but pays a syscall per completion.
 - A recent stable Rust toolchain (edition 2024).
 
 ## Install
@@ -142,54 +146,54 @@ The default for `-t` is the number of physical cores on the machine running
 ## Output
 
 ```console
-$ shb -z 3s -c 50 http://127.0.0.1:3000/
-URL:          http://127.0.0.1:3000/
+$ shb -z 3s -c 50 http://127.0.0.1:3010/
+URL:          http://127.0.0.1:3010/
 Protocol:     HTTP/1.1
 Threads:      16
 Connections:  50
-Requests:     772063 (772063 ok, 0 errors, of which 0 connect) in 3.039s
-Requests/sec: 254014.9
-Transfer:     recv 31.49 MB/s (100368190 bytes), sent 9.69 MB/s (30884080 bytes)
+Requests:     1070162 (1070162 ok, 0 errors, of which 0 connect) in 3.047s
+Requests/sec: 351271.9
+Transfer:     recv 53.93 MB/s (172296082 bytes), sent 13.40 MB/s (42807640 bytes)
 Status codes:
-  [200] 772063
+  [200] 1070162
 Latency (ms):
-  min 0.019  mean 0.194  max 1.869
+  min 0.016  mean 0.140  max 5.448
 Latency distribution:
-  10% in 0.120 ms
-  25% in 0.149 ms
-  50% in 0.186 ms
-  75% in 0.229 ms
-  90% in 0.276 ms
-  95% in 0.309 ms
-  99% in 0.387 ms
-  99.9% in 0.578 ms
-  99.99% in 1.026 ms
+  10% in 0.070 ms
+  25% in 0.093 ms
+  50% in 0.123 ms
+  75% in 0.162 ms
+  90% in 0.222 ms
+  95% in 0.278 ms
+  99% in 0.453 ms
+  99.9% in 0.845 ms
+  99.99% in 1.452 ms
 ```
 
 `-j` prints the same run as JSON, with every latency in seconds:
 
 ```json
 {
-  "url": "http://127.0.0.1:3002/",
+  "url": "http://127.0.0.1:3010/",
   "protocol": "HTTP/2",
   "threads": 8,
   "connections": 8,
-  "durationSeconds": 2.001874342,
-  "requests": { "total": 418121, "ok": 418121, "errors": 0, "connectErrors": 0 },
-  "requestsPerSec": 208864.7580058749,
-  "bytesReceived": 16307931,
-  "bytesReceivedPerSec": 8146330.99483524,
-  "bytesSent": 5438053,
-  "bytesSentPerSec": 2716480.693072393,
-  "statusCodes": { "200": 418121 },
+  "durationSeconds": 2.002848834,
+  "requests": { "total": 722541, "ok": 722541, "errors": 0, "connectErrors": 0 },
+  "requestsPerSec": 360757.1,
+  "bytesReceived": 57803854,
+  "bytesReceivedPerSec": 28860817.16140141,
+  "bytesSent": 20233272,
+  "bytesSentPerSec": 10102246.188790502,
+  "statusCodes": { "200": 722541 },
   "latencySeconds": {
-    "min": 0.00004768,
-    "mean": 0.000606615342716582,
-    "max": 0.00487591,
+    "min": 0.000030961,
+    "mean": 0.0001767384621343287,
+    "max": 0.004210834,
     "percentiles": {
-      "p10": 0.000301916, "p25": 0.000400123, "p50": 0.000536069,
-      "p75": 0.00072343,  "p90": 0.000981392, "p95": 0.001211524,
-      "p99": 0.001806339, "p99.9": 0.002655211, "p99.99": 0.003518719
+      "p10": 0.000103381, "p25": 0.000118051, "p50": 0.000152571,
+      "p75": 0.000211807, "p90": 0.000294087, "p95": 0.000340413,
+      "p99": 0.000424934, "p99.9": 0.000617066, "p99.99": 0.000876762
     }
   }
 }
@@ -321,6 +325,11 @@ cheap:
   being re-armed, into a **provided buffer ring** the kernel picks buffers from.
 - **Sockets are registered files** and the ring itself is a registered fd, so
   neither is looked up per operation.
+- **One `io_uring_enter` covers a batch of completions** rather than one each.
+  A completion is what lets its connection issue the next request, so waiting
+  on too many stalls the pipeline; a worker holds out for a quarter of its
+  connections, capped at eight, and `min_wait_usec` caps how long the kernel
+  waits for a batch that cannot be filled.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and

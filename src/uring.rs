@@ -132,12 +132,15 @@ pub fn make_udp_socket(addr: &SocketAddr) -> Result<RawFd> {
     Ok(socket.into_raw_fd())
 }
 
-/// Re-arm TCP_QUICKACK so our ACKs go out immediately
+/// Re-arm TCP_QUICKACK so our ACKs go out immediately (HTTP/2 only)
 ///
 /// With many concurrent HTTP/2 streams the peer may have Nagle enabled and
 /// wait for our ACK before sending its next small segment; our delayed ACK
 /// (up to ~40ms) then stalls the whole pipeline. Quickack mode is not
-/// permanent, so call this after every receive batch. Best effort.
+/// permanent, so call this after every receive. Converting it to a
+/// SetSockOpt SQE and skipping it when IORING_CQE_F_SOCK_NONEMPTY says more
+/// data is waiting were both tried and both measured within noise (2026-08).
+/// Best effort.
 pub fn set_quickack(fd: RawFd) {
     let one: libc::c_int = 1;
     unsafe {
