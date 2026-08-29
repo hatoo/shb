@@ -324,7 +324,6 @@ pub fn run_worker(
         )?;
     }
 
-    let mut cqe_buf: Vec<(u64, i32, u32)> = Vec::with_capacity(entries as usize * 4);
     let mut stop = false;
 
     'outer: loop {
@@ -339,14 +338,9 @@ pub fn run_worker(
         uring::submit_and_wait_timeout(&submitter, uring::WAIT_TIMEOUT)?;
 
         cq.sync();
-        cqe_buf.clear();
-        for cqe in &mut cq {
-            cqe_buf.push((cqe.user_data(), cqe.result(), cqe.flags()));
-        }
-        // Publish the head of consumed CQEs
-        cq.sync();
 
-        for &(ud, res, flags) in &cqe_buf {
+        for cqe in &mut cq {
+            let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
             if ud == TIMEOUT_USER_DATA {
                 stop = true;
                 continue;
