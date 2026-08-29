@@ -670,6 +670,8 @@ pub fn run_worker(
     }
 
     let mut stop = false;
+    // How many completions one wait should collect before returning
+    let batch = uring::batch_size(connections);
 
     loop {
         if stats.completed + stats.errors >= max_requests {
@@ -741,7 +743,7 @@ pub fn run_worker(
 
         // Publish the tail of pushed SQEs before submitting
         sq.sync();
-        uring::submit_and_wait_timeout(&submitter, wait)?;
+        uring::submit_and_wait_timeout(&submitter, wait, batch)?;
 
         cq.sync();
 

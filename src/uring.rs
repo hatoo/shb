@@ -48,17 +48,56 @@ pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
 /// fires.
 pub const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Submit pending SQEs and wait for at least one CQE, bounded by `max_wait`
+/// Largest batch of completions a single wait will hold out for
+///
+/// Measured on loopback: 8 captures nearly all of the syscall saving, while 16
+/// and 32 start giving it back.
+const MAX_BATCH: usize = 8;
+
+/// How long the kernel may linger collecting a batch before returning with
+/// whatever has arrived
+const BATCH_LINGER: u32 = 500;
+
+/// Whether the kernel supports `min_wait_usec` (IORING_FEAT_MIN_TIMEOUT, 6.12+)
+static MIN_TIMEOUT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many CQEs one io_uring_enter should wait for
+///
+/// Waiting for a batch amortises the syscall over several completions. Asking
+/// for more than the worker can produce would just stall, and a worker keeps
+/// one receive in flight per connection, so its connection count is the bound.
+///
+/// Without `min_wait_usec` support the batch would block until the 100ms
+/// WAIT_TIMEOUT whenever it cannot be filled, which costs far more than the
+/// syscalls it saves, so fall back to waking on the first completion.
+pub fn batch_size(connections: usize) -> usize {
+    if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    connections.clamp(1, MAX_BATCH)
+}
+
+/// Submit pending SQEs and wait for up to `min_complete` CQEs, bounded by
+/// `max_wait`
 ///
 /// A timeout (ETIME) and a signal interruption (EINTR) both return Ok with no
 /// completions; the caller's loop then re-checks its stop conditions.
 pub fn submit_and_wait_timeout(
     submitter: &Submitter<'_>,
     max_wait: std::time::Duration,
+    min_complete: usize,
 ) -> Result<()> {
     let ts = types::Timespec::from(max_wait);
-    let args = types::SubmitArgs::new().timespec(&ts);
-    match submitter.submit_with_args(1, &args) {
+    let mut args = types::SubmitArgs::new().timespec(&ts);
+    let want = min_complete.max(1);
+    if want > 1 {
+        // Hold out for `want` completions, but give up the batching after
+        // BATCH_LINGER and return with whatever arrived (still at least one,
+        // bounded by max_wait). batch_size only returns > 1 when the kernel
+        // supports this.
+        args = args.min_wait_usec(BATCH_LINGER);
+    }
+    match submitter.submit_with_args(want, &args) {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME) | Some(libc::EINTR)) => Ok(()),
         Err(e) => Err(e).context("submit_and_wait failed"),
@@ -113,6 +152,15 @@ pub fn set_quickack(fd: RawFd) {
 /// NO_SQARRAY: drop the SQ indirection array (kernel 6.6+)
 /// CQSIZE: avoid CQ overflow from bursts of multishot recv CQEs
 pub fn build_ring(entries: u32) -> Result<IoUring> {
+    let ring = build_ring_inner(entries)?;
+    MIN_TIMEOUT_OK.store(
+        ring.params().is_feature_min_timeout(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(ring)
+}
+
+fn build_ring_inner(entries: u32) -> Result<IoUring> {
     IoUring::builder()
         .setup_single_issuer()
         .setup_coop_taskrun()
