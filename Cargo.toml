@@ -1,8 +1,21 @@
 [package]
 name = "shb"
 version = "0.1.0"
+authors = ["hatoo <hato2000@gmail.com>"]
 edition = "2024"
+rust-version = "1.93"
+description = "Simple HTTP Benchmarker: an io_uring based HTTP/1.1, HTTP/2 and HTTP/3 load generator"
+documentation = "https://github.com/hatoo/shb"
+repository = "https://github.com/hatoo/shb"
+readme = "README.md"
 license = "MIT"
+keywords = ["cli", "load-testing", "benchmark", "http", "io-uring"]
+categories = [
+    "command-line-utilities",
+    "network-programming",
+    "web-programming::http-client",
+    "development-tools::profiling",
+]
 
 [dependencies]
 anyhow = "1.0.104"
