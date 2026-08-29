@@ -63,9 +63,11 @@ $ shb -z 30s -c 100 http://127.0.0.1:8080/        # run for 30 seconds
 $ shb --http2 -p 32 -c 16 https://example.com/    # HTTP/2, 32 streams per connection
 $ shb --http3 -p 32 -c 16 https://example.com/    # HTTP/3 over QUIC
 $ shb -m POST -H 'Content-Type: application/json' -d @body.json http://127.0.0.1:8080/api
+$ shb --disable-keepalive -c 100 http://127.0.0.1:8080/       # a fresh connection per request
 ```
 
-`-n` and `-z` are mutually exclusive, and `-p` only applies to HTTP/2 and HTTP/3.
+`-n` and `-z` are mutually exclusive, `-p` only applies to HTTP/2 and HTTP/3,
+and `--disable-keepalive` only applies to HTTP/1.1.
 
 ### Options
 
@@ -80,6 +82,7 @@ $ shb -m POST -H 'Content-Type: application/json' -d @body.json http://127.0.0.1
 | `-H, --header` | — | Extra header, repeatable: `-H 'Name: Value'` |
 | `-d, --data` | — | Request body; `@file` reads a file, `@-` reads stdin |
 | `--connect-timeout` | `5s` | Connection establishment timeout |
+| `--disable-keepalive` | off | Reconnect for every request (HTTP/1.1 only) |
 | `--http2` | off | Use HTTP/2 |
 | `--http3` | off | Use HTTP/3 (requires an `https://` URL) |
 | `-j, --json` | off | Print the report as JSON |
@@ -122,6 +125,8 @@ Options:
           Use HTTP/2 (prior knowledge on http://, ALPN "h2" on https://)
       --http3
           Use HTTP/3 over QUIC (https:// URLs only)
+      --disable-keepalive
+          Close the connection after every response instead of reusing it (sends "Connection: close"; HTTP/1.1 only)
   -p, --parallel <PARALLEL>
           Number of concurrent streams per connection (HTTP/2 and HTTP/3) [default: 1]
   -h, --help

@@ -505,7 +505,7 @@ pub fn run_worker(
                                 Ok(ParseOutcome::Complete { keep_alive }) => {
                                     stats.record_success(conn.status_code(), conn.request_start);
                                     request_finished = true;
-                                    keep_conn = keep_alive;
+                                    keep_conn = keep_alive && !target.disable_keepalive;
                                 }
                                 Ok(ParseOutcome::NeedMoreData) => {
                                     if !conn.recv_armed {

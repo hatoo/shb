@@ -74,6 +74,11 @@ pub struct Args {
     #[arg(long)]
     pub http3: bool,
 
+    /// Close the connection after every response instead of reusing it
+    /// (sends "Connection: close"; HTTP/1.1 only)
+    #[arg(long, conflicts_with = "proto")]
+    pub disable_keepalive: bool,
+
     /// Number of concurrent streams per connection (HTTP/2 and HTTP/3)
     #[arg(
         short = 'p',
@@ -122,7 +127,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| if args.body.is_some() { "POST" } else { "GET" }.to_string());
     let body = resolve_body(args.body.as_deref())?;
-    let target = parse_target(&args.url, &method, &args.headers, body.as_deref())?;
+    let target = parse_target(
+        &args.url,
+        &method,
+        &args.headers,
+        body.as_deref(),
+        args.disable_keepalive,
+    )?;
 
     // Print the report even when interrupted with Ctrl-C: the handler sets a
     // flag, workers notice it within ~100ms and return their stats normally

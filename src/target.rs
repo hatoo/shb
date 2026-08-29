@@ -25,6 +25,11 @@ pub struct Target {
     pub body: Vec<u8>,
     /// Pre-encoded HTTP/1.1 request
     pub request_bytes: Vec<u8>,
+    /// Close the connection after every response (HTTP/1.1 only). The request
+    /// already carries `Connection: close`; the worker also drops the
+    /// connection unconditionally, so a server that ignores the header cannot
+    /// keep it alive
+    pub disable_keepalive: bool,
 }
 
 /// Connection-specific headers are meaningless (and mostly forbidden) in
@@ -46,6 +51,7 @@ pub fn parse_target(
     method: &str,
     header_args: &[String],
     body: Option<&[u8]>,
+    disable_keepalive: bool,
 ) -> Result<Target> {
     let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
@@ -114,6 +120,15 @@ pub fn parse_target(
             "application/x-www-form-urlencoded".to_string(),
         ));
     }
+    // Ask the server to close too, unless the user already spelled out their
+    // own Connection header
+    if disable_keepalive
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        headers.push(("Connection".to_string(), "close".to_string()));
+    }
     let authority = host_override.unwrap_or_else(|| authority.to_string());
     let body: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
 
@@ -149,5 +164,6 @@ pub fn parse_target(
         headers,
         body,
         request_bytes,
+        disable_keepalive,
     })
 }

@@ -534,3 +534,152 @@ fn body_from_missing_file_is_rejected() {
     let stderr = shb_fail(&["-d", "@/no/such/shb/file", "-n", "1", "http://127.0.0.1:9/"]);
     assert!(stderr.contains("file"), "stderr: {stderr}");
 }
+
+/// A minimal HTTP/1.1 server that deliberately **ignores** `Connection: close`
+/// and always answers keep-alive, so the tests can prove that
+/// `--disable-keepalive` closes the connection on the client side rather than
+/// relying on the server to cooperate.
+struct StubbornServer {
+    addr: SocketAddr,
+    /// Accepted TCP connections
+    conns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Highest number of requests served on a single connection
+    max_reqs_per_conn: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether any request carried a `Connection: close` header
+    saw_close_header: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn start_stubborn_server() -> StubbornServer {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let conns = Arc::new(AtomicUsize::new(0));
+    let max_reqs_per_conn = Arc::new(AtomicUsize::new(0));
+    let saw_close_header = Arc::new(AtomicBool::new(false));
+
+    let (c, m, h) = (
+        Arc::clone(&conns),
+        Arc::clone(&max_reqs_per_conn),
+        Arc::clone(&saw_close_header),
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            c.fetch_add(1, Ordering::Relaxed);
+            let (m, h) = (Arc::clone(&m), Arc::clone(&h));
+            std::thread::spawn(move || {
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut served = 0usize;
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                    }
+                    // Answer every complete request head in the buffer. The
+                    // tests only send bodyless requests, so the head is the
+                    // whole request.
+                    while let Some(end) = pending
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
+                    {
+                        let head = String::from_utf8_lossy(&pending[..end]).to_lowercase();
+                        if head.contains("connection: close") {
+                            h.store(true, Ordering::Relaxed);
+                        }
+                        pending.drain(..end);
+                        served += 1;
+                        // Publish per response, not at EOF: the test reads
+                        // this right after shb exits, before the peer close
+                        // is necessarily observed here
+                        m.fetch_max(served, Ordering::Relaxed);
+                        // No Connection header: HTTP/1.1 defaults to
+                        // keep-alive, whatever the request asked for
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    StubbornServer {
+        addr,
+        conns,
+        max_reqs_per_conn,
+        saw_close_header,
+    }
+}
+
+#[test]
+fn h1_disable_keepalive_uses_one_connection_per_request() {
+    use std::sync::atomic::Ordering;
+
+    let server = start_stubborn_server();
+    let url = format!("http://{}/", server.addr);
+    let report = shb_json(&[
+        "--disable-keepalive",
+        "-n",
+        "20",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 20, "200");
+
+    assert!(
+        server.saw_close_header.load(Ordering::Relaxed),
+        "requests should carry Connection: close"
+    );
+    assert_eq!(
+        server.max_reqs_per_conn.load(Ordering::Relaxed),
+        1,
+        "every connection should serve exactly one request"
+    );
+    // One connection per request, plus the one opened for the request that
+    // the run ends on
+    assert!(
+        server.conns.load(Ordering::Relaxed) >= 20,
+        "expected at least 20 connections, got {}",
+        server.conns.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn h1_keepalive_reuses_the_connection_by_default() {
+    use std::sync::atomic::Ordering;
+
+    let server = start_stubborn_server();
+    let url = format!("http://{}/", server.addr);
+    let report = shb_json(&["-n", "20", "-c", "1", "-t", "1", &url]);
+    assert_all_ok(&report, 20, "200");
+
+    assert!(
+        !server.saw_close_header.load(Ordering::Relaxed),
+        "Connection: close should not be sent without --disable-keepalive"
+    );
+    assert_eq!(
+        server.max_reqs_per_conn.load(Ordering::Relaxed),
+        20,
+        "all 20 requests should share one connection"
+    );
+}
+
+#[test]
+fn disable_keepalive_conflicts_with_http2_and_http3() {
+    let stderr = shb_fail(&["--disable-keepalive", "--http2", "http://127.0.0.1:1/"]);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "unexpected stderr: {stderr}"
+    );
+}
