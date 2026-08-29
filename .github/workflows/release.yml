@@ -12,6 +12,10 @@ jobs:
   build:
     name: Build ${{ matrix.release_name }}
     runs-on: ubuntu-latest
+    # creating the release and uploading assets needs write access; the
+    # repository default for GITHUB_TOKEN is read-only
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
