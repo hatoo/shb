@@ -1,6 +1,7 @@
 # shb — Simple HTTP Benchmarker
 
 [![CI](https://github.com/hatoo/shb/actions/workflows/ci.yml/badge.svg)](https://github.com/hatoo/shb/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/shb.svg)](https://crates.io/crates/shb)
 
 An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
 and HTTP/3.
@@ -36,6 +37,12 @@ no async runtime underneath.
 - A recent stable Rust toolchain (edition 2024).
 
 ## Install
+
+```console
+$ cargo install shb
+```
+
+Or from git, for the latest commit:
 
 ```console
 $ cargo install --git https://github.com/hatoo/shb
