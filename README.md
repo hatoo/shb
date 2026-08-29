@@ -7,12 +7,10 @@ An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
 and HTTP/3.
 
 Protocol handling is Sans-I/O throughout, so the whole client is one
-completion-driven event loop per thread with no async runtime underneath. The
-HTTP/1.1 and HTTP/2 paths are written for this one job — see
-[How it works](#how-it-works) — while HTTP/3 uses [shiguredo_http3] over
-[quinn-proto].
+completion-driven event loop per thread with no async runtime underneath. All
+three protocol stacks are written for this one job — see
+[How it works](#how-it-works) — over [quinn-proto] for the QUIC transport.
 
-[shiguredo_http3]: https://github.com/shiguredo/http3-rs
 [quinn-proto]: https://github.com/quinn-rs/quinn
 
 ## Features
@@ -208,7 +206,7 @@ threads for every tool. Numbers are requests/sec; higher is better.
 | HTTP/1.1 | 1000 connections | **993,170** | 856,476 | 796,238 |
 | HTTP/2 (h2c) | 32 conns × 32 streams | **932,839** | — | 885,527 |
 | HTTP/2 (h2c) | 100 conns × 100 streams | **1,255,321** | — | 1,205,942 |
-| HTTP/3 | 16 conns × 128 streams | 767,771 | — | **1,395,144** |
+| HTTP/3 | 32 conns × 32 streams | **2,054,015** | — | 1,466,884 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -230,11 +228,11 @@ HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
 `:status` with every other field measured and skipped.
 
-**On HTTP/3 h2load is ~80 % ahead.** That gap is not in the io_uring layer — a
-CPU profile of a saturated worker puts io_uring at 0.1–0.4 %. HTTP/3 is the one
-protocol where shb still leans on general-purpose Rust crates (quinn-proto and
-a Sans-I/O HTTP/3 implementation) against h2load's ngtcp2 and nghttp3 in C, and
-the QUIC transport is where the difference lives.
+**On HTTP/3 shb is 40 % ahead**, and 26 % at 16 × 128. QPACK is where that
+comes from: a profile of a saturated worker used to spend 47 % of its time
+Huffman-decoding response header values, which the scanner now steps over
+without reading. QUIC itself is still [quinn-proto], so the remaining cost is
+mostly transport and crypto.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
@@ -337,6 +335,11 @@ cheap:
   which stops the peer indexing too — response decoding then needs no dynamic
   table, and only `:status` is decoded while every other field is measured and
   stepped over.
+- **HTTP/3 does the same for QPACK**: the request field section is encoded
+  once from static-table references, and `QPACK_MAX_TABLE_CAPACITY: 0` stops
+  the peer inserting, so responses decode without a dynamic table and never
+  block on one. Only `:status` is read; DATA and unknown frames are skipped by
+  length.
 - **HTTP/3 sends with UDP GSO**, batching up to 64 QUIC packets into one
   `sendmsg` when the kernel supports it.
 - **`-z` deadlines and QUIC timers are io_uring timeouts**, so an idle worker
