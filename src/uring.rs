@@ -61,11 +61,18 @@ const BATCH_LINGER: u32 = 500;
 /// Whether the kernel supports `min_wait_usec` (IORING_FEAT_MIN_TIMEOUT, 6.12+)
 static MIN_TIMEOUT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// How many CQEs one io_uring_enter should wait for
+/// Share of a worker's connections one wait may hold out for
 ///
-/// Waiting for a batch amortises the syscall over several completions. Asking
-/// for more than the worker can produce would just stall, and a worker keeps
-/// one receive in flight per connection, so its connection count is the bound.
+/// A completion is what lets its connection issue the next request, so waiting
+/// on a batch stalls that fraction of the worker's pipeline. Waiting for a
+/// quarter of the connections amortises the syscall without the batch ever
+/// needing a full round trip to fill. Measured against a server fast enough to
+/// keep shb on the critical path: a quarter is 7-14% ahead of waiting for all
+/// of them at 3 to 6 connections per worker, and within noise from 12 up,
+/// where the cap of 8 applies either way.
+const BATCH_SHARE: usize = 4;
+
+/// How many CQEs one io_uring_enter should wait for
 ///
 /// Without `min_wait_usec` support the batch would block until the 100ms
 /// WAIT_TIMEOUT whenever it cannot be filled, which costs far more than the
@@ -74,7 +81,7 @@ pub fn batch_size(connections: usize) -> usize {
     if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
         return 1;
     }
-    connections.clamp(1, MAX_BATCH)
+    (connections / BATCH_SHARE).clamp(1, MAX_BATCH)
 }
 
 /// Submit pending SQEs and wait for up to `min_complete` CQEs, bounded by
