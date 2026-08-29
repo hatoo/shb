@@ -6,14 +6,13 @@
 An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
 and HTTP/3.
 
-Protocol handling is Sans-I/O throughout — [shiguredo_http2], [shiguredo_http3]
-and [quinn-proto] for QUIC, with [shiguredo_http11] building the HTTP/1.1
-requests and a purpose-built scanner reading the responses — so the whole client
-is one completion-driven event loop per thread with no async runtime
-underneath.
+Protocol handling is Sans-I/O throughout, so the whole client is one
+completion-driven event loop per thread with no async runtime underneath. The
+HTTP/1.1 and HTTP/2 paths are written for this one job — see
+[How it works](#how-it-works) — while HTTP/3 uses [shiguredo_http3] over
+[quinn-proto], and [shiguredo_http11] builds the HTTP/1.1 requests.
 
 [shiguredo_http11]: https://github.com/shiguredo/http11-rs
-[shiguredo_http2]: https://github.com/shiguredo/http2-rs
 [shiguredo_http3]: https://github.com/shiguredo/http3-rs
 [quinn-proto]: https://github.com/quinn-rs/quinn
 
@@ -202,14 +201,14 @@ Latency distribution:
 ## Comparison with wrk and h2load
 
 Measured against nginx 1.31.4 returning a 13-byte body, with 10 s per run,
-median of 3 runs (5 for HTTP/3, where the spread is wider), and 16 threads for
-every tool. Numbers are requests/sec; higher is better.
+median of 3 runs (5 for HTTP/2 and HTTP/3, where the spread is wider), and 16
+threads for every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
 | HTTP/1.1 | 1000 connections | **993,170** | 856,476 | 796,238 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | 889,303 | — | **923,191** |
-| HTTP/2 (h2c) | 100 conns × 100 streams | 1,028,441 | — | **1,242,151** |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **932,839** | — | 885,527 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,255,321** | — | 1,205,942 |
 | HTTP/3 | 16 conns × 128 streams | 767,771 | — | **1,395,144** |
 
 [wrk]: https://github.com/wg/wrk
@@ -227,12 +226,16 @@ response path is a boundary scanner rather than a parser (see
 much closer together at low connection counts, where the ceiling is a round
 trip rather than the client: at 64 connections it is 476k / 458k / 425k.
 
-**On HTTP/2 h2load is 4 % ahead at 32 × 32 and 21 % ahead at 100 × 100**, and
-**on HTTP/3 it is ~80 % ahead**. That gap is not in the io_uring layer — a CPU
-profile of a saturated worker puts io_uring at 0.1–0.4 %. For those two
-protocols shb leans on pure-Rust Sans-I/O crates where h2load has nghttp2,
-nghttp3 and ngtcp2 in C, and HPACK/QPACK and the QUIC transport are where the
-difference lives.
+**On HTTP/2 shb is 5 % ahead** at 32 × 32 and 4 % at 100 × 100. Like the
+HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
+single HPACK block encoded once at start-up, and responses are walked for
+`:status` with every other field measured and skipped.
+
+**On HTTP/3 h2load is ~80 % ahead.** That gap is not in the io_uring layer — a
+CPU profile of a saturated worker puts io_uring at 0.1–0.4 %. HTTP/3 is the one
+protocol where shb still leans on general-purpose Rust crates (quinn-proto and
+a Sans-I/O HTTP/3 implementation) against h2load's ngtcp2 and nghttp3 in C, and
+the QUIC transport is where the difference lives.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
@@ -328,6 +331,13 @@ cheap:
   `memchr`, one case-insensitive byte decides whether a line is worth reading,
   nothing is allocated per response, and the scan runs straight over the
   receive buffer.
+- **HTTP/2 requests are one pre-encoded HPACK block**, built once at start-up
+  out of static-table indices and literals *without* indexing, so it never
+  touches a dynamic table and the same bytes are memcpy'd for every stream on
+  every connection. The client also advertises `SETTINGS_HEADER_TABLE_SIZE: 0`,
+  which stops the peer indexing too — response decoding then needs no dynamic
+  table, and only `:status` is decoded while every other field is measured and
+  stepped over.
 - **HTTP/3 sends with UDP GSO**, batching up to 64 QUIC packets into one
   `sendmsg` when the kernel supports it.
 - **`-z` deadlines and QUIC timers are io_uring timeouts**, so an idle worker
