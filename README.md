@@ -206,10 +206,10 @@ Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | **280,721** | 276,849 | 276,584 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **777,423** | — | 142,664 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | 663,725 | — | **670,382** |
-| HTTP/3 | 16 conns × 128 streams | **330,696** | — | 307,366 |
+| HTTP/1.1 | 64 connections | **307,216** | 276,064 | 273,447 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **752,609** | — | 144,617 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **635,166** | — | 631,325 |
+| HTTP/3 | 16 conns × 128 streams | **313,191** | — | 292,965 |
 
 [sandbag]: https://github.com/hatoo/sandbag
 [wrk]: https://github.com/wg/wrk
@@ -221,16 +221,19 @@ $ wrk    -d 10s -c 64 -t 16 http://127.0.0.1:3000/
 $ h2load --h1 -D 10 -c 64 -t 16 http://127.0.0.1:3000/
 ```
 
-**On HTTP/1.1 all three tools land within 1.5 % of each other** — at that point
-the test server, not the client, is the limit.
+**On HTTP/1.1 shb is ~11 % ahead** of both wrk and h2load, which land within
+1 % of each other. With only 64 connections the throughput ceiling is set by how
+fast each client turns a response around, and shb waits for a batch of
+completions per `io_uring_enter` instead of one.
 
 **On HTTP/2 the gap is about where the concurrency sits, not about a ceiling.**
-Both tools reach ~670k req/s when the load is spread over 100 connections × 100
-streams. At 32 × 32, though, h2load stays at ~143k while shb reaches ~777k:
-h2load needs a large number of in-flight requests before it saturates, whereas
-shb drives the same throughput from far fewer connections.
+Both tools reach ~635k req/s when the load is spread over 100 connections × 100
+streams — a difference of under 1 %. At 32 × 32, though, h2load stays at ~145k
+while shb reaches ~753k: h2load needs a large number of in-flight requests
+before it saturates, whereas shb drives the same throughput from far fewer
+connections.
 
-**On HTTP/3 shb is ~8 % ahead** at each tool's best configuration. Both plateau
+**On HTTP/3 shb is ~7 % ahead** at each tool's best configuration. Both plateau
 near 300k req/s, which is the server's HTTP/3 limit rather than either client's.
 
 <details>
