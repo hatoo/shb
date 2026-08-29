@@ -206,10 +206,10 @@ every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | 446,625 | **453,298** | 419,928 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | 823,724 | — | **877,824** |
-| HTTP/2 (h2c) | 100 conns × 100 streams | 959,681 | — | **1,182,411** |
-| HTTP/3 | 16 conns × 128 streams | 811,914 | — | **1,359,574** |
+| HTTP/1.1 | 64 connections | 464,697 | **473,246** | 431,567 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | 889,303 | — | **923,191** |
+| HTTP/2 (h2c) | 100 conns × 100 streams | 1,028,441 | — | **1,242,151** |
+| HTTP/3 | 16 conns × 128 streams | 767,771 | — | **1,395,144** |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -220,11 +220,11 @@ $ wrk    -d 10s -c 64 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 64 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 the three tools are within 8 % of each other**, shb and wrk
+**On HTTP/1.1 the three tools are within 10 % of each other**, shb and wrk
 within 2 %.
 
-**On HTTP/2 h2load is 6 % ahead at 32 × 32 and 19 % ahead at 100 × 100**, and
-**on HTTP/3 it is ~40 % ahead**. That gap is not in the io_uring layer — a CPU
+**On HTTP/2 h2load is 4 % ahead at 32 × 32 and 21 % ahead at 100 × 100**, and
+**on HTTP/3 it is ~80 % ahead**. That gap is not in the io_uring layer — a CPU
 profile of a saturated shb worker puts io_uring at 0.1–0.4 % and shb's own code
 at 7 % (HTTP/2) to 15 % (HTTP/1.1). The rest is the sans-I/O protocol crates
 shb builds on, which are pure Rust; h2load's are nghttp2, nghttp3 and ngtcp2 in
@@ -251,7 +251,9 @@ mean anything.
 
 **Tools**
 
-- shb (this repo), built with `cargo build --release`.
+- shb (this repo), built with `cargo build --profile dist` — the profile the
+  released binaries use (LTO, one codegen unit). It measures within about 2 %
+  of a plain `--release` build.
 - wrk 4.1.0 (Ubuntu package).
 - h2load from nghttp2 1.71.0-DEV, built against ngtcp2 + nghttp3 + BoringSSL —
   the distro build of h2load has no HTTP/3 support.
