@@ -1,13 +1,15 @@
 //! HTTP/1.1 benchmark worker
 
+mod parse;
+
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use io_uring::{Submitter, cqueue, squeue, types};
-use shiguredo_http11::{BodyKind, BodyProgress, HttpHead, ResponseDecoder};
 
+use self::parse::Parser;
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
@@ -17,30 +19,13 @@ use crate::uring::{
     TIMEOUT_USER_DATA,
 };
 
-/// Progress of receiving a response
-enum ParseOutcome {
-    /// One response completed; keep_alive is true if the connection can be reused
-    Complete { keep_alive: bool },
-    /// Not enough data; keep receiving
-    NeedMoreData,
-}
-
-/// Metadata of the current response, extracted from the decoded headers
-///
-/// The ResponseHead is consumed by decode_headers, so keep only the values
-/// needed until the response completes.
-struct ResponseMeta {
-    body_kind: BodyKind,
-    keep_alive: bool,
-    /// Status code (tallied on completion)
-    status_code: u16,
-}
-
 struct Conn {
     fd: RawFd,
     /// Whether the TCP connection is established (true after a successful Connect CQE)
     connected: bool,
-    decoder: ResponseDecoder,
+    parser: Parser,
+    /// Plaintext scratch for the TLS path, reused across receives
+    plain: Vec<u8>,
     /// TLS session (https URLs only; recreated per TCP connection)
     tls: Option<TlsSession>,
     /// Bytes currently being sent; must stay untouched while a Send is in flight
@@ -54,8 +39,6 @@ struct Conn {
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
     generation: u64,
-    /// Metadata of the current response (None = headers not decoded yet)
-    resp: Option<ResponseMeta>,
     request_start: Instant,
 }
 
@@ -64,14 +47,14 @@ impl Conn {
         Conn {
             fd: -1,
             connected: false,
-            decoder: ResponseDecoder::new(),
+            parser: Parser::new(),
+            plain: Vec::new(),
             tls: None,
             out: Vec::new(),
             out_off: 0,
             sending: false,
             recv_armed: false,
             generation: 0,
-            resp: None,
             request_start: Instant::now(),
         }
     }
@@ -92,82 +75,14 @@ impl Conn {
         self.generation += 1;
     }
 
-    /// Advance the decoder state machine after feeding received data
-    fn parse(&mut self) -> Result<ParseOutcome> {
-        let meta = match &self.resp {
-            Some(meta) => meta,
-            None => match self
-                .decoder
-                .decode_headers()
-                .map_err(|e| anyhow::anyhow!("decode error: {e:?}"))?
-            {
-                None => return Ok(ParseOutcome::NeedMoreData),
-                Some((head, body_kind)) => &*self.resp.insert(ResponseMeta {
-                    body_kind,
-                    // A close-delimited body ends with the connection closing,
-                    // so keep-alive is impossible regardless of the Connection header
-                    keep_alive: head.is_keep_alive()
-                        && !matches!(body_kind, BodyKind::CloseDelimited),
-                    status_code: head.status_code(),
-                }),
-            },
-        };
-
-        match meta.body_kind {
-            BodyKind::None => Ok(ParseOutcome::Complete {
-                keep_alive: meta.keep_alive,
-            }),
-            BodyKind::Tunnel => bail!("unexpected tunnel response"),
-            _ => {
-                let keep_alive = meta.keep_alive;
-                loop {
-                    let progress = if let Some(body) = self.decoder.peek_body() {
-                        let len = body.len();
-                        self.decoder
-                            .consume_body(len)
-                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
-                    } else {
-                        self.decoder
-                            .progress()
-                            .map_err(|e| anyhow::anyhow!("body decode error: {e:?}"))?
-                    };
-                    match progress {
-                        BodyProgress::Complete { .. } => {
-                            return Ok(ParseOutcome::Complete { keep_alive });
-                        }
-                        BodyProgress::Advanced => continue,
-                        BodyProgress::NeedData => return Ok(ParseOutcome::NeedMoreData),
-                    }
-                }
-            }
-        }
-    }
-
     /// Reset per-request state for the next request
     fn begin_request(&mut self) {
-        self.resp = None;
         self.request_start = Instant::now();
-    }
-
-    fn status_code(&self) -> u16 {
-        self.resp.as_ref().map_or(0, |m| m.status_code)
     }
 }
 
 /// Queue the request bytes for sending on this connection
-///
-/// For HEAD the decoder must be told the request method: the response has
-/// headers only, regardless of Content-Length (RFC 9112 Section 6.3). The
-/// decoder clears the method at each message boundary, so set it per request.
-fn queue_request(conn: &mut Conn, request: &[u8], is_head: bool) -> Result<()> {
-    if is_head {
-        // The decoder clears request_method during its lazy Complete ->
-        // StartLine transition, which would wipe a method set before it.
-        // Force the transition now (a no-op on an empty buffer), then set
-        // the method for the upcoming response
-        let _ = conn.decoder.decode_headers();
-        conn.decoder.set_request_method("HEAD");
-    }
+fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
     match &mut conn.tls {
         Some(tls) => tls.write_plaintext(request),
         None => {
@@ -258,7 +173,10 @@ pub fn run_worker(
     let mut buf_ring = BufRing::new(buf_entries)?;
     let mut conns: Vec<Conn> = Vec::with_capacity(connections);
     for _ in 0..connections {
-        conns.push(Conn::new());
+        let mut conn = Conn::new();
+        // The method never changes during a run, so the parser is told once
+        conn.parser.set_head_request(is_head);
+        conns.push(conn);
     }
 
     let entries = (connections * 2).next_power_of_two().max(256) as u32;
@@ -382,7 +300,7 @@ pub fn run_worker(
                         // connect; the first request on a TLS connection does
                         // include the handshake)
                         conn.request_start = Instant::now();
-                        queue_request(conn, &target.request_bytes, is_head)?;
+                        queue_request(conn, &target.request_bytes)?;
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
@@ -446,15 +364,8 @@ pub fn run_worker(
                             buf_ring.recycle(bid);
                         }
                         // EOF: a close-delimited body completes normally here
-                        // (is_close_delimited implies the headers were decoded)
-                        if conn.decoder.is_close_delimited() {
-                            conn.decoder.mark_eof();
-                            match conn.parse() {
-                                Ok(ParseOutcome::Complete { .. }) => {
-                                    stats.record_success(conn.status_code(), conn.request_start);
-                                }
-                                _ => stats.errors += 1,
-                            }
+                        if conn.parser.mark_eof() {
+                            stats.record_success(conn.parser.status(), conn.request_start);
                         } else {
                             stats.errors += 1;
                         }
@@ -464,65 +375,48 @@ pub fn run_worker(
                         stats.bytes_received += res as u64;
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
-                        // In TLS mode decrypt straight into the decoder's
-                        // internal buffer via mut_buf/advance_buf (no
-                        // intermediate copy); otherwise feed the socket bytes
-                        // directly
-                        let feed_result: Result<()> = match &mut conn.tls {
-                            Some(tls) => tls.feed(buf_ring.data(bid, res as usize)).and_then(
-                                |mut available| {
-                                    while available > 0 {
-                                        let len = available.min(conn.decoder.available_buf());
-                                        if len == 0 {
-                                            anyhow::bail!(
-                                                "decoder buffer full (response headers too large?)"
-                                            );
+                        // Plaintext feeds the received bytes to the parser
+                        // as they are; TLS decrypts into a reused scratch
+                        // buffer first
+                        let done: Result<usize> = match &mut conn.tls {
+                            Some(tls) => {
+                                tls.feed(buf_ring.data(bid, res as usize))
+                                    .and_then(|available| {
+                                        conn.plain.resize(available, 0);
+                                        let mut filled = 0;
+                                        while filled < available {
+                                            let n =
+                                                tls.read_plaintext(&mut conn.plain[filled..])?;
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            filled += n;
                                         }
-                                        let buf = conn
-                                            .decoder
-                                            .mut_buf(len)
-                                            .map_err(|e| anyhow::anyhow!("mut_buf: {e:?}"))?;
-                                        let n = tls.read_plaintext(buf)?;
-                                        conn.decoder.advance_buf(n);
-                                        if n == 0 {
-                                            break;
-                                        }
-                                        available -= n;
-                                    }
-                                    Ok(())
-                                },
-                            ),
-                            None => conn
-                                .decoder
-                                .feed(buf_ring.data(bid, res as usize))
-                                .map_err(|e| anyhow::anyhow!("decode feed: {e:?}")),
+                                        conn.parser.feed(&conn.plain[..filled])
+                                    })
+                            }
+                            None => conn.parser.feed(buf_ring.data(bid, res as usize)),
                         };
                         buf_ring.recycle(bid);
-                        if feed_result.is_err() {
-                            stats.errors += 1;
-                            request_finished = true;
-                            keep_conn = false;
-                        } else {
-                            match conn.parse() {
-                                Ok(ParseOutcome::Complete { keep_alive }) => {
-                                    stats.record_success(conn.status_code(), conn.request_start);
-                                    request_finished = true;
-                                    keep_conn = keep_alive && !target.disable_keepalive;
+                        match done {
+                            Ok(0) => {
+                                if !conn.recv_armed {
+                                    push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                                 }
-                                Ok(ParseOutcome::NeedMoreData) => {
-                                    if !conn.recv_armed {
-                                        push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
-                                    }
-                                }
-                                Err(_) => {
-                                    stats.errors += 1;
-                                    request_finished = true;
-                                    keep_conn = false;
-                                }
+                                // The TLS handshake may need to send its next
+                                // flight even though no request completed
+                                flush(&submitter, &mut sq, conn_idx, conn)?;
                             }
-                            // The TLS handshake may need to send its next
-                            // flight even though no request completed
-                            flush(&submitter, &mut sq, conn_idx, conn)?;
+                            Ok(_) => {
+                                stats.record_success(conn.parser.status(), conn.request_start);
+                                request_finished = true;
+                                keep_conn = !target.disable_keepalive;
+                            }
+                            Err(_) => {
+                                stats.errors += 1;
+                                request_finished = true;
+                                keep_conn = false;
+                            }
                         }
                     }
                 }
@@ -538,11 +432,11 @@ pub fn run_worker(
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
-                        queue_request(conn, &target.request_bytes, is_head)?;
+                        queue_request(conn, &target.request_bytes)?;
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     } else {
                         conn.close();
-                        conn.decoder.reset();
+                        conn.parser.reset();
                         match uring::start_connect(
                             &submitter,
                             &mut sq,

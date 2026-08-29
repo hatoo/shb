@@ -1102,6 +1102,7 @@ dependencies = [
  "humantime",
  "io-uring",
  "libc",
+ "memchr",
  "num_cpus",
  "quinn",
  "quinn-proto",
