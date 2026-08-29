@@ -6,10 +6,11 @@
 An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
 and HTTP/3.
 
-Every protocol is driven by a Sans-I/O state machine
-([shiguredo_http11], [shiguredo_http2], [shiguredo_http3] and [quinn-proto] for
-QUIC), so the whole client is one completion-driven event loop per thread with
-no async runtime underneath.
+Protocol handling is Sans-I/O throughout — [shiguredo_http2], [shiguredo_http3]
+and [quinn-proto] for QUIC, with [shiguredo_http11] building the HTTP/1.1
+requests and a purpose-built scanner reading the responses — so the whole client
+is one completion-driven event loop per thread with no async runtime
+underneath.
 
 [shiguredo_http11]: https://github.com/shiguredo/http11-rs
 [shiguredo_http2]: https://github.com/shiguredo/http2-rs
@@ -206,7 +207,7 @@ every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | 464,697 | **473,246** | 431,567 |
+| HTTP/1.1 | 64 connections | **476,233** | 458,287 | 425,420 |
 | HTTP/2 (h2c) | 32 conns × 32 streams | 889,303 | — | **923,191** |
 | HTTP/2 (h2c) | 100 conns × 100 streams | 1,028,441 | — | **1,242,151** |
 | HTTP/3 | 16 conns × 128 streams | 767,771 | — | **1,395,144** |
@@ -220,16 +221,16 @@ $ wrk    -d 10s -c 64 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 64 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 the three tools are within 10 % of each other**, shb and wrk
-within 2 %.
+**On HTTP/1.1 shb is ahead of both** — 4 % over wrk and 12 % over h2load. Its
+response path is a boundary scanner rather than a parser (see
+[How it works](#how-it-works)), which is worth ~10 % on its own.
 
 **On HTTP/2 h2load is 4 % ahead at 32 × 32 and 21 % ahead at 100 × 100**, and
 **on HTTP/3 it is ~80 % ahead**. That gap is not in the io_uring layer — a CPU
-profile of a saturated shb worker puts io_uring at 0.1–0.4 % and shb's own code
-at 7 % (HTTP/2) to 15 % (HTTP/1.1). The rest is the sans-I/O protocol crates
-shb builds on, which are pure Rust; h2load's are nghttp2, nghttp3 and ngtcp2 in
-C. Header parsing, HPACK/QPACK and the QUIC transport are where the difference
-lives.
+profile of a saturated worker puts io_uring at 0.1–0.4 %. For those two
+protocols shb leans on pure-Rust Sans-I/O crates where h2load has nghttp2,
+nghttp3 and ngtcp2 in C, and HPACK/QPACK and the QUIC transport are where the
+difference lives.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
@@ -318,8 +319,12 @@ cheap:
   being re-armed, into a **provided buffer ring** the kernel picks buffers from.
 - **Sockets are registered files** and the ring itself is a registered fd, so
   neither is looked up per operation.
-- **HTTP/1.1 decodes in place**: `mut_buf`/`advance_buf` let the socket write
-  straight into the decoder's buffer, and TLS decrypts into it directly.
+- **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
+  to know where one response ends and the next begins, so the scanner reads the
+  status line, `Content-Length` and `Transfer-Encoding` and steps over every
+  other header without looking at it. Lines are found with `memchr`, one
+  case-insensitive byte decides whether a line is worth reading, nothing is
+  allocated per response, and the scan runs straight over the receive buffer.
 - **HTTP/3 sends with UDP GSO**, batching up to 64 QUIC packets into one
   `sendmsg` when the kernel supports it.
 - **`-z` deadlines and QUIC timers are io_uring timeouts**, so an idle worker
