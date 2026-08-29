@@ -1,13 +1,13 @@
 //! HTTP/2 benchmark worker (h2c prior knowledge, or ALPN "h2" over TLS)
 
+mod conn;
+mod hpack;
+
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use io_uring::{Submitter, cqueue, squeue, types};
-use shiguredo_http2::{Connection, ErrorCode, Event, HeaderField, Limits, StreamId, WindowSize};
-
+use self::conn::{Connection, Event};
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
@@ -16,69 +16,37 @@ use crate::uring::{
     self, BUF_GROUP, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND,
     TIMEOUT_USER_DATA,
 };
+use anyhow::{Context, Result, bail};
+use io_uring::{Submitter, cqueue, squeue, types};
 
-/// Stream-level receive window advertised via SETTINGS_INITIAL_WINDOW_SIZE.
-/// Matches h2load's default of (1 << 30) - 1, effectively disabling
-/// flow-control stalls for responses up to 1GB.
-const STREAM_WINDOW: u32 = (1 << 30) - 1;
-/// Connection-level receive window advertised at connection setup.
-/// Matches h2load's default of (1 << 30) - 1.
-const CONNECTION_WINDOW: u32 = (1 << 30) - 1;
-
-fn make_limits() -> Result<Limits> {
-    Limits::builder()
-        .initial_window_size(
-            WindowSize::new(STREAM_WINDOW).map_err(|e| anyhow::anyhow!("window size: {e:?}"))?,
-        )
-        .connection_window_size(
-            WindowSize::new(CONNECTION_WINDOW)
-                .map_err(|e| anyhow::anyhow!("window size: {e:?}"))?,
-        )
-        .build()
-        .map_err(|e| anyhow::anyhow!("invalid HTTP/2 limits: {e:?}"))
-}
-
-/// Request headers, built once and cloned per request
+/// Build the HPACK block sent for every request on every connection
 ///
-/// Like h2load's pre-built nva arrays, the template is constructed once with
-/// `Cow::Borrowed` contents (`from_static` over intentionally leaked strings),
-/// so the per-request clone copies pointers instead of allocating. Custom
-/// header names are lowercased (required by HTTP/2) and validated with
-/// `HeaderField::new` first so user input cannot trip from_static's panics.
-fn build_request_headers(target: &Target) -> Result<Vec<HeaderField>> {
-    let authority: &'static [u8] =
-        Box::leak(target.authority.clone().into_bytes().into_boxed_slice());
-    let path: &'static [u8] = Box::leak(target.path.clone().into_bytes().into_boxed_slice());
-    let method: &'static [u8] = Box::leak(target.method.clone().into_bytes().into_boxed_slice());
-    let scheme: &'static [u8] = if target.tls { b"https" } else { b"http" };
-
-    let mut fields = vec![
-        HeaderField::from_static(b":method", method),
-        HeaderField::from_static(b":scheme", scheme),
-        HeaderField::from_static(b":authority", authority),
-        HeaderField::from_static(b":path", path),
-    ];
-    for (name, value) in &target.headers {
-        if crate::target::is_connection_specific(name) {
-            continue;
-        }
-        let name = name.to_ascii_lowercase();
-        HeaderField::new(&name, value).map_err(|e| anyhow::anyhow!("header {name:?}: {e:?}"))?;
-        let name: &'static [u8] = Box::leak(name.into_bytes().into_boxed_slice());
-        let value: &'static [u8] = Box::leak(value.clone().into_bytes().into_boxed_slice());
-        fields.push(HeaderField::from_static(name, value));
-    }
-    Ok(fields)
+/// It is encoded once and then memcpy'd per request; nothing in it depends on
+/// the stream or the connection.
+fn build_header_block(target: &Target) -> Vec<u8> {
+    let headers: Vec<(String, String)> = target
+        .headers
+        .iter()
+        .filter(|(name, _)| !crate::target::is_connection_specific(name))
+        // HTTP/2 requires lower-case field names (RFC 9113 Section 8.2.1)
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    hpack::encode_request(
+        &target.method,
+        if target.tls { "https" } else { "http" },
+        &target.authority,
+        &target.path,
+        &headers,
+        target.body.len(),
+    )
 }
 
 /// An in-flight request (one open stream)
 struct InFlight {
-    stream_id: StreamId,
+    stream_id: u32,
     start: Instant,
     /// Status code from :status (0 = not received yet)
     status: u16,
-    /// Stream-level receive-window consumption not yet replenished
-    window_debt: usize,
 }
 
 struct Conn {
@@ -98,8 +66,6 @@ struct Conn {
     recv_armed: bool,
     /// GOAWAY received: no new streams, reconnect once in-flight streams drain
     goaway: bool,
-    /// Connection-level receive-window consumption not yet replenished
-    window_debt: usize,
     /// Reconnect generation. Incremented on every close; CQEs from an old
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
@@ -121,7 +87,6 @@ impl Conn {
             sending: false,
             recv_armed: false,
             goaway: false,
-            window_debt: 0,
             generation: 0,
             streams: Vec::new(),
         }
@@ -137,7 +102,6 @@ impl Conn {
         self.recv_armed = false;
         self.sending = false;
         self.goaway = false;
-        self.window_debt = 0;
         self.out.clear();
         self.out_off = 0;
         self.h2 = None;
@@ -161,7 +125,7 @@ impl Conn {
 /// completions.
 fn fill_streams(
     conn: &mut Conn,
-    request_headers: &[HeaderField],
+    header_block: &[u8],
     body: &[u8],
     parallel: usize,
     started: &mut u64,
@@ -175,21 +139,15 @@ fn fill_streams(
         return;
     };
     while conn.streams.len() < parallel && *started < max_requests {
-        match h2.start_stream(request_headers.to_vec(), body.is_empty()) {
-            Ok(stream_id) => {
-                if !body.is_empty() && h2.send_data(stream_id, body.to_vec(), true).is_err() {
-                    break;
-                }
-                conn.streams.push(InFlight {
-                    stream_id,
-                    start: Instant::now(),
-                    status: 0,
-                    window_debt: 0,
-                });
-                *started += 1;
-            }
-            Err(_) => break,
-        }
+        let Some(stream_id) = h2.start_stream(header_block, body) else {
+            break;
+        };
+        conn.streams.push(InFlight {
+            stream_id,
+            start: Instant::now(),
+            status: 0,
+        });
+        *started += 1;
     }
 }
 
@@ -211,7 +169,7 @@ fn flush(
         Some(tls) => {
             // Encrypt the h2 output; the ciphertext may also contain pending
             // handshake messages even when h2 has nothing to say
-            if let Some(buf) = h2.poll_output() {
+            if let Some(buf) = h2.take_output() {
                 tls.write_plaintext(&buf)?;
             }
             let ciphertext = tls.take_ciphertext()?;
@@ -223,7 +181,7 @@ fn flush(
             }
         }
         None => {
-            if let Some(buf) = h2.poll_output() {
+            if let Some(buf) = h2.take_output() {
                 conn.out = buf;
                 conn.out_off = 0;
                 conn.sending = true;
@@ -234,91 +192,33 @@ fn flush(
     Ok(())
 }
 
-/// Drain h2 events, replenish flow-control windows, and record completed
-/// requests. Returns false if the connection is broken (connection error).
-fn process_events(conn: &mut Conn, stats: &mut Stats) -> bool {
-    let Some(h2) = conn.h2.as_mut() else {
-        return false;
-    };
-    let mut alive = true;
-    while let Some(event) = h2.poll_event() {
-        match event {
-            Event::HeadersReceived {
-                stream_id,
-                headers,
-                end_stream,
-                ..
-            } => {
+/// Turn the connection's events into statistics
+///
+/// Streams are found by scanning a list of at most `parallel` entries, which
+/// keeps the hot path free of hashing.
+fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
+    for event in events {
+        match *event {
+            Event::Status { stream_id, status } => {
                 if let Some(inflight) = conn.streams.iter_mut().find(|s| s.stream_id == stream_id) {
-                    for field in &headers {
-                        if field.name() == b":status" {
-                            inflight.status = std::str::from_utf8(field.value())
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                        }
-                    }
-                    if end_stream {
-                        stats.record_success(inflight.status, inflight.start);
-                        conn.streams.retain(|s| s.stream_id != stream_id);
-                    }
+                    inflight.status = status;
                 }
             }
-            Event::DataReceived {
-                stream_id,
-                data,
-                end_stream,
-            } => {
-                conn.window_debt += data.len();
+            Event::End { stream_id } => {
                 if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
-                    if end_stream {
-                        let inflight = conn.streams.swap_remove(pos);
-                        stats.record_success(inflight.status, inflight.start);
-                    } else {
-                        // Replenish the stream-level window once half of it
-                        // has been consumed (like nghttp2's auto updates)
-                        let inflight = &mut conn.streams[pos];
-                        inflight.window_debt += data.len();
-                        if inflight.window_debt >= (STREAM_WINDOW / 2) as usize {
-                            let _ = h2.send_window_update(stream_id, inflight.window_debt as u32);
-                            inflight.window_debt = 0;
-                        }
-                    }
+                    let inflight = conn.streams.swap_remove(pos);
+                    stats.record_success(inflight.status, inflight.start);
                 }
             }
-            Event::StreamReset {
-                stream_id,
-                connection_window_consumed,
-                ..
-            } => {
-                conn.window_debt += connection_window_consumed;
+            Event::Reset { stream_id } => {
                 if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
                     conn.streams.swap_remove(pos);
                     stats.errors += 1;
                 }
             }
-            Event::DataDiscarded {
-                connection_window_consumed,
-                ..
-            } => {
-                conn.window_debt += connection_window_consumed;
-            }
-            Event::GoawayReceived { .. } => {
-                conn.goaway = true;
-            }
-            Event::ConnectionError { .. } => {
-                alive = false;
-            }
-            _ => {}
+            Event::Goaway => conn.goaway = true,
         }
     }
-    // Replenish the connection-level window once half of it has been consumed
-    // (like nghttp2's auto updates)
-    if conn.window_debt >= (CONNECTION_WINDOW / 2) as usize {
-        let _ = h2.send_window_update(StreamId::Connection, conn.window_debt as u32);
-        conn.window_debt = 0;
-    }
-    alive
 }
 
 /// Benchmark loop of a single HTTP/2 worker thread
@@ -346,8 +246,9 @@ pub fn run_worker(
         );
     }
 
-    let limits = make_limits()?;
-    let request_headers = build_request_headers(target)?;
+    let header_block = build_header_block(target);
+    // Reused across receives so events never allocate on the hot path
+    let mut events: Vec<Event> = Vec::with_capacity(64);
 
     // Declare buf_ring / conns before the ring. Reverse drop order then
     // destroys the ring first (its teardown waits for in-flight operations to
@@ -477,13 +378,12 @@ pub fn run_worker(
                         // Prior knowledge: send the client preface + SETTINGS
                         // and the first requests in a single flush (in TLS mode
                         // they are buffered until the handshake completes)
-                        let mut h2 = Connection::client(limits.clone());
-                        h2.initiate()
-                            .map_err(|e| anyhow::anyhow!("h2 initiate failed: {e:?}"))?;
+                        let mut h2 = Connection::new();
+                        h2.initiate();
                         conn.h2 = Some(h2);
                         fill_streams(
                             conn,
-                            &request_headers,
+                            &header_block,
                             &target.body,
                             parallel,
                             &mut started,
@@ -562,6 +462,7 @@ pub fn run_worker(
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
                         // In TLS mode decrypt into scratch and feed the
                         // plaintext; otherwise feed the socket bytes directly
+                        events.clear();
                         let feed_ok = {
                             let h2 = conn.h2.as_mut().context("recv without h2 connection")?;
                             match &mut conn.tls {
@@ -573,19 +474,19 @@ pub fn run_worker(
                                             if n == 0 {
                                                 break;
                                             }
-                                            h2.feed(&scratch[..n])
-                                                .map_err(|e| anyhow::anyhow!("h2 feed: {e:?}"))?;
+                                            h2.feed(&scratch[..n], &mut events)?;
                                         }
                                         Ok(())
                                     })
                                     .is_ok(),
-                                None => h2.feed(buf_ring.data(bid, res as usize)).is_ok(),
+                                None => h2
+                                    .feed(buf_ring.data(bid, res as usize), &mut events)
+                                    .is_ok(),
                             }
                         };
                         buf_ring.recycle(bid);
-                        let process_ok =
-                            feed_ok && conn.h2.as_mut().is_some_and(|h2| h2.process().is_ok());
-                        if !process_ok || !process_events(conn, &mut stats) {
+                        process_events(conn, &events, &mut stats);
+                        if !feed_ok {
                             conn.fail_inflight(&mut stats);
                             conn_broken = true;
                         } else if conn.goaway && conn.streams.is_empty() {
@@ -594,7 +495,7 @@ pub fn run_worker(
                         } else {
                             fill_streams(
                                 conn,
-                                &request_headers,
+                                &header_block,
                                 &target.body,
                                 parallel,
                                 &mut started,
@@ -644,8 +545,8 @@ pub fn run_worker(
         if conn.connected
             && let Some(h2) = conn.h2.as_mut()
         {
-            let _ = h2.send_goaway(ErrorCode::NoError, Vec::new());
-            if let Some(buf) = h2.poll_output() {
+            h2.send_goaway();
+            if let Some(buf) = h2.take_output() {
                 let bytes = match &mut conn.tls {
                     Some(tls) => {
                         let _ = tls.write_plaintext(&buf);

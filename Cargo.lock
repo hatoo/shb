@@ -1110,7 +1110,6 @@ dependencies = [
  "rustls",
  "serde_json",
  "shiguredo_http11",
- "shiguredo_http2",
  "shiguredo_http3",
  "socket2",
  "tokio",
@@ -1121,12 +1120,6 @@ name = "shiguredo_http11"
 version = "2026.7.0-canary.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c64998e8f4f4f520c6c9d409700af0b7b64cc98f5da3de71b0dc3fa14a2ddb44"
-
-[[package]]
-name = "shiguredo_http2"
-version = "2026.1.0-canary.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeefac9d28889b164475919a39a20cb0038902edfb7e8b83b8df5920fc75218c"
 
 [[package]]
 name = "shiguredo_http3"
