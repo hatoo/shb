@@ -156,6 +156,9 @@ struct Conn {
     h3_ready: bool,
     /// Peer-opened unidirectional streams, by QUIC stream id
     uni: Vec<(u64, UniReader)>,
+    /// Datagrams have been handed to the endpoint since the state machine was
+    /// last driven
+    pending: bool,
     /// GOAWAY received: no new streams on this connection
     goaway: bool,
     /// Outgoing datagrams; the front one is in flight while `sending`
@@ -180,6 +183,7 @@ impl Conn {
             quic: None,
             h3_ready: false,
             uni: Vec::new(),
+            pending: false,
             goaway: false,
             out_queue: VecDeque::new(),
             msg_state: Box::new(unsafe { std::mem::zeroed() }),
@@ -761,28 +765,11 @@ pub fn run_worker(
                             uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                             conn.recv_armed = true;
                         }
-                        let alive = drive(
-                            &mut endpoint,
-                            conn,
-                            &mut stats,
-                            &request,
-                            parallel,
-                            &mut started,
-                            max_requests,
-                            stop,
-                        );
-                        pump_transmits(
-                            &submitter,
-                            &mut sq,
-                            conn_idx,
-                            conn,
-                            now,
-                            &mut transmit_buf,
-                            gso,
-                        )?;
-                        if !alive {
-                            conn_broken = true;
-                        }
+                        // Turning the state machine is the expensive part -
+                        // polling events, opening streams, building packets -
+                        // and it costs the same whether one datagram arrived
+                        // or eight, so leave it until the batch is drained
+                        conn.pending = true;
                     }
                 }
                 _ => unreachable!(),
@@ -790,6 +777,51 @@ pub fn run_worker(
 
             if conn_broken {
                 let conn = &mut conns[conn_idx];
+                handle_broken(
+                    &mut endpoint,
+                    &submitter,
+                    &mut sq,
+                    conn_idx,
+                    conn,
+                    &mut stats,
+                    &quic_config,
+                    target,
+                    &mut started,
+                    max_requests,
+                    stop,
+                    &mut transmit_buf,
+                    gso,
+                )?;
+            }
+        }
+
+        // Turn the state machines once for the whole batch of datagrams
+        let now = Instant::now();
+        for (conn_idx, conn) in conns.iter_mut().enumerate() {
+            if !conn.pending {
+                continue;
+            }
+            conn.pending = false;
+            let alive = drive(
+                &mut endpoint,
+                conn,
+                &mut stats,
+                &request,
+                parallel,
+                &mut started,
+                max_requests,
+                stop,
+            );
+            pump_transmits(
+                &submitter,
+                &mut sq,
+                conn_idx,
+                conn,
+                now,
+                &mut transmit_buf,
+                gso,
+            )?;
+            if !alive {
                 handle_broken(
                     &mut endpoint,
                     &submitter,
