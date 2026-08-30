@@ -112,8 +112,12 @@ while IFS='|' read -r server proto url note; do
         printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "$ok ok" "$note"
         pass=$((pass + 1))
     else
+        # Say what actually happened: "failed" on its own costs a whole
+        # debugging round trip when this only reproduces in CI
+        detail=$(printf '%s' "$out" | jq -rc \
+            '"ok=\(.requests.ok) err=\(.requests.errors) connErr=\(.requests.connectErrors) \(.statusCodes)"' 2>/dev/null)
         printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"
-        failures+=("$server $proto $url")
+        failures+=("$server $proto $url  ${detail:-no JSON report; shb itself failed}")
         fail=$((fail + 1))
     fi
 done <<< "$ENDPOINTS"
