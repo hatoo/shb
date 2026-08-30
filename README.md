@@ -378,14 +378,16 @@ $ scripts/interop.sh          # or: scripts/interop.sh h3
 
 `scripts/docker-interop.sh` starts nine HTTP servers in containers — nginx,
 Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat and OpenLiteSpeed — and
-loads each over every protocol it speaks, 35 combinations in all, including
-cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's own,
-quic-go and quiche). Those are servers we start ourselves, so it runs in CI on
+loads each over every protocol it speaks, 40 combinations in all, including
+cleartext h2c, HTTP/3 against three separate QUIC stacks (nginx's own, quic-go
+and quiche), and a response carrying 48 KB of headers — three times the default
+HTTP/2 frame size, so the server has to split the block across CONTINUATION
+frames. Those are servers we start ourselves, so it runs in CI on
 every push, and with enough requests to exercise connection reuse rather than
 just the first exchange.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
-one request to each of 80 public endpoints over all three protocols and reports
+one request to each of 82 public endpoints over all three protocols and reports
 whether the exchange completed. It runs weekly rather than on every push: it
 depends on other people's servers, and on the network. Any HTTP status counts
 as a pass, since a 403 from a server that blocks unknown clients still means
@@ -400,7 +402,8 @@ Caddy and Google's QUICHE are thirteen separate QUIC implementations, several
 of them run by the people who wrote the specification. HTTP/2 covers nghttp2,
 H2O, Apache httpd, Traffic Server, Jetty, Hypercorn, Proxygen, Caddy, HAProxy,
 Tengine, OpenResty and the large CDN edges, plus a gRPC endpoint for the
-trailers a plain GET never produces; HTTP/1.1 adds cleartext, origins whose
+trailers a plain GET never produces and an `Expect: 100-continue` request for a
+real interim response; HTTP/1.1 adds cleartext, origins whose
 ALPN offers only `http/1.1`, and one that offers no ALPN at all.
 
 That breadth is what finds bugs. Widening this list is what caught an HTTP/3
@@ -410,7 +413,7 @@ wrong Huffman table entry and a TLS buffer limit. None of them could be
 reproduced against a local server.
 
 Servers that were probed and simply worked are recorded in a `KNOWN_GOOD` list
-in the same script rather than run — 290 more endpoints, most of them behind a
+in the same script rather than run — 288 more endpoints, most of them behind a
 CDN already represented above. `EXTRA=1 scripts/interop.sh` includes them. It
 is a list of servers shb is known to work with, and any line can be promoted
 the day it stops passing.

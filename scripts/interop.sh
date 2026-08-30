@@ -104,6 +104,8 @@ h2|https://prometheus.io/|Netlify
 h2|https://gcore.com/|Gcore
 h2|https://www.taobao.com/|Tengine, Alibaba's fork of nginx
 h2|https://openresty.org/|OpenResty Edge
+h1|https://httpbin.org/post|a real 100 Continue, which no plain GET produces|-m POST -H 'expect: 100-continue' -d aaaa
+h2|https://httpbin.org/post|the same 100 Continue over HTTP/2|-m POST -H 'expect: 100-continue' -d aaaa
 h2|https://grpcb.in/hello.HelloService/SayHello|gRPC: the one server here that sends HTTP/2 trailers, which v0.2.3 could not read|-m POST -H 'content-type: application/grpc' -H 'te: trailers' -d x
 h3|https://cloudflare-quic.com/|Cloudflare quiche, an HTTP/3 test endpoint
 h3|https://quic.nginx.org/|nginx QUIC, an HTTP/3 test endpoint
@@ -295,8 +297,6 @@ h1|https://www.godaddy.com/|GoDaddy
 h2|https://www.godaddy.com/|GoDaddy
 h1|https://api.github.com/|GitHub API
 h2|https://api.github.com/|GitHub API
-h1|https://httpbin.org/|httpbin
-h2|https://httpbin.org/|httpbin
 h1|https://postman-echo.com/|Postman Echo
 h2|https://postman-echo.com/|Postman Echo
 h1|https://www.ietf.org/|IETF

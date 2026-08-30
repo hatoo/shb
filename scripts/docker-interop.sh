@@ -9,7 +9,11 @@
 # cannot — cleartext h2c, and TLS against a server whose certificate we made.
 #
 # Every server answers the same 13-byte body, so a status of 200 everywhere is
-# the whole of the expected output. These are our own containers, so the load
+# the whole of the expected output. The exception is nginx's /bigheaders, which
+# returns the same body behind 48 KB of response headers: that is three times
+# the default HTTP/2 frame size, so the server has to split the block across
+# CONTINUATION frames, a path no page-sized response reaches and one that only
+# a server we configure ourselves will produce on demand. These are our own containers, so the load
 # is real rather than a single request: 200 requests over 50 connections
 # exercises connection reuse and concurrency, not just the first exchange.
 #
@@ -42,6 +46,11 @@ nginx|h2|http://127.0.0.1:18080/|cleartext h2c, prior knowledge
 nginx|h1|https://127.0.0.1:18443/|TLS
 nginx|h2|https://127.0.0.1:18443/|TLS, ALPN h2
 nginx|h3|https://127.0.0.1:18443/|nginx's own QUIC
+nginx|h1|http://127.0.0.1:18080/bigheaders|a 48 KB response header block
+nginx|h2|http://127.0.0.1:18080/bigheaders|the same block, split across CONTINUATION frames
+nginx|h1|https://127.0.0.1:18443/bigheaders|48 KB of headers over TLS
+nginx|h2|https://127.0.0.1:18443/bigheaders|CONTINUATION over TLS
+nginx|h3|https://127.0.0.1:18443/bigheaders|a QPACK field section spanning several reads
 caddy|h1|http://127.0.0.1:18081/|cleartext
 caddy|h2|http://127.0.0.1:18081/|cleartext h2c, prior knowledge
 caddy|h1|https://127.0.0.1:18444/|TLS
