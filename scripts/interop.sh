@@ -12,10 +12,18 @@
 #
 # One request per endpoint, so it is negligible load on someone else's server.
 #
-# An endpoint earns its place here by having caught something. Probing a new
-# server is worth doing often; adding it to this list is worth doing only when
-# it fails, since one that has always passed costs runtime and finds nothing.
-# The ones that passed are recorded in KNOWN_GOOD below rather than run.
+# An endpoint earns its place here by covering an implementation nothing else
+# here covers, or by having caught something. Twenty sites behind the same CDN
+# exercise one HTTP stack twenty times; what finds bugs is a different stack,
+# so the list is chosen by implementation rather than by name recognition, and
+# a server that merely passed goes in KNOWN_GOOD below rather than into the
+# run. Probing new servers is cheap and worth doing often - promoting one is
+# worth doing when it fails, or when it is something new.
+#
+# HTTP/3 is where that shows most: quicly, ngtcp2, picoquic, aioquic, quic-go,
+# quiche, msquic, mvfst, lsquic, nginx, HAProxy, Caddy and Google's QUICHE are
+# thirteen separate QUIC implementations, several run by the people who wrote
+# the specification.
 #
 #   scripts/interop.sh              # every endpoint
 #   scripts/interop.sh h3           # only HTTP/3
@@ -36,156 +44,78 @@ fi
 
 # protocol | url | what is known to be serving it
 ENDPOINTS=$(cat <<'EOF'
-h1|https://example.com/|ICANN
 h1|http://example.com/|ICANN, cleartext
-h1|https://www.google.com/|Google
-h1|https://nginx.org/|nginx
+h1|https://example.com/|ICANN
 h1|http://nginx.org/|nginx, cleartext
-h1|https://www.cloudflare.com/|Cloudflare
-h1|https://github.com/|GitHub
-h1|https://www.fastly.com/|Fastly
-h1|https://facebook.com/|Meta Proxygen
-h1|https://www.wikipedia.org/|Wikimedia ATS
-h1|https://www.debian.org/|Debian
-h1|https://www.kernel.org/|kernel.org
-h1|https://crates.io/|crates.io
-h1|https://docs.rs/|docs.rs
-h1|https://www.rust-lang.org/|Rust
-h1|https://www.akamai.com/|Akamai
-h1|https://www.apple.com/|Apple
-h1|https://aws.amazon.com/|CloudFront
-h1|https://www.haproxy.org/|HAProxy
-h1|https://caddyserver.com/|Caddy
+h1|https://nginx.org/|nginx
+h1|https://h2o.examp1e.net/|H2O
 h1|https://nghttp2.org/|nghttp2
-h1|https://litespeedtech.com/|LiteSpeed
-h1|https://www.microsoft.com/|Microsoft
-h1|https://www.bing.com/|Microsoft
-h1|https://www.linkedin.com/|LinkedIn
-h1|https://www.adobe.com/|Adobe
-h1|https://www.oracle.com/|Oracle
-h1|https://www.paypal.com/|PayPal
-h1|https://www.netflix.com/|Netflix
-h1|https://www.spotify.com/|Spotify
-h1|https://www.python.org/|Python
-h1|https://pypi.org/|PyPI
-h1|https://www.mozilla.org/|Mozilla
-h1|https://developer.mozilla.org/|MDN
-h1|https://go.dev/|Go
 h1|https://www.apache.org/|Apache httpd
-h1|https://curl.se/|curl
-h1|https://www.nytimes.com/|The New York Times
-h1|https://www.theguardian.com/|The Guardian
-h1|https://archive.org/|Internet Archive
-h1|https://letsencrypt.org/|Let's Encrypt
-h1|https://www.eff.org/|EFF
-h1|https://kubernetes.io/|Kubernetes
-h1|https://prometheus.io/|Prometheus
-h1|https://www.docker.com/|Docker
-h1|https://hub.docker.com/|Docker Hub
-h1|https://archlinux.org/|Arch Linux
-h1|https://ubuntu.com/|Canonical
-h1|https://www.postgresql.org/|PostgreSQL
-h1|https://www.openssl.org/|OpenSSL
-h1|https://vercel.com/|Vercel
-h1|https://www.netlify.com/|Netlify
-h1|https://bitbucket.org/|Bitbucket
-h1|https://www.atlassian.com/|Atlassian
-h1|https://registry.npmjs.org/|npm registry
+h1|https://www.wikipedia.org/|Apache Traffic Server
+h1|https://caddyserver.com/|Caddy
+h1|https://www.haproxy.org/|HAProxy
+h1|https://www.eclipse.org/|Jetty
+h1|https://pgjones.dev/|Hypercorn
+h1|https://interop.seemann.io/|quic-go
+h1|https://facebook.com/|Meta Proxygen
+h1|https://www.google.com/|Google
+h1|https://www.cloudflare.com/|Cloudflare
+h1|https://www.fastly.com/|Fastly
+h1|https://www.akamai.com/|Akamai
+h1|https://aws.amazon.com/|CloudFront
+h1|https://github.com/|GitHub
+h1|https://www.bing.com/|Microsoft
 h1|https://www.twitch.tv/|Twitch
-h1|https://www.linode.com/|Linode
-h1|https://www.yahoo.co.jp/|Yahoo! JAPAN
-h1|https://www.rakuten.co.jp/|Rakuten
-h1|https://qiita.com/|Qiita
-h1|https://zenn.dev/|Zenn
-h1|https://www.ntt.com/|NTT
-h1|https://www.freebsd.org/|FreeBSD, an origin that offers no ALPN but http/1.1
-h1|https://www.sakura.ad.jp/|SAKURA internet, HTTP/1.1-only origin
-h1|https://www.iij.ad.jp/|IIJ, HTTP/1.1-only origin
-h1|https://www.nic.ad.jp/|JPNIC, HTTP/1.1-only origin
+h1|https://vercel.com/|Vercel
+h1|https://prometheus.io/|Netlify
+h1|https://gcore.com/|Gcore
+h1|https://www.kernel.org/|kernel.org
+h1|https://www.debian.org/|Debian
+h1|https://www.sakura.ad.jp/|an origin whose ALPN offers only http/1.1
+h1|https://www.baidu.com/|Baidu, another http/1.1-only origin
+h1|https://s3.amazonaws.com/|AWS S3, another http/1.1-only origin
+h1|https://www.jst.go.jp/|an origin that offers no ALPN at all
+h2|https://nghttp2.org/|nghttp2, the reference implementation
+h2|https://h2o.examp1e.net/|H2O
+h2|https://www.apache.org/|Apache httpd, mod_http2
+h2|https://www.wikipedia.org/|Apache Traffic Server
+h2|https://caddyserver.com/|Caddy
+h2|https://www.haproxy.com/|HAProxy
+h2|https://www.eclipse.org/|Jetty
+h2|https://pgjones.dev/|Hypercorn
+h2|https://interop.seemann.io/|quic-go
+h2|https://facebook.com/|Meta Proxygen
 h2|https://www.google.com/|Google
 h2|https://www.cloudflare.com/|Cloudflare
-h2|https://nghttp2.org/|nghttp2, the reference implementation
 h2|https://www.fastly.com/|Fastly
-h2|https://github.com/|GitHub
-h2|https://facebook.com/|Meta Proxygen
-h2|https://www.rust-lang.org/|Rust
-h2|https://www.wikipedia.org/|Wikimedia ATS
-h2|https://crates.io/|crates.io
-h2|https://docs.rs/|docs.rs
+h2|https://www.adobe.com/|Akamai
 h2|https://aws.amazon.com/|CloudFront
-h2|https://www.apple.com/|Apple
-h2|https://caddyserver.com/|Caddy
-h2|https://litespeedtech.com/|LiteSpeed
+h2|https://github.com/|GitHub
 h2|https://gitlab.com/|GitLab
-h2|https://stackoverflow.com/|Stack Overflow
-h2|https://www.debian.org/|Debian
-h2|https://www.microsoft.com/|Microsoft
 h2|https://www.bing.com/|Microsoft
-h2|https://www.linkedin.com/|LinkedIn
-h2|https://www.adobe.com/|Adobe
-h2|https://www.oracle.com/|Oracle
-h2|https://www.paypal.com/|PayPal
-h2|https://www.netflix.com/|Netflix
-h2|https://www.spotify.com/|Spotify
-h2|https://www.python.org/|Python
-h2|https://pypi.org/|PyPI
-h2|https://www.mozilla.org/|Mozilla
-h2|https://developer.mozilla.org/|MDN
-h2|https://go.dev/|Go
-h2|https://www.apache.org/|Apache httpd
-h2|https://curl.se/|curl
-h2|https://www.nytimes.com/|The New York Times
-h2|https://www.theguardian.com/|The Guardian
-h2|https://archive.org/|Internet Archive
-h2|https://letsencrypt.org/|Let's Encrypt
-h2|https://www.eff.org/|EFF
-h2|https://kubernetes.io/|Kubernetes
-h2|https://prometheus.io/|Prometheus
-h2|https://www.docker.com/|Docker
-h2|https://hub.docker.com/|Docker Hub
-h2|https://archlinux.org/|Arch Linux
-h2|https://ubuntu.com/|Canonical
-h2|https://www.postgresql.org/|PostgreSQL
-h2|https://www.openssl.org/|OpenSSL
-h2|https://www.kernel.org/|kernel.org
+h2|https://www.twitch.tv/|Twitch, which should agree with the HTTP/3 result
 h2|https://vercel.com/|Vercel
-h2|https://www.netlify.com/|Netlify
-h2|https://bitbucket.org/|Bitbucket
-h2|https://www.atlassian.com/|Atlassian
-h2|https://registry.npmjs.org/|npm registry
-h2|https://www.twitch.tv/|Twitch
-h2|https://www.yahoo.co.jp/|Yahoo! JAPAN
-h2|https://www.rakuten.co.jp/|Rakuten
-h2|https://qiita.com/|Qiita
-h2|https://zenn.dev/|Zenn
-h2|https://www.ntt.com/|NTT
+h2|https://prometheus.io/|Netlify
+h2|https://gcore.com/|Gcore
 h3|https://cloudflare-quic.com/|Cloudflare quiche, an HTTP/3 test endpoint
 h3|https://quic.nginx.org/|nginx QUIC, an HTTP/3 test endpoint
-h3|https://www.google.com/|Google
-h3|https://www.youtube.com/|Google
+h3|https://h2o.examp1e.net/|quicly, H2O's own QUIC
+h3|https://nghttp2.org:4433/|ngtcp2, the reference implementation
+h3|https://test.privateoctopus.com:4433/|picoquic
+h3|https://quic.aiortc.org/|aioquic
+h3|https://pgjones.dev/|aioquic, via Hypercorn
+h3|https://interop.seemann.io/|quic-go
+h3|https://caddyserver.com/|Caddy, quic-go
+h3|https://www.haproxy.com/|HAProxy's own QUIC
+h3|https://www.google.com/|Google QUICHE
+h3|https://facebook.com/|Meta mvfst, which caught a wrong Huffman table entry
+h3|https://www.bing.com/|Microsoft msquic, which caught a connection teardown
+h3|https://litespeedtech.com/|LiteSpeed lsquic, the one thing the OpenLiteSpeed container cannot serve
 h3|https://www.cloudflare.com/|Cloudflare
-h3|https://blog.cloudflare.com/|Cloudflare
 h3|https://www.fastly.com/|Fastly
-h3|https://facebook.com/|Meta mvfst
-h3|https://www.instagram.com/|Meta mvfst
-h3|https://litespeedtech.com/|LiteSpeed lsquic
-h3|https://discord.com/|Cloudflare
-h3|https://www.reddit.com/|Fastly
-h3|https://www.bing.com/|Microsoft msquic
-h3|https://www.linkedin.com/|LinkedIn
 h3|https://www.adobe.com/|Akamai
-h3|https://www.linode.com/|Akamai
-h3|https://www.spotify.com/|Fastly
-h3|https://www.python.org/|Fastly
-h3|https://pypi.org/|Fastly
-h3|https://www.theguardian.com/|Fastly
-h3|https://www.mozilla.org/|Mozilla
-h3|https://developer.mozilla.org/|MDN
-h3|https://curl.se/|curl
 h3|https://prometheus.io/|Netlify
-h3|https://www.openssl.org/|OpenSSL
-h3|https://www.kernel.org/|kernel.org
-h3|https://www.atlassian.com/|Atlassian
+h3|https://gcore.com/|Gcore
 h3|https://www.twitch.tv/|Twitch, which answers with a 103 Early Hints first
 EOF
 )
@@ -199,40 +129,18 @@ EOF
 # talk to, so a future report of "shb does not work with X" has somewhere to
 # start, and any of them can be promoted into the list above the day it fails.
 #
-# The first group is worth more than the rest: quicly, ngtcp2, picoquic,
-# aioquic, quic-go, quiche and Hypercorn are QUIC and HTTP/3 implementations
-# no other endpoint here covers, several of them run by the people who wrote
-# the specification. They passed, so by the rule above they are recorded
-# rather than run - but they are the first candidates to promote if the list
-# above is ever rebalanced towards distinct implementations and away from
-# homepages behind the same handful of CDNs.
+# Most of these are sites that sit behind a CDN already represented above, so
+# running them would re-test the same HTTP stack under a different hostname.
 #
 # Run them with EXTRA=1. Protocols a host does not offer are simply absent:
 # every omission here was checked with `openssl s_client -alpn h2,http/1.1`
 # for HTTP/2 and for an Alt-Svc advertisement for HTTP/3, and was the server's
 # doing rather than ours.
 KNOWN_GOOD=$(cat <<'EOF'
-h1|https://h2o.examp1e.net/|H2O
-h2|https://h2o.examp1e.net/|H2O
-h3|https://h2o.examp1e.net/|quicly, H2O's own QUIC
-h3|https://nghttp2.org:4433/|ngtcp2, the reference QUIC implementation
-h3|https://test.privateoctopus.com:4433/|picoquic
-h3|https://quic.aiortc.org/|aioquic
-h1|https://interop.seemann.io/|quic-go
-h2|https://interop.seemann.io/|quic-go
-h3|https://interop.seemann.io/|quic-go
 h1|https://quic.tech:8443/|Cloudflare quiche
 h2|https://quic.tech:8443/|Cloudflare quiche
 h3|https://quic.tech:8443/|Cloudflare quiche
-h1|https://pgjones.dev/|Hypercorn
-h2|https://pgjones.dev/|Hypercorn
-h3|https://pgjones.dev/|aioquic, via Hypercorn
 h1|https://www.haproxy.com/|HAProxy
-h2|https://www.haproxy.com/|HAProxy
-h3|https://www.haproxy.com/|HAProxy
-h3|https://caddyserver.com/|Caddy, quic-go
-h1|https://www.eclipse.org/|Eclipse, Jetty
-h2|https://www.eclipse.org/|Eclipse, Jetty
 h1|https://www.jenkins.io/|Jenkins, Jetty
 h2|https://www.jenkins.io/|Jenkins, Jetty
 h1|https://learn.microsoft.com/|Microsoft
@@ -313,7 +221,8 @@ h2|https://www.corriere.it/|Corriere della Sera
 h1|https://www.globo.com/|Globo, HTTP/1.1-only origin
 h1|https://www.abc.net.au/|ABC Australia
 h2|https://www.abc.net.au/|ABC Australia
-h1|https://www.baidu.com/|Baidu, HTTP/1.1-only origin
+h1|https://litespeedtech.com/|LiteSpeed; its HTTP/1.1 and h2 run in the container suite instead
+h2|https://litespeedtech.com/|LiteSpeed, whose HPACK decoder caught a bug here
 h1|https://www.qq.com/|Tencent, HTTP/1.1-only origin
 h1|https://www.yandex.ru/|Yandex
 h2|https://www.yandex.ru/|Yandex
@@ -340,7 +249,6 @@ h2|https://www.shopify.com/|Shopify
 h3|https://www.shopify.com/|Shopify
 h1|https://www.squarespace.com/|Squarespace
 h2|https://www.squarespace.com/|Squarespace
-h1|https://s3.amazonaws.com/|AWS S3, HTTP/1.1-only origin
 h1|https://storage.googleapis.com/|Google Cloud Storage
 h2|https://storage.googleapis.com/|Google Cloud Storage
 h3|https://storage.googleapis.com/|Google Cloud Storage
@@ -356,9 +264,6 @@ h3|https://cdnjs.cloudflare.com/|Cloudflare
 h1|https://unpkg.com/|unpkg
 h2|https://unpkg.com/|unpkg
 h3|https://unpkg.com/|unpkg
-h1|https://gcore.com/|Gcore
-h2|https://gcore.com/|Gcore
-h3|https://gcore.com/|Gcore
 h1|https://bunny.net/|Bunny
 h2|https://bunny.net/|Bunny
 h1|https://deno.dev/|Deno Deploy
@@ -401,7 +306,6 @@ h1|https://www.u-tokyo.ac.jp/|University of Tokyo, offers no ALPN
 h1|https://www.kyoto-u.ac.jp/|Kyoto University
 h2|https://www.kyoto-u.ac.jp/|Kyoto University
 h1|https://www.soumu.go.jp/|MIC Japan, HTTP/1.1-only origin
-h1|https://www.jst.go.jp/|JST, offers no ALPN
 h1|https://europa.eu/|European Union, offers no ALPN
 h1|https://en.wikipedia.org/|Wikimedia ATS
 h2|https://en.wikipedia.org/|Wikimedia ATS
@@ -412,6 +316,105 @@ h2|https://www.mediawiki.org/|Wikimedia ATS
 h1|https://about.gitlab.com/|GitLab
 h2|https://about.gitlab.com/|GitLab
 h3|https://about.gitlab.com/|GitLab
+h1|https://crates.io/|crates.io
+h1|https://docs.rs/|docs.rs
+h1|https://www.rust-lang.org/|Rust
+h1|https://www.apple.com/|Apple
+h1|https://www.microsoft.com/|Microsoft
+h1|https://www.linkedin.com/|LinkedIn
+h1|https://www.adobe.com/|Adobe
+h1|https://www.oracle.com/|Oracle
+h1|https://www.paypal.com/|PayPal
+h1|https://www.netflix.com/|Netflix
+h1|https://www.spotify.com/|Spotify
+h1|https://www.python.org/|Python
+h1|https://pypi.org/|PyPI
+h1|https://www.mozilla.org/|Mozilla
+h1|https://developer.mozilla.org/|MDN
+h1|https://go.dev/|Go
+h1|https://curl.se/|curl
+h1|https://www.nytimes.com/|The New York Times
+h1|https://www.theguardian.com/|The Guardian
+h1|https://archive.org/|Internet Archive
+h1|https://letsencrypt.org/|Let's Encrypt
+h1|https://www.eff.org/|EFF
+h1|https://kubernetes.io/|Kubernetes
+h1|https://www.docker.com/|Docker
+h1|https://hub.docker.com/|Docker Hub
+h1|https://archlinux.org/|Arch Linux
+h1|https://ubuntu.com/|Canonical
+h1|https://www.postgresql.org/|PostgreSQL
+h1|https://www.openssl.org/|OpenSSL
+h1|https://www.netlify.com/|Netlify
+h1|https://bitbucket.org/|Bitbucket
+h1|https://www.atlassian.com/|Atlassian
+h1|https://registry.npmjs.org/|npm registry
+h1|https://www.linode.com/|Linode
+h1|https://www.yahoo.co.jp/|Yahoo! JAPAN
+h1|https://www.rakuten.co.jp/|Rakuten
+h1|https://qiita.com/|Qiita
+h1|https://zenn.dev/|Zenn
+h1|https://www.ntt.com/|NTT
+h1|https://www.freebsd.org/|FreeBSD, an origin that offers no ALPN but http/1.1
+h1|https://www.iij.ad.jp/|IIJ, HTTP/1.1-only origin
+h1|https://www.nic.ad.jp/|JPNIC, HTTP/1.1-only origin
+h2|https://www.rust-lang.org/|Rust
+h2|https://crates.io/|crates.io
+h2|https://docs.rs/|docs.rs
+h2|https://www.apple.com/|Apple
+h2|https://stackoverflow.com/|Stack Overflow
+h2|https://www.debian.org/|Debian
+h2|https://www.microsoft.com/|Microsoft
+h2|https://www.linkedin.com/|LinkedIn
+h2|https://www.oracle.com/|Oracle
+h2|https://www.paypal.com/|PayPal
+h2|https://www.netflix.com/|Netflix
+h2|https://www.spotify.com/|Spotify
+h2|https://www.python.org/|Python
+h2|https://pypi.org/|PyPI
+h2|https://www.mozilla.org/|Mozilla
+h2|https://developer.mozilla.org/|MDN
+h2|https://go.dev/|Go
+h2|https://curl.se/|curl
+h2|https://www.nytimes.com/|The New York Times
+h2|https://www.theguardian.com/|The Guardian
+h2|https://archive.org/|Internet Archive
+h2|https://letsencrypt.org/|Let's Encrypt
+h2|https://www.eff.org/|EFF
+h2|https://kubernetes.io/|Kubernetes
+h2|https://www.docker.com/|Docker
+h2|https://hub.docker.com/|Docker Hub
+h2|https://archlinux.org/|Arch Linux
+h2|https://ubuntu.com/|Canonical
+h2|https://www.postgresql.org/|PostgreSQL
+h2|https://www.openssl.org/|OpenSSL
+h2|https://www.kernel.org/|kernel.org
+h2|https://www.netlify.com/|Netlify
+h2|https://bitbucket.org/|Bitbucket
+h2|https://www.atlassian.com/|Atlassian
+h2|https://registry.npmjs.org/|npm registry
+h2|https://www.yahoo.co.jp/|Yahoo! JAPAN
+h2|https://www.rakuten.co.jp/|Rakuten
+h2|https://qiita.com/|Qiita
+h2|https://zenn.dev/|Zenn
+h2|https://www.ntt.com/|NTT
+h3|https://www.youtube.com/|Google
+h3|https://blog.cloudflare.com/|Cloudflare
+h3|https://www.instagram.com/|Meta mvfst
+h3|https://discord.com/|Cloudflare
+h3|https://www.reddit.com/|Fastly
+h3|https://www.linkedin.com/|LinkedIn
+h3|https://www.linode.com/|Akamai
+h3|https://www.spotify.com/|Fastly
+h3|https://www.python.org/|Fastly
+h3|https://pypi.org/|Fastly
+h3|https://www.theguardian.com/|Fastly
+h3|https://www.mozilla.org/|Mozilla
+h3|https://developer.mozilla.org/|MDN
+h3|https://curl.se/|curl
+h3|https://www.openssl.org/|OpenSSL
+h3|https://www.kernel.org/|kernel.org
+h3|https://www.atlassian.com/|Atlassian
 EOF
 )
 
