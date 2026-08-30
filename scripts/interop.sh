@@ -199,11 +199,120 @@ EOF
 # talk to, so a future report of "shb does not work with X" has somewhere to
 # start, and any of them can be promoted into the list above the day it fails.
 #
+# The first group is worth more than the rest: quicly, ngtcp2, picoquic,
+# aioquic, quic-go, quiche and Hypercorn are QUIC and HTTP/3 implementations
+# no other endpoint here covers, several of them run by the people who wrote
+# the specification. They passed, so by the rule above they are recorded
+# rather than run - but they are the first candidates to promote if the list
+# above is ever rebalanced towards distinct implementations and away from
+# homepages behind the same handful of CDNs.
+#
 # Run them with EXTRA=1. Protocols a host does not offer are simply absent:
 # every omission here was checked with `openssl s_client -alpn h2,http/1.1`
 # for HTTP/2 and for an Alt-Svc advertisement for HTTP/3, and was the server's
 # doing rather than ours.
 KNOWN_GOOD=$(cat <<'EOF'
+h1|https://h2o.examp1e.net/|H2O
+h2|https://h2o.examp1e.net/|H2O
+h3|https://h2o.examp1e.net/|quicly, H2O's own QUIC
+h3|https://nghttp2.org:4433/|ngtcp2, the reference QUIC implementation
+h3|https://test.privateoctopus.com:4433/|picoquic
+h3|https://quic.aiortc.org/|aioquic
+h1|https://interop.seemann.io/|quic-go
+h2|https://interop.seemann.io/|quic-go
+h3|https://interop.seemann.io/|quic-go
+h1|https://quic.tech:8443/|Cloudflare quiche
+h2|https://quic.tech:8443/|Cloudflare quiche
+h3|https://quic.tech:8443/|Cloudflare quiche
+h1|https://pgjones.dev/|Hypercorn
+h2|https://pgjones.dev/|Hypercorn
+h3|https://pgjones.dev/|aioquic, via Hypercorn
+h1|https://www.haproxy.com/|HAProxy
+h2|https://www.haproxy.com/|HAProxy
+h3|https://www.haproxy.com/|HAProxy
+h3|https://caddyserver.com/|Caddy, quic-go
+h1|https://www.eclipse.org/|Eclipse, Jetty
+h2|https://www.eclipse.org/|Eclipse, Jetty
+h1|https://www.jenkins.io/|Jenkins, Jetty
+h2|https://www.jenkins.io/|Jenkins, Jetty
+h1|https://learn.microsoft.com/|Microsoft
+h2|https://learn.microsoft.com/|Microsoft
+h1|https://azure.microsoft.com/|Azure, HTTP/1.1-only origin
+h1|https://www.amazon.com/|Amazon
+h2|https://www.amazon.com/|Amazon
+h3|https://www.amazon.com/|Amazon
+h1|https://www.ebay.com/|eBay
+h2|https://www.ebay.com/|eBay
+h3|https://www.ebay.com/|eBay
+h1|https://www.walmart.com/|Walmart
+h2|https://www.walmart.com/|Walmart
+h1|https://www.target.com/|Target
+h2|https://www.target.com/|Target
+h3|https://www.target.com/|Target
+h1|https://www.booking.com/|Booking.com
+h2|https://www.booking.com/|Booking.com
+h1|https://www.airbnb.com/|Airbnb
+h2|https://www.airbnb.com/|Airbnb
+h3|https://www.airbnb.com/|Airbnb
+h1|https://www.expedia.com/|Expedia
+h2|https://www.expedia.com/|Expedia
+h1|https://www.tumblr.com/|Tumblr
+h2|https://www.tumblr.com/|Tumblr
+h3|https://www.tumblr.com/|Tumblr
+h1|https://medium.com/|Medium
+h2|https://medium.com/|Medium
+h3|https://medium.com/|Medium
+h1|https://substack.com/|Substack
+h2|https://substack.com/|Substack
+h3|https://substack.com/|Substack
+h1|https://www.notion.so/|Notion
+h2|https://www.notion.so/|Notion
+h1|https://slack.com/|Slack
+h2|https://slack.com/|Slack
+h3|https://slack.com/|Slack
+h1|https://zoom.us/|Zoom
+h2|https://zoom.us/|Zoom
+h1|https://www.dropbox.com/|Dropbox
+h2|https://www.dropbox.com/|Dropbox
+h3|https://www.dropbox.com/|Dropbox
+h1|https://www.box.com/|Box
+h2|https://www.box.com/|Box
+h3|https://www.box.com/|Box
+h1|https://www.asahi.com/|Asahi Shimbun
+h2|https://www.asahi.com/|Asahi Shimbun
+h1|https://www.nikkei.com/|Nikkei
+h2|https://www.nikkei.com/|Nikkei
+h3|https://www.nikkei.com/|Nikkei
+h1|https://www3.nhk.or.jp/|NHK
+h2|https://www3.nhk.or.jp/|NHK
+h1|https://www.itmedia.co.jp/|ITmedia
+h2|https://www.itmedia.co.jp/|ITmedia
+h1|https://www.pixiv.net/|pixiv
+h2|https://www.pixiv.net/|pixiv
+h3|https://www.pixiv.net/|pixiv
+h1|https://www.nicovideo.jp/|niconico
+h2|https://www.nicovideo.jp/|niconico
+h1|https://www.jreast.co.jp/|JR East
+h2|https://www.jreast.co.jp/|JR East
+h1|https://www.jal.co.jp/|Japan Airlines
+h2|https://www.jal.co.jp/|Japan Airlines
+h1|https://www.bbc.co.uk/|BBC
+h2|https://www.bbc.co.uk/|BBC
+h3|https://www.bbc.co.uk/|BBC
+h1|https://www.reuters.com/|Reuters
+h2|https://www.reuters.com/|Reuters
+h1|https://apnews.com/|AP
+h2|https://apnews.com/|AP
+h3|https://apnews.com/|AP
+h1|https://www.lemonde.fr/|Le Monde
+h2|https://www.lemonde.fr/|Le Monde
+h1|https://www.spiegel.de/|Der Spiegel
+h2|https://www.spiegel.de/|Der Spiegel
+h1|https://www.corriere.it/|Corriere della Sera
+h2|https://www.corriere.it/|Corriere della Sera
+h1|https://www.globo.com/|Globo, HTTP/1.1-only origin
+h1|https://www.abc.net.au/|ABC Australia
+h2|https://www.abc.net.au/|ABC Australia
 h1|https://www.baidu.com/|Baidu, HTTP/1.1-only origin
 h1|https://www.qq.com/|Tencent, HTTP/1.1-only origin
 h1|https://www.yandex.ru/|Yandex
