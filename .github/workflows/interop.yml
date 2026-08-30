@@ -1,0 +1,37 @@
+name: Interop
+
+# Not on push: this sends requests to other people's servers, and they are
+# under no obligation to keep answering them. Once a week catches a protocol
+# regression long before anyone notices it in the field, without making every
+# commit depend on the reachability and mood of thirty third parties — and a
+# server that starts refusing unknown clients cannot block a merge.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: "Which protocol to check"
+        required: false
+        default: all
+        type: choice
+        options: [all, h1, h2, h3]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: One request to each public endpoint
+        run: scripts/interop.sh "${{ inputs.protocol || 'all' }}"
