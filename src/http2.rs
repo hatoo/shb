@@ -470,17 +470,11 @@ pub fn run_worker(
                             let h2 = conn.h2.as_mut().context("recv without h2 connection")?;
                             match &mut conn.tls {
                                 Some(tls) => tls
-                                    .feed(buf_ring.data(bid, res as usize))
-                                    .and_then(|_| {
-                                        loop {
-                                            let n = tls.read_plaintext(&mut scratch)?;
-                                            if n == 0 {
-                                                break;
-                                            }
-                                            h2.feed(&scratch[..n], &mut events)?;
-                                        }
-                                        Ok(())
-                                    })
+                                    .feed_into(
+                                        buf_ring.data(bid, res as usize),
+                                        &mut scratch,
+                                        |plain| h2.feed(plain, &mut events),
+                                    )
                                     .is_ok(),
                                 None => h2
                                     .feed(buf_ring.data(bid, res as usize), &mut events)

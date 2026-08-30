@@ -24,8 +24,6 @@ struct Conn {
     /// Whether the TCP connection is established (true after a successful Connect CQE)
     connected: bool,
     parser: Parser,
-    /// Plaintext scratch for the TLS path, reused across receives
-    plain: Vec<u8>,
     /// TLS session (https URLs only; recreated per TCP connection)
     tls: Option<TlsSession>,
     /// Bytes currently being sent; must stay untouched while a Send is in flight
@@ -48,7 +46,6 @@ impl Conn {
             fd: -1,
             connected: false,
             parser: Parser::new(),
-            plain: Vec::new(),
             tls: None,
             out: Vec::new(),
             out_off: 0,
@@ -243,6 +240,8 @@ pub fn run_worker(
     }
 
     let mut stop = false;
+    // Plaintext scratch for the TLS path, reused across receives
+    let mut plain = vec![0u8; 32 * 1024];
     // How many completions one wait should collect before returning
     let batch = uring::batch_size(connections);
 
@@ -380,20 +379,17 @@ pub fn run_worker(
                         // buffer first
                         let done: Result<usize> = match &mut conn.tls {
                             Some(tls) => {
-                                tls.feed(buf_ring.data(bid, res as usize))
-                                    .and_then(|available| {
-                                        conn.plain.resize(available, 0);
-                                        let mut filled = 0;
-                                        while filled < available {
-                                            let n =
-                                                tls.read_plaintext(&mut conn.plain[filled..])?;
-                                            if n == 0 {
-                                                break;
-                                            }
-                                            filled += n;
-                                        }
-                                        conn.parser.feed(&conn.plain[..filled])
-                                    })
+                                let parser = &mut conn.parser;
+                                let mut completed = 0;
+                                tls.feed_into(
+                                    buf_ring.data(bid, res as usize),
+                                    &mut plain,
+                                    |bytes| {
+                                        completed += parser.feed(bytes)?;
+                                        Ok(())
+                                    },
+                                )
+                                .map(|()| completed)
                             }
                             None => conn.parser.feed(buf_ring.data(bid, res as usize)),
                         };

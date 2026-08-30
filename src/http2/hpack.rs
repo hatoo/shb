@@ -242,17 +242,10 @@ fn huffman_digit(bits: u32, nbits: u32) -> Option<(u8, u32)> {
         }
     }
     if nbits >= 6 {
-        // '3'..'8' are 011010..011111
+        // '3' through '9' are 011001 through 011111
         let top6 = (bits >> (nbits - 6)) & 0x3f;
-        if (0b011010..=0b011111).contains(&top6) {
-            return Some((b'3' + (top6 - 0b011010) as u8, 6));
-        }
-    }
-    if nbits >= 7 {
-        // '9' is 1011100
-        let top7 = (bits >> (nbits - 7)) & 0x7f;
-        if top7 == 0b1011100 {
-            return Some((b'9', 7));
+        if (0b011001..=0b011111).contains(&top6) {
+            return Some((b'3' + (top6 - 0b011001) as u8, 6));
         }
     }
     None
@@ -413,8 +406,7 @@ mod tests {
                 b'0' => (0b00000, 5),
                 b'1' => (0b00001, 5),
                 b'2' => (0b00010, 5),
-                b'3'..=b'8' => ((0b011010 + (c - b'3') as u32), 6),
-                b'9' => (0b1011100, 7),
+                b'3'..=b'9' => (0b011001 + (c - b'3') as u32, 6),
                 _ => unreachable!(),
             };
             for i in (0..len).rev() {
@@ -428,6 +420,26 @@ mod tests {
         bits.chunks(8)
             .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | b as u8))
             .collect()
+    }
+
+    /// Byte sequences worked out by hand from RFC 7541 Appendix B, so the
+    /// decoder is checked against the spec rather than against this file's own
+    /// encoder
+    #[test]
+    fn huffman_status_matches_the_spec() {
+        for (status, huffman) in [
+            (301u16, &[0x64u8, 0x01][..]),
+            (200, &[0x10, 0x01]),
+            (404, &[0x68, 0x0d, 0x7f]),
+            (503, &[0x6c, 0x0c, 0xff]),
+            (999, &[0x7d, 0xf7, 0xff]),
+        ] {
+            // Literal without indexing, name index 8 (:status)
+            let mut block = vec![0x08u8];
+            encode_int(&mut block, 7, 0x80, huffman.len() as u32);
+            block.extend_from_slice(huffman);
+            assert_eq!(find_status(&block).unwrap(), status, "{status}");
+        }
     }
 
     #[test]

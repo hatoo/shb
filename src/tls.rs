@@ -103,20 +103,36 @@ impl TlsSession {
     ///
     /// Returns the number of decrypted plaintext bytes now available via
     /// [`read_plaintext`](Self::read_plaintext).
-    pub fn feed(&mut self, mut data: &[u8]) -> Result<usize> {
-        let mut available = 0;
+    /// Feed received ciphertext, handing the plaintext to `sink` as it appears
+    ///
+    /// rustls refuses more ciphertext once 16 KiB of decrypted plaintext is
+    /// waiting - one maximum-sized TLS record - and that limit is not
+    /// configurable. A server sending full-sized records therefore fills it
+    /// part-way through a single receive, so the plaintext has to be taken out
+    /// between reads rather than after the whole receive.
+    pub fn feed_into(
+        &mut self,
+        mut data: &[u8],
+        scratch: &mut [u8],
+        mut sink: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         while !data.is_empty() {
             let n = self.conn.read_tls(&mut data).context("read_tls failed")?;
             if n == 0 {
                 break;
             }
-            let state = self
-                .conn
+            self.conn
                 .process_new_packets()
                 .map_err(|e| anyhow::anyhow!("TLS error: {e}"))?;
-            available = state.plaintext_bytes_to_read();
+            loop {
+                let n = self.read_plaintext(scratch)?;
+                if n == 0 {
+                    break;
+                }
+                sink(&scratch[..n])?;
+            }
         }
-        Ok(available)
+        Ok(())
     }
 
     /// Read decrypted plaintext into buf; Ok(0) means none is available
