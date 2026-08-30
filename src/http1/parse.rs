@@ -151,6 +151,17 @@ impl Parser {
                         return Ok((pos, done));
                     };
                     pos += len;
+                    if (100..200).contains(&status) {
+                        if status == 101 {
+                            // The connection stops being HTTP/1.1 here, and a
+                            // load generator has nothing to switch to
+                            bail!("unexpected 101 Switching Protocols");
+                        }
+                        // An interim response carries no body and does not
+                        // finish the message: keep reading for the final one
+                        // (RFC 9110 Section 15.2)
+                        continue;
+                    }
                     self.current_status = status;
                     // A close-delimited body ends with the connection itself
                     self.current_keep_alive = keep_alive && body != Body::Eof;
@@ -224,8 +235,11 @@ impl Parser {
 }
 
 /// Responses that never carry a body, whatever the framing headers say
+///
+/// 1xx is handled before this: an interim response does not finish the message
+/// at all.
 fn no_body_status(status: u16) -> bool {
-    (100..200).contains(&status) || status == 204 || status == 304
+    status == 204 || status == 304
 }
 
 /// Scan a status line and header block
@@ -244,7 +258,9 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
     let http_1_0 = buf[7] == b'0';
     let status = parse_status(&buf[9..12])?;
     let mut pos = nl + 1;
-    let mut body = Body::Eof;
+    let mut content_length: Option<u64> = None;
+    let mut te_present = false;
+    let mut te_chunked = false;
     let mut close = false;
     let mut keep_alive_token = false;
     loop {
@@ -254,6 +270,21 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
         let line = trim_cr(&buf[pos..pos + rel]);
         pos += rel + 1;
         if line.is_empty() {
+            // Transfer-Encoding overrides Content-Length, and when chunked is
+            // not the final coding the body runs to the end of the connection
+            // (RFC 9112 Section 6.3)
+            let body = if te_present {
+                if te_chunked {
+                    Body::ChunkSize
+                } else {
+                    Body::Eof
+                }
+            } else {
+                match content_length {
+                    Some(n) => Body::Exact(n),
+                    None => Body::Eof,
+                }
+            };
             // HTTP/1.1 keeps the connection unless told otherwise; HTTP/1.0
             // closes it unless told otherwise (RFC 9112 Section 9.3)
             let keep_alive = if http_1_0 {
@@ -266,10 +297,13 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
         // One case-insensitive byte decides whether a line is worth reading
         match line[0] | 0x20 {
             b'c' if ci_prefix(line, b"content-length:") => {
-                // Chunked framing wins over Content-Length (RFC 9112 6.3)
-                if body != Body::ChunkSize {
-                    body = Body::Exact(parse_u64(trim_ows(&line[15..]))?);
+                let n = parse_u64(trim_ows(&line[15..]))?;
+                // Repeated fields are only allowed to agree; disagreeing ones
+                // are a framing attack, not a message (RFC 9112 Section 6.3)
+                if content_length.is_some_and(|prev| prev != n) {
+                    bail!("conflicting Content-Length");
                 }
+                content_length = Some(n);
             }
             b'c' if ci_prefix(line, b"connection:") => {
                 for token in line[11..].split(|&b| b == b',') {
@@ -281,10 +315,11 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
                     }
                 }
             }
-            b't' if ci_prefix(line, b"transfer-encoding:")
-                && ci_ends_with_chunked(trim_ows(&line[18..])) =>
-            {
-                body = Body::ChunkSize;
+            b't' if ci_prefix(line, b"transfer-encoding:") => {
+                // Repeated fields concatenate, so the last one decides whether
+                // chunked is the final coding
+                te_present = true;
+                te_chunked = ci_ends_with_chunked(trim_ows(&line[18..]));
             }
             _ => {}
         }
@@ -553,6 +588,87 @@ mod tests {
         );
         assert!(p.mark_eof());
         assert!(!p.keep_alive());
+    }
+
+    #[test]
+    fn interim_responses_do_not_finish_the_message() {
+        // Arriving together
+        let mut p = Parser::new();
+        let data = resp(
+            "HTTP/1.1 103 Early Hints\nLink: </s.css>\n\nHTTP/1.1 200 OK\nContent-Length: 2\n\nok",
+        );
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert_eq!(p.status(), 200);
+
+        // And arriving in separate reads, which is how a real early hint comes
+        let mut p = Parser::new();
+        assert_eq!(
+            p.feed(&resp("HTTP/1.1 103 Early Hints\nLink: </s.css>\n\n"))
+                .unwrap(),
+            0,
+            "an interim response must not complete a request"
+        );
+        assert_eq!(
+            p.feed(&resp("HTTP/1.1 200 OK\nContent-Length: 2\n\nok"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(p.status(), 200);
+    }
+
+    #[test]
+    fn a_hundred_continue_is_skipped() {
+        let mut p = Parser::new();
+        assert_eq!(p.feed(&resp("HTTP/1.1 100 Continue\n\n")).unwrap(), 0);
+        assert_eq!(
+            p.feed(&resp("HTTP/1.1 201 Created\nContent-Length: 0\n\n"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(p.status(), 201);
+    }
+
+    #[test]
+    fn switching_protocols_is_rejected() {
+        let mut p = Parser::new();
+        assert!(
+            p.feed(&resp("HTTP/1.1 101 Switching Protocols\n\n"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn disagreeing_content_lengths_are_rejected() {
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 200 OK\nContent-Length: 2\nContent-Length: 9\n\nok");
+        assert!(p.feed(&data).is_err());
+
+        // Repeats that agree are allowed
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 200 OK\nContent-Length: 2\nContent-Length: 2\n\nok");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+    }
+
+    #[test]
+    fn transfer_encoding_without_chunked_last_runs_to_eof() {
+        // chunked is not the final coding, so Content-Length must be ignored
+        // and the body ends with the connection
+        let mut p = Parser::new();
+        let data = resp(
+            "HTTP/1.1 200 OK\nContent-Length: 2\nTransfer-Encoding: chunked, gzip\n\nnot two bytes",
+        );
+        assert_eq!(p.feed(&data).unwrap(), 0);
+        assert!(p.mark_eof());
+        assert!(!p.keep_alive());
+    }
+
+    #[test]
+    fn transfer_encoding_over_two_lines_ends_in_chunked() {
+        let mut p = Parser::new();
+        let data = resp(
+            "HTTP/1.1 200 OK\nTransfer-Encoding: gzip\nTransfer-Encoding: chunked\n\n2\nhi\n0\n\n",
+        );
+        assert_eq!(p.feed(&data).unwrap(), 1);
     }
 
     #[test]
