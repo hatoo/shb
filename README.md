@@ -376,11 +376,14 @@ $ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy, ... in cont
 $ scripts/interop.sh          # or: scripts/interop.sh h3
 ```
 
-`scripts/docker-interop.sh` starts nine HTTP servers in containers — nginx,
-Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat and OpenLiteSpeed — and
-loads each over every protocol it speaks, 46 combinations in all, including
-cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's own,
-quic-go and quiche). Six of them exist to reach paths a well-behaved page-sized
+`scripts/docker-interop.sh` starts twelve HTTP servers in containers — nginx,
+Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat, OpenLiteSpeed, and
+Hypercorn, Node and Go — and loads each over every protocol it speaks, 58
+combinations in all, including cleartext h2c and HTTP/3 against four separate
+QUIC stacks (nginx's own, quic-go, quiche and aioquic). The last three servers
+are a few lines each on an official base image, and they are there because the
+suite had drifted towards C proxies sharing the same libraries: Hypercorn, Node
+and Go each implement HTTP/2 themselves. Six of them exist to reach paths a well-behaved page-sized
 response never does: a reply carrying 48 KB of headers, which is three times
 the default HTTP/2 frame size and so has to be split across CONTINUATION
 frames, and an nginx configured to take the connection away on the fifth

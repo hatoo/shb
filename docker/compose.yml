@@ -66,3 +66,22 @@ services:
     image: litespeedtech/openlitespeed:latest
     volumes: ["./conf/index.html:/var/www/vhosts/localhost/html/index.html:ro"]
     ports: ["18089:80", "18449:443"]
+
+  # Three more HTTP/2 implementations and one more QUIC one. The suite was
+  # heavy on C proxies: every HTTP/3 endpoint was nginx's own QUIC, quic-go or
+  # quiche, and most HTTP/2 came from nginx, httpd or a Go proxy reusing the
+  # same libraries. These are decoders written independently of those.
+  hypercorn:
+    build: ./hypercorn
+    volumes: ["./conf:/conf:ro"]
+    ports: ["18091:8080", "18451:443", "18451:443/udp"]
+
+  node:
+    build: ./node
+    volumes: ["./conf:/conf:ro"]
+    ports: ["18092:80", "18093:8080", "18452:443"]
+
+  goserver:
+    build: ./go
+    volumes: ["./conf:/conf:ro"]
+    ports: ["18094:80", "18453:443"]

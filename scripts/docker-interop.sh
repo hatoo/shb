@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 #
 # Start the major HTTP servers in containers and send one request to each over
-# every protocol it speaks. Every image is either a Docker Official Image or
-# published by the project itself, and each was picked for being a distinct
-# implementation rather than a distinct product. This complements scripts/interop.sh: that one goes
+# every protocol it speaks. Every image is either a Docker Official Image, one
+# published by the project itself, or a few lines built on an official base,
+# and each was picked for being a distinct implementation rather than a
+# distinct product. The last three exist because the suite had drifted towards
+# C proxies sharing libraries: Hypercorn, Node and Go each decode HTTP/2
+# themselves, and Hypercorn brings aioquic, a fourth QUIC stack next to
+# nginx's own, quic-go and quiche. This complements scripts/interop.sh: that one goes
 # out to whatever the public internet happens to be running, this one pins down
 # a known set of server implementations and covers combinations the public one
 # cannot — cleartext h2c, and TLS against a server whose certificate we made.
@@ -92,6 +96,18 @@ tomcat|h2|http://127.0.0.1:18088/|cleartext h2c, Coyote
 openlite|h1|http://127.0.0.1:18089/|cleartext
 openlite|h1|https://127.0.0.1:18449/|TLS
 openlite|h2|https://127.0.0.1:18449/|TLS, ALPN h2
+hypercorn|h1|http://127.0.0.1:18091/|cleartext
+hypercorn|h2|http://127.0.0.1:18091/|cleartext h2c, Hypercorn's own HTTP/2
+hypercorn|h1|https://127.0.0.1:18451/|TLS
+hypercorn|h2|https://127.0.0.1:18451/|TLS, ALPN h2
+hypercorn|h3|https://127.0.0.1:18451/|aioquic
+node|h1|http://127.0.0.1:18093/|cleartext
+node|h2|http://127.0.0.1:18092/|cleartext h2c, Node's own HTTP/2
+node|h1|https://127.0.0.1:18452/|TLS
+node|h2|https://127.0.0.1:18452/|TLS, ALPN h2
+goserver|h1|http://127.0.0.1:18094/|cleartext
+goserver|h1|https://127.0.0.1:18453/|TLS
+goserver|h2|https://127.0.0.1:18453/|TLS, ALPN h2, Go's net/http2
 EOF
 )
 
