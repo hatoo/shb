@@ -168,7 +168,6 @@ h3|https://www.reddit.com/|Fastly
 h3|https://www.bing.com/|Microsoft msquic
 h3|https://www.linkedin.com/|LinkedIn
 h3|https://www.adobe.com/|Akamai
-h3|https://www.paypal.com/|Akamai
 h3|https://www.linode.com/|Akamai
 h3|https://www.spotify.com/|Fastly
 h3|https://www.python.org/|Fastly

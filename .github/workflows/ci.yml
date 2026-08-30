@@ -50,9 +50,9 @@ jobs:
           ./target/release/shb -n 1000 -c 4 http://127.0.0.1:8000/ | tee smoke.txt
           grep -q "1000 ok" smoke.txt
 
-      # nginx, Caddy, HAProxy, Apache httpd and Envoy in containers, one
-      # request to each over every protocol it speaks. Unlike
-      # scripts/interop.sh these are servers we start ourselves, so this can
-      # gate a merge.
+      # nginx, Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat and
+      # OpenLiteSpeed in containers, loaded over every protocol each of them
+      # speaks. Unlike scripts/interop.sh these are servers we start
+      # ourselves, so this can gate a merge.
       - name: Interop against containerised servers
         run: scripts/docker-interop.sh --down
