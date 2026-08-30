@@ -210,7 +210,7 @@ threads for every tool. Numbers are requests/sec; higher is better.
 | HTTP/1.1 | 1000 connections | **993,170** | 856,476 | 796,238 |
 | HTTP/2 (h2c) | 32 conns × 32 streams | **932,839** | — | 885,527 |
 | HTTP/2 (h2c) | 100 conns × 100 streams | **1,255,321** | — | 1,205,942 |
-| HTTP/3 | 32 conns × 32 streams | **2,054,015** | — | 1,466,884 |
+| HTTP/3 | 32 conns × 32 streams | **1,967,413** | — | 1,395,173 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -232,11 +232,12 @@ HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
 `:status` with every other field measured and skipped.
 
-**On HTTP/3 shb is 40 % ahead**, and 26 % at 16 × 128. QPACK is where that
-comes from: a profile of a saturated worker used to spend 47 % of its time
-Huffman-decoding response header values, which the scanner now steps over
-without reading. QUIC itself is still [quinn-proto], so the remaining cost is
-mostly transport and crypto.
+**On HTTP/3 shb is 41 % ahead**, and 48 % at 16 × 128. Two things get it
+there: QPACK, where a profile of a saturated worker used to spend 47 % of its
+time Huffman-decoding response header values that the scanner now steps over,
+and turning the QUIC state machine once per batch of datagrams rather than
+once per datagram. QUIC itself is still [quinn-proto], and it is now most of
+what a worker spends its time on.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
