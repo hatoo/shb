@@ -1,6 +1,6 @@
 [package]
 name = "shb"
-version = "0.2.4"
+version = "0.3.0"
 authors = ["hatoo <hato2000@gmail.com>"]
 edition = "2024"
 rust-version = "1.91"
