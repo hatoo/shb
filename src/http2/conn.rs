@@ -42,6 +42,7 @@ const MAX_WINDOW: u32 = (1 << 31) - 1;
 const WINDOW_REFRESH: u32 = 1 << 30;
 
 /// What the worker needs to hear about
+#[derive(Debug)]
 pub enum Event {
     /// The response headers arrived; the stream may still be carrying a body
     Status { stream_id: u32, status: u16 },
@@ -314,10 +315,17 @@ impl Connection {
         block: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<()> {
-        events.push(Event::Status {
-            stream_id: stream,
-            status: hpack::find_status(block)?,
-        });
+        // A section with no `:status` is trailers, and a 1xx is informational
+        // and precedes the real response (RFC 9110 Section 15.2); neither is
+        // the status this request gets answered with
+        if let Some(status) = hpack::find_status(block)?
+            && !crate::is_informational(status)
+        {
+            events.push(Event::Status {
+                stream_id: stream,
+                status,
+            });
+        }
         if end_stream && self.finish_stream() {
             events.push(Event::End { stream_id: stream });
         }
@@ -486,6 +494,53 @@ mod tests {
         data.extend_from_slice(&frame(DATA, FLAG_END_STREAM, id, b" world"));
         c.feed(&data, &mut events).unwrap();
         assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], Event::Status { status: 200, .. }));
+        assert!(matches!(events[1], Event::End { .. }));
+    }
+
+    /// HPACK has no static entry for a 1xx, so a 103 arrives as a literal
+    /// ":status" (static name index 8) with the value "103"
+    #[test]
+    fn interim_responses_do_not_become_the_status() {
+        let mut c = connected();
+        let id = c.start_stream(&[0x82], b"").unwrap();
+        c.take_output();
+        let mut events = Vec::new();
+        let early = [0x08, 0x03, b'1', b'0', b'3'];
+        let mut data = frame(HEADERS, FLAG_END_HEADERS, id, &early);
+        data.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            &[0x88],
+        ));
+        c.feed(&data, &mut events).unwrap();
+        // The 103 produces no status event at all, so the only one is the 200
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], Event::Status { status: 200, .. }));
+        assert!(matches!(events[1], Event::End { .. }));
+    }
+
+    /// Trailers are a second HEADERS frame with no ":status"; treating that as
+    /// a malformed response would tear down the whole connection
+    #[test]
+    fn trailers_do_not_overwrite_the_status() {
+        let mut c = connected();
+        let id = c.start_stream(&[0x82], b"").unwrap();
+        c.take_output();
+        let mut events = Vec::new();
+        let mut data = frame(HEADERS, FLAG_END_HEADERS, id, &[0x88]);
+        data.extend_from_slice(&frame(DATA, 0, id, b"hi"));
+        // A literal field "abc: 1", with no :status anywhere
+        let trailers = [0x00, 0x03, b'a', b'b', b'c', 0x01, b'1'];
+        data.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            &trailers,
+        ));
+        c.feed(&data, &mut events).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
         assert!(matches!(events[0], Event::Status { status: 200, .. }));
         assert!(matches!(events[1], Event::End { .. }));
     }

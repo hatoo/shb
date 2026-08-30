@@ -11,7 +11,7 @@
 //! after every response, assuming keep-alive makes every second request fail.
 //! That check costs one extra name comparison on lines starting with `c`.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// How the body of the response being read is delimited
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,7 +20,10 @@ enum Body {
     Exact(u64),
     /// Reading the hex size line of the next chunk
     ChunkSize,
-    /// Bytes remaining in the current chunk, then its trailing CRLF
+    /// Bytes remaining in the current chunk, its trailing CRLF included
+    ///
+    /// Counting the CRLF here rather than adding it on each pass is what lets
+    /// a read that stops *inside* that CRLF leave a correct remainder
     Chunk(u64),
     /// Reading trailers after the zero-sized chunk
     Trailers,
@@ -151,7 +154,7 @@ impl Parser {
                         return Ok((pos, done));
                     };
                     pos += len;
-                    if (100..200).contains(&status) {
+                    if crate::is_informational(status) {
                         if status == 101 {
                             // The connection stops being HTTP/1.1 here, and a
                             // load generator has nothing to switch to
@@ -196,17 +199,17 @@ impl Parser {
                     self.state = State::Body(if size == 0 {
                         Body::Trailers
                     } else {
-                        Body::Chunk(size)
+                        // The data plus its terminating CRLF
+                        let want = size.checked_add(2).context("chunk size overflow")?;
+                        Body::Chunk(want)
                     });
                 }
                 State::Body(Body::Chunk(n)) => {
-                    // The chunk data plus its terminating CRLF
-                    let want = n + 2;
                     let avail = (buf.len() - pos) as u64;
-                    let take = want.min(avail);
+                    let take = n.min(avail);
                     pos += take as usize;
-                    if take < want {
-                        self.state = State::Body(Body::Chunk(want - take - 2));
+                    if take < n {
+                        self.state = State::Body(Body::Chunk(n - take));
                         return Ok((pos, done));
                     }
                     self.state = State::Body(Body::ChunkSize);
@@ -488,6 +491,29 @@ mod tests {
             let b = p.feed(&data[split..]).unwrap();
             assert_eq!(a + b, 1, "split at {split}");
         }
+    }
+
+    /// Several chunks, split at every offset: a read that stops between the
+    /// CR and the LF ending a chunk used to underflow the remaining count
+    #[test]
+    fn multi_chunk_split_at_every_offset() {
+        let data =
+            resp("HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n1\na\n2\nbc\n3\ndef\n0\n\n");
+        for split in 1..data.len() {
+            let mut p = Parser::new();
+            let a = p.feed(&data[..split]).unwrap();
+            let b = p.feed(&data[split..]).unwrap();
+            assert_eq!(a + b, 1, "split at {split}");
+        }
+    }
+
+    /// A chunk size that leaves no room to add its CRLF must be rejected
+    /// rather than wrap around
+    #[test]
+    fn absurd_chunk_size_is_rejected() {
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\nffffffffffffffff\n");
+        assert!(p.feed(&data).is_err());
     }
 
     #[test]

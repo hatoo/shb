@@ -225,7 +225,11 @@ fn huffman_digit(bits: u32, nbits: u32) -> Option<(u8, u32)> {
 ///
 /// Every other field is measured and stepped over; none of their names or
 /// values are decoded.
-pub fn find_status(block: &[u8]) -> Result<u16> {
+///
+/// `Ok(None)` means the block carried no `:status` at all, which is what a
+/// trailer section looks like (RFC 9113 Section 8.1); it is the caller's job
+/// to tell that apart from a response.
+pub fn find_status(block: &[u8]) -> Result<Option<u16>> {
     let mut pos = 0;
     while pos < block.len() {
         let first = block[pos];
@@ -233,7 +237,7 @@ pub fn find_status(block: &[u8]) -> Result<u16> {
             // Fully indexed field
             let index = decode_int(block, &mut pos, 7)?;
             if (STATUS_INDEX_LO..=STATUS_INDEX_HI).contains(&index) {
-                return Ok(STATUS_BY_INDEX[(index - STATUS_INDEX_LO) as usize]);
+                return Ok(Some(STATUS_BY_INDEX[(index - STATUS_INDEX_LO) as usize]));
             }
             if index == 0 {
                 bail!("HPACK index 0");
@@ -267,10 +271,10 @@ pub fn find_status(block: &[u8]) -> Result<u16> {
         };
         let (value, huffman) = read_str(block, &mut pos)?;
         if named_status {
-            return status_value(value, huffman);
+            return status_value(value, huffman).map(Some);
         }
     }
-    bail!("response without :status")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -358,9 +362,9 @@ mod tests {
 
     #[test]
     fn indexed_status_is_read() {
-        assert_eq!(find_status(&[0x88]).unwrap(), 200);
-        assert_eq!(find_status(&[0x8b]).unwrap(), 304);
-        assert_eq!(find_status(&[0x8e]).unwrap(), 500);
+        assert_eq!(find_status(&[0x88]).unwrap(), Some(200));
+        assert_eq!(find_status(&[0x8b]).unwrap(), Some(304));
+        assert_eq!(find_status(&[0x8e]).unwrap(), Some(500));
     }
 
     #[test]
@@ -368,7 +372,7 @@ mod tests {
         // Literal without indexing, name index 8 (:status), value "201"
         let mut block = vec![0x08];
         encode_str(&mut block, b"201");
-        assert_eq!(find_status(&block).unwrap(), 201);
+        assert_eq!(find_status(&block).unwrap(), Some(201));
     }
 
     #[test]
@@ -376,7 +380,7 @@ mod tests {
         // "201" Huffman: '2'=00010, '0'=00000, '1'=00001, padded with ones
         // 00010 00000 00001 1 -> 0001_0000 0000_0011
         let block = [0x08u8, 0x82, 0x10, 0x03];
-        assert_eq!(find_status(&block).unwrap(), 201);
+        assert_eq!(find_status(&block).unwrap(), Some(201));
     }
 
     #[test]
@@ -387,7 +391,11 @@ mod tests {
             let mut block = vec![0x08u8];
             encode_int(&mut block, 7, 0x80, encoded.len() as u32);
             block.extend_from_slice(&encoded);
-            assert_eq!(find_status(&block).unwrap(), status, "status {status}");
+            assert_eq!(
+                find_status(&block).unwrap(),
+                Some(status),
+                "status {status}"
+            );
         }
     }
 
@@ -431,7 +439,7 @@ mod tests {
             let mut block = vec![0x08u8];
             encode_int(&mut block, 7, 0x80, huffman.len() as u32);
             block.extend_from_slice(huffman);
-            assert_eq!(find_status(&block).unwrap(), status, "{status}");
+            assert_eq!(find_status(&block).unwrap(), Some(status), "{status}");
         }
     }
 
@@ -441,7 +449,7 @@ mod tests {
         literal(&mut block, b"server", b"nginx");
         block.push(0x88); // :status 200
         literal(&mut block, b"content-type", b"text/plain");
-        assert_eq!(find_status(&block).unwrap(), 200);
+        assert_eq!(find_status(&block).unwrap(), Some(200));
     }
 
     #[test]
@@ -452,7 +460,7 @@ mod tests {
 
     #[test]
     fn size_update_is_skipped() {
-        assert_eq!(find_status(&[0x20, 0x88]).unwrap(), 200);
+        assert_eq!(find_status(&[0x20, 0x88]).unwrap(), Some(200));
     }
 
     #[test]

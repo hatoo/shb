@@ -729,7 +729,15 @@ pub fn run_worker(
                         if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
                             buf_ring.recycle(bid);
                         }
-                        if res == -libc::ENOBUFS {
+                        if res == -libc::ENOBUFS || res == -libc::EMSGSIZE {
+                            // ENOBUFS: the buffer ring ran dry. EMSGSIZE: a
+                            // datagram we sent was too big for the path, and
+                            // the ICMP reply is reported on whichever
+                            // operation runs next - often a recv rather than
+                            // the send itself. Both leave the connection
+                            // intact; an MTU probe that draws one is a probe
+                            // that timed out, which is what the send path
+                            // already assumes.
                             uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                             conn.recv_armed = true;
                         } else {

@@ -18,6 +18,16 @@ use crate::report::{print_json_report, print_report};
 use crate::stats::Stats;
 use crate::target::parse_target;
 
+/// Is this an interim response that does not finish the message?
+///
+/// A 1xx (RFC 9110 Section 15.2) is informational: the real response follows
+/// it on the same exchange, so recording one as the answer would report
+/// whatever the server sent as a hint - a 103 Early Hints, say - in place of
+/// the status the request actually got.
+pub fn is_informational(status: u16) -> bool {
+    (100..200).contains(&status)
+}
+
 #[derive(Parser)]
 #[command(
     name = "shb",

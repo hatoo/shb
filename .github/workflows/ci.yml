@@ -29,7 +29,14 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Test
+      # Both profiles, and the debug one first: release turns off the
+      # arithmetic overflow checks, so a subtraction that wraps silently there
+      # panics here. That is not hypothetical - it hid a chunked-body
+      # underflow that made the parser wait for 2^64 more bytes.
+      - name: Test (debug, with overflow checks)
+        run: cargo test
+
+      - name: Test (release)
         run: cargo test --release
 
       # Multishot recv and provided buffer rings need kernel 6.0; the setup

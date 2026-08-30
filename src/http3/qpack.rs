@@ -260,7 +260,11 @@ fn is_status_index(index: u64) -> bool {
 ///
 /// Every other field is measured and stepped over; none of their names or
 /// values are decoded, which is what keeps Huffman decoding off the hot path.
-pub fn find_status(section: &[u8]) -> Result<u16> {
+///
+/// `Ok(None)` means the section carried no `:status` at all, which is what a
+/// trailer section looks like (RFC 9114 Section 4.1); it is the caller's job
+/// to tell that apart from a response.
+pub fn find_status(section: &[u8]) -> Result<Option<u16>> {
     let mut pos = 0;
     // Field section prefix. The peer was told not to insert, so the required
     // insert count must be zero and the base cannot be anything else.
@@ -280,7 +284,7 @@ pub fn find_status(section: &[u8]) -> Result<u16> {
                 bail!("QPACK dynamic table reference");
             }
             if let Some(status) = status_for_index(index) {
-                return Ok(status);
+                return Ok(Some(status));
             }
         } else if first & 0x40 != 0 {
             // Literal field line with a name reference
@@ -292,7 +296,7 @@ pub fn find_status(section: &[u8]) -> Result<u16> {
             let named_status = is_status_index(index);
             let (value, huffman) = read_str(section, &mut pos, 7)?;
             if named_status {
-                return status_value(value, huffman);
+                return status_value(value, huffman).map(Some);
             }
         } else if first & 0x20 != 0 {
             // Literal field line with a literal name
@@ -300,14 +304,14 @@ pub fn find_status(section: &[u8]) -> Result<u16> {
             let named_status = !name_huffman && name == b":status";
             let (value, huffman) = read_str(section, &mut pos, 7)?;
             if named_status {
-                return status_value(value, huffman);
+                return status_value(value, huffman).map(Some);
             }
         } else {
             // Indexed field line with post-base index: dynamic table only
             bail!("QPACK dynamic table reference");
         }
     }
-    bail!("response without :status")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -374,26 +378,26 @@ mod tests {
 
     #[test]
     fn indexed_status_is_read() {
-        assert_eq!(find_status(&section(&[0xc0 | 25])).unwrap(), 200);
-        assert_eq!(find_status(&section(&[0xc0 | 27])).unwrap(), 404);
+        assert_eq!(find_status(&section(&[0xc0 | 25])).unwrap(), Some(200));
+        assert_eq!(find_status(&section(&[0xc0 | 27])).unwrap(), Some(404));
         // Indices above the 6-bit prefix take the continuation form
         let mut body = Vec::new();
         indexed(&mut body, 69);
-        assert_eq!(find_status(&section(&body)).unwrap(), 500);
+        assert_eq!(find_status(&section(&body)).unwrap(), Some(500));
     }
 
     #[test]
     fn literal_status_with_a_name_reference_is_read() {
         let mut body = Vec::new();
         literal_named(&mut body, 25, b"201");
-        assert_eq!(find_status(&section(&body)).unwrap(), 201);
+        assert_eq!(find_status(&section(&body)).unwrap(), Some(201));
     }
 
     #[test]
     fn literal_status_with_a_literal_name_is_read() {
         let mut body = Vec::new();
         literal(&mut body, b":status", b"418");
-        assert_eq!(find_status(&section(&body)).unwrap(), 418);
+        assert_eq!(find_status(&section(&body)).unwrap(), Some(418));
     }
 
     #[test]
@@ -406,7 +410,11 @@ mod tests {
             encode_int(&mut body, 4, 0x50, 25);
             encode_int(&mut body, 7, 0x80, encoded.len() as u64);
             body.extend_from_slice(&encoded);
-            assert_eq!(find_status(&section(&body)).unwrap(), status, "{status}");
+            assert_eq!(
+                find_status(&section(&body)).unwrap(),
+                Some(status),
+                "{status}"
+            );
         }
     }
 
@@ -449,7 +457,11 @@ mod tests {
             encode_int(&mut body, 4, 0x50, 25);
             encode_int(&mut body, 7, 0x80, huffman.len() as u64);
             body.extend_from_slice(huffman);
-            assert_eq!(find_status(&section(&body)).unwrap(), status, "{status}");
+            assert_eq!(
+                find_status(&section(&body)).unwrap(),
+                Some(status),
+                "{status}"
+            );
         }
     }
 
@@ -463,7 +475,7 @@ mod tests {
         encode_int(&mut body, 7, 0x80, 3);
         body.extend_from_slice(&[0xff, 0xff, 0xff]);
         indexed(&mut body, 25);
-        assert_eq!(find_status(&section(&body)).unwrap(), 200);
+        assert_eq!(find_status(&section(&body)).unwrap(), Some(200));
     }
 
     #[test]

@@ -159,9 +159,14 @@ impl ResponseReader {
                     return Ok(pos);
                 }
                 let section = &buf[pos + header_len..end];
-                // Trailers arrive as a second HEADERS frame and have no status
-                if self.status == 0 {
-                    self.status = qpack::find_status(section)?;
+                // A section with no `:status` is trailers, and a 1xx is
+                // informational and precedes the real response (RFC 9110
+                // Section 15.2); neither is the status this request gets
+                // answered with
+                if let Some(status) = qpack::find_status(section)?
+                    && !crate::is_informational(status)
+                {
+                    self.status = status;
                 }
                 pos = end;
                 continue;
@@ -361,6 +366,32 @@ mod tests {
         stream.extend_from_slice(&frame(0x1f * 3 + 0x21, b"more grease"));
         r.feed(&stream).unwrap();
         assert_eq!(r.status(), 200);
+    }
+
+    /// A 103 Early Hints arrives as its own HEADERS frame before the real
+    /// response; taking it as the answer is what www.twitch.tv exposed
+    #[test]
+    fn interim_responses_do_not_become_the_status() {
+        let mut r = ResponseReader::default();
+        // Static index 24 is ":status 103", 25 is ":status 200"
+        let mut stream = frame(FRAME_HEADERS, &[0x00, 0x00, 0xc0 | 24]);
+        stream.extend_from_slice(&frame(FRAME_HEADERS, &[0x00, 0x00, 0xc0 | 25]));
+        stream.extend_from_slice(&frame(FRAME_DATA, b"body"));
+        r.feed(&stream).unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    /// The same exchange, but delivered one byte at a time
+    #[test]
+    fn interim_response_split_at_every_offset() {
+        let mut stream = frame(FRAME_HEADERS, &[0x00, 0x00, 0xc0 | 24]);
+        stream.extend_from_slice(&frame(FRAME_HEADERS, &[0x00, 0x00, 0xc0 | 27]));
+        for split in 1..stream.len() {
+            let mut r = ResponseReader::default();
+            r.feed(&stream[..split]).unwrap();
+            r.feed(&stream[split..]).unwrap();
+            assert_eq!(r.status(), 404, "split at {split}");
+        }
     }
 
     #[test]
