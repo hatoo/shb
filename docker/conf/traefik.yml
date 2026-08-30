@@ -1,0 +1,12 @@
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+    http3:
+      advertisedPort: 443
+providers:
+  file:
+    filename: /conf/traefik-dynamic.yml
+log:
+  level: ERROR

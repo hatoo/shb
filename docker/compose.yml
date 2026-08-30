@@ -29,3 +29,40 @@ services:
     image: envoyproxy/envoy:v1.31-latest
     volumes: ["./conf:/conf:ro", "./conf/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
     ports: ["18084:80", "18447:443", "18447:443/udp"]
+
+  # A cache rather than an origin, but vcl_synth answers without a backend.
+  # Distinct HTTP/1.1 and HTTP/2 implementations in C.
+  varnish:
+    image: varnish:stable
+    command: ["varnishd", "-F", "-a", ":80", "-a", ":81,PROXY", "-f", "/conf/varnish.vcl", "-p", "feature=+http2"]
+    volumes: ["./conf:/conf:ro"]
+    ports: ["18086:80"]
+
+  # Go, like Caddy, but a different product in front of the same quic-go.
+  # It has no static-response feature, so it proxies to the nginx container.
+  traefik:
+    image: traefik:v3.1
+    command: ["--configFile=/conf/traefik.yml"]
+    volumes: ["./conf:/conf:ro"]
+    ports: ["18087:80", "18448:443", "18448:443/udp"]
+    depends_on: [nginx]
+
+  # Java: an implementation family none of the others share
+  tomcat:
+    image: tomcat:11-jre21
+    volumes:
+      - "./conf/index.html:/usr/local/tomcat/webapps/ROOT/index.html:ro"
+      - "./conf/tomcat-server.xml:/usr/local/tomcat/conf/server.xml:ro"
+    ports: ["18088:8080"]
+
+  # Published by LiteSpeed themselves rather than being a Docker Official
+  # Image. Its own self-signed certificate is fine, shb trusting everything.
+  #
+  # Worth keeping even though the stock image offers neither h2c on the plain
+  # listener nor QUIC on the TLS one: its HPACK decoder is the one that could
+  # not follow a reference into the dynamic table, which is what made shb stop
+  # asking peers to index. The TLS h2 row is the regression test for that.
+  openlitespeed:
+    image: litespeedtech/openlitespeed:latest
+    volumes: ["./conf/index.html:/var/www/vhosts/localhost/html/index.html:ro"]
+    ports: ["18089:80", "18449:443"]

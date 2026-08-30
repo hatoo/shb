@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Server port="8005" shutdown="SHUTDOWN">
+  <Service name="Catalina">
+    <!-- HTTP/1.1 with h2c upgrade and prior knowledge on the same port -->
+    <Connector port="8080" protocol="HTTP/1.1" connectionTimeout="20000">
+      <UpgradeProtocol className="org.apache.coyote.http2.Http2Protocol" />
+    </Connector>
+    <Engine name="Catalina" defaultHost="localhost">
+      <Host name="localhost" appBase="webapps" unpackWARs="true" autoDeploy="false" />
+    </Engine>
+  </Service>
+</Server>

@@ -26,7 +26,7 @@ use io_uring::{Submitter, cqueue, squeue, types};
 ///
 /// They are encoded once and then memcpy'd per request; nothing in them
 /// depends on the stream or the connection.
-fn build_header_block(target: &Target) -> hpack::RequestBlocks {
+fn build_header_block(target: &Target) -> Vec<u8> {
     let headers: Vec<(String, String)> = target
         .headers
         .iter()
@@ -128,7 +128,7 @@ impl Conn {
 /// completions.
 fn fill_streams(
     conn: &mut Conn,
-    header_block: &hpack::RequestBlocks,
+    header_block: &[u8],
     body: &[u8],
     parallel: usize,
     started: &mut u64,
@@ -210,7 +210,15 @@ fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
             Event::End { stream_id } => {
                 if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
                     let inflight = conn.streams.swap_remove(pos);
-                    stats.record_success(inflight.status, inflight.start);
+                    if inflight.status == 0 {
+                        // Every response begins with HEADERS carrying :status
+                        // (RFC 9113 Section 8.1). A stream that ends without
+                        // one is not a response, and counting it as a success
+                        // would report a request that never got an answer
+                        stats.errors += 1;
+                    } else {
+                        stats.record_success(inflight.status, inflight.start);
+                    }
                 }
             }
             Event::Reset { stream_id } => {

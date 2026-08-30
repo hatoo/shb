@@ -481,7 +481,14 @@ fn drive(
                     stats.errors += 1;
                 } else if fin {
                     let inflight = conn.streams.swap_remove(pos);
-                    stats.record_success(inflight.reader.status(), inflight.start);
+                    if inflight.reader.status() == 0 {
+                        // Every response begins with a HEADERS frame carrying
+                        // :status (RFC 9114 Section 4.1); a stream that ends
+                        // without one never answered the request
+                        stats.errors += 1;
+                    } else {
+                        stats.record_success(inflight.reader.status(), inflight.start);
+                    }
                 }
                 continue;
             }

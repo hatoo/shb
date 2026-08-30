@@ -8,7 +8,7 @@
 
 use anyhow::{Result, bail};
 
-use super::hpack::{self, RequestBlocks};
+use super::hpack;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_HEADER_LEN: usize = 9;
@@ -69,13 +69,6 @@ pub struct Connection {
     open: u32,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
-    /// The peer's SETTINGS_HEADER_TABLE_SIZE, once its SETTINGS have arrived.
-    /// Until then nothing may be indexed: the peer might be keeping no table
-    /// at all, in which case a reference to one would be a decoding error
-    peer_table_size: Option<u32>,
-    /// Whether a block that inserts `:authority` has already gone out, so the
-    /// peer's table holds the entry the short block refers to
-    inserted_authority: bool,
     /// Our remaining connection-level send credit
     send_window: i64,
     /// The peer's SETTINGS_INITIAL_WINDOW_SIZE, the credit each new stream gets
@@ -97,8 +90,6 @@ impl Connection {
             next_id: 1,
             open: 0,
             max_concurrent: u32::MAX,
-            peer_table_size: None,
-            inserted_authority: false,
             send_window: 65535,
             peer_initial_window: 65535,
             recv_consumed: 0,
@@ -131,27 +122,16 @@ impl Connection {
         !self.goaway && self.open < self.max_concurrent
     }
 
-    /// Open a stream carrying the request (and `body`), returning its id
+    /// Open a stream carrying `block` (and `body`), returning its id
     ///
-    /// Picks the short header block once the peer has said it keeps a dynamic
-    /// table big enough for the entry, and the entry has been sent.
-    pub fn start_stream(&mut self, blocks: &RequestBlocks, body: &[u8]) -> Option<u32> {
+    /// `block` is the header block built once by [`super::hpack::encode_request`].
+    pub fn start_stream(&mut self, block: &[u8], body: &[u8]) -> Option<u32> {
         if !self.can_open()
             || (body.len() as i64) > self.send_window
             || body.len() as u32 > self.peer_initial_window
         {
             return None;
         }
-        let indexed = self.inserted_authority
-            && self
-                .peer_table_size
-                .is_some_and(|size| size >= blocks.entry_size);
-        let block: &[u8] = if indexed {
-            &blocks.indexed
-        } else {
-            self.inserted_authority = true;
-            &blocks.first
-        };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(2);
         let end_stream = if body.is_empty() { FLAG_END_STREAM } else { 0 };
@@ -352,14 +332,11 @@ impl Connection {
         if !rest.is_empty() {
             bail!("malformed SETTINGS");
         }
-        // The default when the peer says nothing (RFC 7541 Section 4.2)
-        let mut table_size = 4096;
         for entry in entries {
             let id = u16::from_be_bytes([entry[0], entry[1]]);
             let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
             match id {
                 SETTINGS_MAX_CONCURRENT_STREAMS => self.max_concurrent = value,
-                SETTINGS_HEADER_TABLE_SIZE => table_size = value,
                 // Our only use for this is deciding whether a request body
                 // fits; responses ride on the huge window we advertise
                 SETTINGS_INITIAL_WINDOW_SIZE if value <= MAX_WINDOW => {
@@ -369,7 +346,6 @@ impl Connection {
                 _ => {}
             }
         }
-        self.peer_table_size = Some(table_size);
         self.frame_header(0, SETTINGS, FLAG_ACK, 0);
         Ok(())
     }
@@ -420,16 +396,6 @@ mod tests {
         v
     }
 
-    /// Two identical one-byte blocks, so tests that only care about framing
-    /// do not have to think about which one goes out
-    fn blocks() -> RequestBlocks {
-        RequestBlocks {
-            first: vec![0x82],
-            indexed: vec![0x82],
-            entry_size: 46,
-        }
-    }
-
     fn connected() -> Connection {
         let mut c = Connection::new();
         c.initiate();
@@ -463,12 +429,7 @@ mod tests {
 
         // A request is one HEADERS frame carrying the block, ending the stream
         let mut c = connected();
-        let blocks = RequestBlocks {
-            first: vec![0x82, 0x86],
-            indexed: vec![0x82],
-            entry_size: 46,
-        };
-        assert_eq!(c.start_stream(&blocks, b""), Some(1));
+        assert_eq!(c.start_stream(&[0x82, 0x86], b""), Some(1));
         assert_eq!(
             c.take_output().unwrap(),
             [
@@ -490,15 +451,15 @@ mod tests {
     #[test]
     fn stream_ids_are_odd_and_ascending() {
         let mut c = connected();
-        assert_eq!(c.start_stream(&blocks(), b""), Some(1));
-        assert_eq!(c.start_stream(&blocks(), b""), Some(3));
-        assert_eq!(c.start_stream(&blocks(), b""), Some(5));
+        assert_eq!(c.start_stream(&[0x82], b""), Some(1));
+        assert_eq!(c.start_stream(&[0x82], b""), Some(3));
+        assert_eq!(c.start_stream(&[0x82], b""), Some(5));
     }
 
     #[test]
     fn response_in_one_headers_frame() {
         let mut c = connected();
-        let id = c.start_stream(&blocks(), b"").unwrap();
+        let id = c.start_stream(&[0x82], b"").unwrap();
         c.take_output();
         let mut events = Vec::new();
         let data = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, id, &[0x88]);
@@ -517,7 +478,7 @@ mod tests {
     #[test]
     fn headers_then_data_completes_on_end_stream() {
         let mut c = connected();
-        let id = c.start_stream(&blocks(), b"").unwrap();
+        let id = c.start_stream(&[0x82], b"").unwrap();
         c.take_output();
         let mut events = Vec::new();
         let mut data = frame(HEADERS, FLAG_END_HEADERS, id, &[0x88]);
@@ -540,7 +501,7 @@ mod tests {
         ));
         for split in 1..whole.len() {
             let mut c = connected();
-            c.start_stream(&blocks(), b"").unwrap();
+            c.start_stream(&[0x82], b"").unwrap();
             c.take_output();
             let mut events = Vec::new();
             c.feed(&whole[..split], &mut events).unwrap();
@@ -552,7 +513,7 @@ mod tests {
     #[test]
     fn continuation_is_reassembled() {
         let mut c = connected();
-        let id = c.start_stream(&blocks(), b"").unwrap();
+        let id = c.start_stream(&[0x82], b"").unwrap();
         c.take_output();
         let mut events = Vec::new();
         // ":status 200" is one byte, so split it around a preceding field
@@ -586,9 +547,9 @@ mod tests {
         let out = c.take_output().unwrap();
         assert_eq!(out[3], SETTINGS);
         assert_eq!(out[4], FLAG_ACK);
-        assert!(c.start_stream(&blocks(), b"").is_some());
-        assert!(c.start_stream(&blocks(), b"").is_some());
-        assert!(c.start_stream(&blocks(), b"").is_none(), "limit applies");
+        assert!(c.start_stream(&[0x82], b"").is_some());
+        assert!(c.start_stream(&[0x82], b"").is_some());
+        assert!(c.start_stream(&[0x82], b"").is_none(), "limit applies");
     }
 
     #[test]
@@ -598,13 +559,13 @@ mod tests {
         c.feed(&frame(GOAWAY, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]), &mut events)
             .unwrap();
         assert!(matches!(events[0], Event::Goaway));
-        assert!(c.start_stream(&blocks(), b"").is_none());
+        assert!(c.start_stream(&[0x82], b"").is_none());
     }
 
     #[test]
     fn padded_headers_are_trimmed() {
         let mut c = connected();
-        let id = c.start_stream(&blocks(), b"").unwrap();
+        let id = c.start_stream(&[0x82], b"").unwrap();
         c.take_output();
         let mut events = Vec::new();
         // One pad-length byte, the block, then two padding bytes
@@ -625,7 +586,7 @@ mod tests {
     #[test]
     fn window_update_credit_is_returned_in_bulk() {
         let mut c = connected();
-        let id = c.start_stream(&blocks(), b"").unwrap();
+        let id = c.start_stream(&[0x82], b"").unwrap();
         c.take_output();
         let mut events = Vec::new();
         let body = vec![0u8; 16384];

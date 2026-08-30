@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
 #
 # Start the major HTTP servers in containers and send one request to each over
-# every protocol it speaks. This complements scripts/interop.sh: that one goes
+# every protocol it speaks. Every image is either a Docker Official Image or
+# published by the project itself, and each was picked for being a distinct
+# implementation rather than a distinct product. This complements scripts/interop.sh: that one goes
 # out to whatever the public internet happens to be running, this one pins down
 # a known set of server implementations and covers combinations the public one
 # cannot — cleartext h2c, and TLS against a server whose certificate we made.
 #
 # Every server answers the same 13-byte body, so a status of 200 everywhere is
-# the whole of the expected output.
+# the whole of the expected output. These are our own containers, so the load
+# is real rather than a single request: 200 requests over 50 connections
+# exercises connection reuse and concurrency, not just the first exchange.
 #
 #   scripts/docker-interop.sh          # bring the servers up, test, leave them up
 #   scripts/docker-interop.sh --down   # stop them afterwards
 #   SHB=target/dist/shb scripts/docker-interop.sh
+#   CONNECTIONS=200 REQUESTS=5000 scripts/docker-interop.sh
 #
 set -uo pipefail
 
 SHB=${SHB:-./target/release/shb}
+# Our own servers, so this is a real if small amount of load rather than one
+# request; it covers connection reuse, which one request cannot
+CONNECTIONS=${CONNECTIONS:-50}
+REQUESTS=${REQUESTS:-200}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
 if [ ! -x "$SHB" ]; then
@@ -51,6 +60,18 @@ envoy|h2|http://127.0.0.1:18084/|cleartext h2c, prior knowledge
 envoy|h1|https://127.0.0.1:18447/|TLS
 envoy|h2|https://127.0.0.1:18447/|TLS, ALPN h2
 envoy|h3|https://127.0.0.1:18447/|quiche
+varnish|h1|http://127.0.0.1:18086/|cleartext
+varnish|h2|http://127.0.0.1:18086/|cleartext h2c, prior knowledge
+traefik|h1|http://127.0.0.1:18087/|cleartext
+traefik|h2|http://127.0.0.1:18087/|cleartext h2c, prior knowledge
+traefik|h1|https://127.0.0.1:18448/|TLS
+traefik|h2|https://127.0.0.1:18448/|TLS, ALPN h2
+traefik|h3|https://127.0.0.1:18448/|quic-go
+tomcat|h1|http://127.0.0.1:18088/|cleartext
+tomcat|h2|http://127.0.0.1:18088/|cleartext h2c, Coyote
+openlite|h1|http://127.0.0.1:18089/|cleartext
+openlite|h1|https://127.0.0.1:18449/|TLS
+openlite|h2|https://127.0.0.1:18449/|TLS, ALPN h2
 EOF
 )
 
@@ -77,8 +98,8 @@ printf '%-8s %-5s %-30s %-9s %s\n' -------- ----- ------------------------------
 
 while IFS='|' read -r server proto url note; do
     [ -z "$server" ] && continue
-    out=$(timeout 30 "$SHB" $(flag_for "$proto") \
-        -c 1 -t 1 -n 1 --connect-timeout 10s -j "$url" 2>/dev/null)
+    out=$(timeout 60 "$SHB" $(flag_for "$proto") \
+        -c "$CONNECTIONS" -n "$REQUESTS" --connect-timeout 10s -j "$url" 2>/dev/null)
 
     if [ -n "$out" ] && [ "${out:0:1}" = "{" ]; then
         ok=$(printf '%s' "$out" | jq -r '.requests.ok')
@@ -87,8 +108,8 @@ while IFS='|' read -r server proto url note; do
         ok=0; codes=""
     fi
 
-    if [ "$ok" = "1" ] && [ "$codes" = "200" ]; then
-        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "ok 200" "$note"
+    if [ "$ok" = "$REQUESTS" ] && [ "$codes" = "200" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "$ok ok" "$note"
         pass=$((pass + 1))
     else
         printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"

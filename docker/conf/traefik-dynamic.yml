@@ -1,0 +1,22 @@
+http:
+  routers:
+    clear:
+      rule: "PathPrefix(`/`)"
+      service: s
+      entryPoints: [web]
+    tls:
+      rule: "PathPrefix(`/`)"
+      service: s
+      entryPoints: [websecure]
+      tls: {}
+  services:
+    s:
+      loadBalancer:
+        servers:
+          - url: "http://nginx:80"
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /conf/cert.pem
+        keyFile: /conf/key.pem

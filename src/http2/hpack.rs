@@ -53,32 +53,8 @@ fn literal_indexed_name(out: &mut Vec<u8>, name_index: u32, value: &[u8]) {
     encode_str(out, value);
 }
 
-/// A literal field whose name is in the static table, added to the peer's
-/// dynamic table as it is decoded
-fn literal_indexing(out: &mut Vec<u8>, name_index: u32, value: &[u8]) {
-    encode_int(out, 6, 0x40, name_index);
-    encode_str(out, value);
-}
-
-/// Static index of `:authority`, and the dynamic index its entry lands on
-///
-/// The dynamic table is addressed from 62 downwards, newest first, and
-/// `:authority` is the only field shb ever inserts, so its entry is always 62.
+/// Static index of `:authority`
 const IDX_AUTHORITY: u32 = 1;
-const DYNAMIC_AUTHORITY: u32 = 62;
-
-/// The two header blocks a connection alternates between
-pub struct RequestBlocks {
-    /// Sent until the peer is known to be keeping a dynamic table. It carries
-    /// `:authority` as a literal and asks the peer to remember it.
-    pub first: Vec<u8>,
-    /// Sent afterwards, with `:authority` as a one-byte reference to that
-    /// entry. For a typical authority this is 15 bytes shorter per request.
-    pub indexed: Vec<u8>,
-    /// What the entry costs in the peer's table (RFC 7541 Section 4.1), so the
-    /// caller can check it against SETTINGS_HEADER_TABLE_SIZE
-    pub entry_size: u32,
-}
 
 /// A literal field with both parts spelled out, without indexing
 fn literal(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
@@ -87,12 +63,18 @@ fn literal(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     encode_str(out, value);
 }
 
-/// Build the header blocks sent for every request
+/// Build the header block sent for every request
 ///
 /// Pseudo-headers come first, as RFC 9113 Section 8.3 requires. Header names
-/// must already be lower-cased. Only `:authority` is ever indexed: it is the
-/// one field long enough to be worth it, and keeping it the sole entry is what
-/// makes its dynamic index a constant.
+/// must already be lower-cased.
+///
+/// Nothing here asks the peer to index: every field is either a static-table
+/// reference or a literal *without* indexing, so the peer's dynamic table
+/// stays empty and this one block is valid for every stream on every
+/// connection. Indexing `:authority` and then referring to the entry was
+/// tried, and takes a request from 28 bytes to 13, but it measured within
+/// noise on loopback and OpenLiteSpeed fails to decode the reference — a bad
+/// trade for a benchmarker, whose job is to work against whatever is there.
 pub fn encode_request(
     method: &str,
     scheme: &str,
@@ -100,50 +82,38 @@ pub fn encode_request(
     path: &str,
     headers: &[(String, String)],
     body_len: usize,
-) -> RequestBlocks {
-    let build = |index_authority: bool| {
-        let mut out = Vec::with_capacity(64 + headers.len() * 32);
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + headers.len() * 32);
 
-        // :method — GET and POST have a static entry of their own
-        match method {
-            "GET" => out.push(0x82),
-            "POST" => out.push(0x83),
-            _ => literal_indexed_name(&mut out, 2, method.as_bytes()),
-        }
-        // :scheme
-        match scheme {
-            "http" => out.push(0x86),
-            "https" => out.push(0x87),
-            _ => literal_indexed_name(&mut out, 6, scheme.as_bytes()),
-        }
-        // :authority
-        if index_authority {
-            encode_int(&mut out, 7, 0x80, DYNAMIC_AUTHORITY);
-        } else {
-            literal_indexing(&mut out, IDX_AUTHORITY, authority.as_bytes());
-        }
-        // :path — "/" has a static entry
-        if path == "/" {
-            out.push(0x84);
-        } else {
-            literal_indexed_name(&mut out, 4, path.as_bytes());
-        }
-
-        for (name, value) in headers {
-            literal(&mut out, name.as_bytes(), value.as_bytes());
-        }
-        if body_len > 0 {
-            // content-length is static index 28
-            literal_indexed_name(&mut out, 28, body_len.to_string().as_bytes());
-        }
-        out
-    };
-    RequestBlocks {
-        first: build(false),
-        indexed: build(true),
-        // name + value + 32 (RFC 7541 Section 4.1)
-        entry_size: (":authority".len() + authority.len() + 32) as u32,
+    // :method — GET and POST have a static entry of their own
+    match method {
+        "GET" => out.push(0x82),
+        "POST" => out.push(0x83),
+        _ => literal_indexed_name(&mut out, 2, method.as_bytes()),
     }
+    // :scheme
+    match scheme {
+        "http" => out.push(0x86),
+        "https" => out.push(0x87),
+        _ => literal_indexed_name(&mut out, 6, scheme.as_bytes()),
+    }
+    // :authority
+    literal_indexed_name(&mut out, IDX_AUTHORITY, authority.as_bytes());
+    // :path — "/" has a static entry
+    if path == "/" {
+        out.push(0x84);
+    } else {
+        literal_indexed_name(&mut out, 4, path.as_bytes());
+    }
+
+    for (name, value) in headers {
+        literal(&mut out, name.as_bytes(), value.as_bytes());
+    }
+    if body_len > 0 {
+        // content-length is static index 28
+        literal_indexed_name(&mut out, 28, body_len.to_string().as_bytes());
+    }
+    out
 }
 
 /// Read an integer in HPACK's prefix encoding, advancing `pos`
@@ -351,72 +321,39 @@ mod tests {
 
     #[test]
     fn get_request_uses_static_entries() {
-        let blocks = encode_request("GET", "http", "127.0.0.1:80", "/", &[], 0);
-        for block in [&blocks.first, &blocks.indexed] {
-            // :method GET, :scheme http, :path / are one byte each
-            assert_eq!(block[0], 0x82);
-            assert_eq!(block[1], 0x86);
-            assert_eq!(*block.last().unwrap(), 0x84);
-        }
+        let block = encode_request("GET", "http", "127.0.0.1:80", "/", &[], 0);
+        // :method GET, :scheme http, :path / are one byte each
+        assert_eq!(block[0], 0x82);
+        assert_eq!(block[1], 0x86);
+        assert_eq!(*block.last().unwrap(), 0x84);
+    }
+
+    /// The whole block, byte for byte. Every representation is either an index
+    /// into the static table or a literal *without* indexing (the 0x01 and
+    /// 0x04 prefixes), so the peer's dynamic table stays empty and this one
+    /// block keeps working for the life of the connection.
+    #[test]
+    fn nothing_asks_the_peer_to_index() {
+        let block = encode_request("GET", "http", "127.0.0.1:8080", "/x", &[], 0);
+        let mut want = vec![
+            0x82, // :method GET, static index 2
+            0x86, // :scheme http, static index 6
+            0x01, // literal without indexing, name index 1 (:authority)
+            14,   // length of the authority that follows
+        ];
+        want.extend_from_slice(b"127.0.0.1:8080");
+        // literal without indexing, name index 4 (:path), then "/x"
+        want.extend_from_slice(&[0x04, 2, b'/', b'x']);
+        assert_eq!(block, want);
     }
 
     #[test]
-    fn the_short_block_replaces_the_authority_literal() {
-        let authority = "127.0.0.1:8080";
-        let blocks = encode_request("GET", "http", authority, "/", &[], 0);
-        // The first block spells the authority out and asks the peer to keep it
-        assert_eq!(
-            blocks.first[2],
-            0x40 | 1,
-            "literal with incremental indexing"
+    fn a_body_adds_content_length() {
+        let block = encode_request("POST", "https", "h", "/", &[], 1234);
+        assert!(
+            block.windows(4).any(|w| w == b"1234"),
+            "content-length is spelled out"
         );
-        assert_eq!(&blocks.first[4..4 + authority.len()], authority.as_bytes());
-        // The short one is a single reference to the entry that created
-        assert_eq!(blocks.indexed[2], 0x80 | 62);
-        assert_eq!(
-            blocks.first.len() - blocks.indexed.len(),
-            authority.len() + 1,
-            "the literal's length byte and text are what goes away"
-        );
-        assert_eq!(blocks.entry_size, (10 + authority.len() + 32) as u32);
-    }
-
-    #[test]
-    fn a_body_adds_content_length_to_both_blocks() {
-        let blocks = encode_request("POST", "https", "h", "/", &[], 1234);
-        for block in [&blocks.first, &blocks.indexed] {
-            assert!(
-                block.windows(4).any(|w| w == b"1234"),
-                "content-length is spelled out"
-            );
-        }
-    }
-
-    /// The representations from RFC 7541 Section 6, asserted as bytes, so the
-    /// encoders are pinned to the spec and not just to this file's decoder
-    #[test]
-    fn representations_match_the_spec() {
-        // 6.1 indexed header field: 1 then a 7-bit index
-        assert_eq!(0x82, 0b1000_0000 | 2, ":method GET is index 2");
-        // 6.2.1 literal with incremental indexing: 01 then a 6-bit name index
-        let mut out = Vec::new();
-        literal_indexing(&mut out, 1, b"ab");
-        assert_eq!(out, [0b0100_0001, 0b0000_0010, b'a', b'b']);
-        // 6.2.2 literal without indexing: 0000 then a 4-bit name index
-        let mut out = Vec::new();
-        literal_indexed_name(&mut out, 4, b"c");
-        assert_eq!(out, [0b0000_0100, 0b0000_0001, b'c']);
-        // ... and with the name spelled out, the index field is zero
-        let mut out = Vec::new();
-        literal(&mut out, b"ab", b"c");
-        assert_eq!(
-            out,
-            [0b0000_0000, 0b0000_0010, b'a', b'b', 0b0000_0001, b'c']
-        );
-        // A name index too large for the 4-bit prefix continues
-        let mut out = Vec::new();
-        literal_indexed_name(&mut out, 28, b"1");
-        assert_eq!(out, [0b0000_1111, 28 - 15, 0b0000_0001, b'1']);
     }
 
     #[test]
