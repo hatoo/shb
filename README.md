@@ -207,10 +207,10 @@ threads for every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **993,170** | 856,476 | 796,238 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **932,839** | — | 885,527 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,255,321** | — | 1,205,942 |
-| HTTP/3 | 32 conns × 32 streams | **1,967,413** | — | 1,395,173 |
+| HTTP/1.1 | 1000 connections | **1,043,685** | 915,864 | 828,703 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **931,124** | — | 909,564 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,252,889** | — | 1,199,664 |
+| HTTP/3 | 32 conns × 32 streams | **1,938,777** | — | 1,430,755 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -221,18 +221,18 @@ $ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 16 % over wrk and 25 % over h2load. Its
+**On HTTP/1.1 shb is ahead of both** — 14 % over wrk and 26 % over h2load. Its
 response path is a boundary scanner rather than a parser (see
 [How it works](#how-it-works)), which is worth ~10 % on its own. The three land
-much closer together at low connection counts, where the ceiling is a round
-trip rather than the client: at 64 connections it is 476k / 458k / 425k.
+closer together at low connection counts, where the ceiling is a round trip
+rather than the client: at 64 connections it is 503k / 462k / 433k.
 
-**On HTTP/2 shb is 5 % ahead** at 32 × 32 and 4 % at 100 × 100. Like the
+**On HTTP/2 shb is 2 % ahead** at 32 × 32 and 4 % at 100 × 100. Like the
 HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
 `:status` with every other field measured and skipped.
 
-**On HTTP/3 shb is 41 % ahead**, and 48 % at 16 × 128. Two things get it
+**On HTTP/3 shb is 36 % ahead**, and 66 % at 16 × 128. Two things get it
 there: QPACK, where a profile of a saturated worker used to spend 47 % of its
 time Huffman-decoding response header values that the scanner now steps over,
 and turning the QUIC state machine once per batch of datagrams rather than
