@@ -385,7 +385,7 @@ every push, and with enough requests to exercise connection reuse rather than
 just the first exchange.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
-one request to each of 73 public endpoints over all three protocols and reports
+one request to each of 80 public endpoints over all three protocols and reports
 whether the exchange completed. It runs weekly rather than on every push: it
 depends on other people's servers, and on the network. Any HTTP status counts
 as a pass, since a 403 from a server that blocks unknown clients still means
@@ -398,9 +398,10 @@ bugs is a different stack. HTTP/3 is where that matters most — quicly, ngtcp2,
 picoquic, aioquic, quic-go, quiche, msquic, mvfst, lsquic, nginx, HAProxy,
 Caddy and Google's QUICHE are thirteen separate QUIC implementations, several
 of them run by the people who wrote the specification. HTTP/2 covers nghttp2,
-H2O, Apache httpd, Traffic Server, Jetty, Hypercorn, Proxygen, Caddy, HAProxy
-and the large CDN edges; HTTP/1.1 adds cleartext, origins whose ALPN offers
-only `http/1.1`, and one that offers no ALPN at all.
+H2O, Apache httpd, Traffic Server, Jetty, Hypercorn, Proxygen, Caddy, HAProxy,
+Tengine, OpenResty and the large CDN edges, plus a gRPC endpoint for the
+trailers a plain GET never produces; HTTP/1.1 adds cleartext, origins whose
+ALPN offers only `http/1.1`, and one that offers no ALPN at all.
 
 That breadth is what finds bugs. Widening this list is what caught an HTTP/3
 connection being torn down by an ICMP reply to our own MTU probe, and a 103
@@ -409,7 +410,7 @@ wrong Huffman table entry and a TLS buffer limit. None of them could be
 reproduced against a local server.
 
 Servers that were probed and simply worked are recorded in a `KNOWN_GOOD` list
-in the same script rather than run — 278 more endpoints, most of them behind a
+in the same script rather than run — 290 more endpoints, most of them behind a
 CDN already represented above. `EXTRA=1 scripts/interop.sh` includes them. It
 is a list of servers shb is known to work with, and any line can be promoted
 the day it stops passing.

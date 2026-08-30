@@ -42,7 +42,10 @@ if [ ! -x "$SHB" ]; then
     exit 2
 fi
 
-# protocol | url | what is known to be serving it
+# protocol | url | what is known to be serving it | extra shb arguments
+#
+# The fourth field is optional. It exists because some response shapes cannot
+# be reached with a plain GET - HTTP/2 trailers, for one.
 ENDPOINTS=$(cat <<'EOF'
 h1|http://example.com/|ICANN, cleartext
 h1|https://example.com/|ICANN
@@ -69,6 +72,8 @@ h1|https://www.twitch.tv/|Twitch
 h1|https://vercel.com/|Vercel
 h1|https://prometheus.io/|Netlify
 h1|https://gcore.com/|Gcore
+h1|https://www.taobao.com/|Tengine, Alibaba's fork of nginx
+h1|https://openresty.org/|OpenResty Edge
 h1|https://www.kernel.org/|kernel.org
 h1|https://www.debian.org/|Debian
 h1|https://www.sakura.ad.jp/|an origin whose ALPN offers only http/1.1
@@ -97,6 +102,9 @@ h2|https://www.twitch.tv/|Twitch, which should agree with the HTTP/3 result
 h2|https://vercel.com/|Vercel
 h2|https://prometheus.io/|Netlify
 h2|https://gcore.com/|Gcore
+h2|https://www.taobao.com/|Tengine, Alibaba's fork of nginx
+h2|https://openresty.org/|OpenResty Edge
+h2|https://grpcb.in/hello.HelloService/SayHello|gRPC: the one server here that sends HTTP/2 trailers, which v0.2.3 could not read|-m POST -H 'content-type: application/grpc' -H 'te: trailers' -d x
 h3|https://cloudflare-quic.com/|Cloudflare quiche, an HTTP/3 test endpoint
 h3|https://quic.nginx.org/|nginx QUIC, an HTTP/3 test endpoint
 h3|https://h2o.examp1e.net/|quicly, H2O's own QUIC
@@ -116,6 +124,8 @@ h3|https://www.fastly.com/|Fastly
 h3|https://www.adobe.com/|Akamai
 h3|https://prometheus.io/|Netlify
 h3|https://gcore.com/|Gcore
+h3|https://www.taobao.com/|XQUIC, Alibaba's own QUIC
+h3|https://openresty.org/|OpenResty Edge
 h3|https://www.twitch.tv/|Twitch, which answers with a 103 Early Hints first
 EOF
 )
@@ -137,6 +147,21 @@ EOF
 # for HTTP/2 and for an Alt-Svc advertisement for HTTP/3, and was the server's
 # doing rather than ours.
 KNOWN_GOOD=$(cat <<'EOF'
+h1|https://grpcb.in/|gRPC test server
+h2|https://grpcb.in/|gRPC test server
+h1|https://grpc.io/|gRPC
+h2|https://grpc.io/|gRPC
+h3|https://grpc.io/|gRPC
+h1|https://www.tmall.com/|Tmall, Tengine
+h2|https://www.tmall.com/|Tmall, Tengine
+h3|https://www.tmall.com/|Tmall, Tengine
+h1|https://www.iis.net/|Microsoft IIS
+h2|https://www.iis.net/|Microsoft IIS
+h1|https://www.jetbrains.com/|JetBrains
+h2|https://www.jetbrains.com/|JetBrains
+h3|https://www.jetbrains.com/|JetBrains
+h1|https://www.redhat.com/|Red Hat, Akamai
+h2|https://www.redhat.com/|Red Hat, Akamai
 h1|https://quic.tech:8443/|Cloudflare quiche
 h2|https://quic.tech:8443/|Cloudflare quiche
 h3|https://quic.tech:8443/|Cloudflare quiche
@@ -232,9 +257,6 @@ h2|https://ya.ru/|Yandex
 h3|https://ya.ru/|Yandex
 h1|https://www.naver.com/|Naver
 h2|https://www.naver.com/|Naver
-h1|https://www.taobao.com/|Alibaba
-h2|https://www.taobao.com/|Alibaba
-h3|https://www.taobao.com/|Alibaba
 h1|https://www.aliexpress.com/|Alibaba
 h2|https://www.aliexpress.com/|Alibaba
 h3|https://www.aliexpress.com/|Alibaba
@@ -439,8 +461,10 @@ failures=()
 printf '%-4s %-38s %-9s %s\n' PROTO ENDPOINT RESULT NOTE
 printf '%-4s %-38s %-9s %s\n' ---- -------------------------------------- --------- ----
 
-while IFS='|' read -r proto url note; do
+while IFS='|' read -r proto url note extra; do
     [ -z "$proto" ] && continue
+    extra_args=()
+    [ -n "${extra:-}" ] && eval "extra_args=($extra)"
     if [ "$FILTER" != "all" ] && [ "$FILTER" != "$proto" ]; then
         skipped=$((skipped + 1))
         continue
@@ -452,7 +476,8 @@ while IFS='|' read -r proto url note; do
     # weekly run that cries wolf gets ignored. A protocol bug fails twice.
     for attempt in 1 2; do
         out=$(timeout 40 "$SHB" $(flag_for "$proto") \
-            -c 1 -t 1 -n 1 --connect-timeout 10s -j "$url" 2>"$err")
+            -c 1 -t 1 -n 1 --connect-timeout 10s \
+            ${extra_args[@]+"${extra_args[@]}"} -j "$url" 2>"$err")
 
         if [ -n "$out" ] && [ "${out:0:1}" = "{" ]; then
             ok=$(printf '%s' "$out" | jq -r '.requests.ok')
