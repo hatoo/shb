@@ -345,11 +345,13 @@ fn push_front_send(
             state.msg.msg_iov = &mut state.iov;
             state.msg.msg_iovlen = 1;
             state.msg.msg_control = state.cmsg.as_mut_ptr() as *mut libc::c_void;
-            state.msg.msg_controllen = libc::CMSG_SPACE(2) as usize;
+            // These two are size_t against glibc and socklen_t against musl,
+            // so the cast has to be inferred rather than named
+            state.msg.msg_controllen = libc::CMSG_SPACE(2) as _;
             let cmsg = libc::CMSG_FIRSTHDR(&state.msg);
             (*cmsg).cmsg_level = libc::SOL_UDP;
             (*cmsg).cmsg_type = UDP_SEGMENT;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(2) as usize;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(2) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut u16, front.segment_size as u16);
             let entry = io_uring::opcode::SendMsg::new(
                 io_uring::types::Fixed(conn_idx as u32),

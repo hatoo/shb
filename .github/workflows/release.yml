@@ -8,6 +8,12 @@ on:
 
 # Builds on every push and PR so a broken cross-compile shows up long before a
 # tag is cut; the binaries are only attached to a release on a v* tag.
+#
+# The targets are musl, statically linked, so one binary runs whatever glibc
+# the machine has - a dynamically linked build made against the runner's glibc
+# refuses to start on anything older. That costs nothing only because shb
+# replaces musl's allocator: left alone it doubles userspace CPU per request
+# and takes 36% off HTTP/3 throughput. See the mimalloc feature in Cargo.toml.
 jobs:
   build:
     name: Build ${{ matrix.release_name }}
@@ -20,10 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             release_name: shb-linux-amd64
             use_cross: false
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             release_name: shb-linux-arm64
             use_cross: true
     env:
@@ -35,6 +41,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # ring and mimalloc both compile C, so the musl target needs a musl C
+      # compiler. cross carries its own, so this is only for the native build.
+      - name: Install the musl C toolchain
+        if: ${{ !matrix.use_cross }}
+        run: sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Install cross
         if: matrix.use_cross

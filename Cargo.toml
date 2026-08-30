@@ -25,6 +25,7 @@ humantime = "2.4.0"
 io-uring = "0.7.14"
 libc = "0.2"
 memchr = "2.8.3"
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
 num_cpus = "1.17.0"
 quinn-proto = { version = "0.11.17", default-features = false, features = ["rustls-ring"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
@@ -48,3 +49,10 @@ inherits = "release"
 lto = true
 codegen-units = 1
 strip = true
+
+[features]
+# On by default because it is what makes a musl build worth having: musl's own
+# allocator doubles shb's userspace CPU per request, which costs 36% of HTTP/3
+# throughput. --no-default-features falls back to whatever the platform gives.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]

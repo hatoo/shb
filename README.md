@@ -56,6 +56,19 @@ $ cargo build --release
 $ ./target/release/shb --help
 ```
 
+The [releases](https://github.com/hatoo/shb/releases) also carry prebuilt
+`x86_64` and `aarch64` binaries. They are statically linked against musl, so
+one binary runs whatever glibc the machine has rather than refusing to start on
+anything older than the build machine's.
+
+Every build, released or not, replaces the system allocator with
+[mimalloc](https://github.com/microsoft/mimalloc). That is what makes a musl
+build worth having: musl's own allocator costs twice the userspace CPU per
+request, which is 36 % of HTTP/3 throughput and 4 % of HTTP/2's — HTTP/1.1 does
+not notice, since it spends 98 % of its time in the kernel. On glibc it
+measures as no change in either direction. `cargo install shb
+--no-default-features` opts out and uses the platform's allocator.
+
 ## Usage
 
 ```console
