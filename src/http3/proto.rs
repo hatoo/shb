@@ -314,6 +314,24 @@ mod tests {
         assert_eq!(&out[3..5], &[0x01, 0x00]);
     }
 
+    /// The request framing from RFC 9114 Section 7.2, asserted as bytes
+    #[test]
+    fn request_framing_matches_the_spec() {
+        // HEADERS (type 0x01) carrying the field section, and nothing else
+        // when there is no body
+        assert_eq!(request_bytes(&[0xaa, 0xbb], b""), [0x01, 0x02, 0xaa, 0xbb]);
+        // With a body, a DATA frame (type 0x00) follows
+        assert_eq!(
+            request_bytes(&[0xaa], b"hi"),
+            [0x01, 0x01, 0xaa, 0x00, 0x02, b'h', b'i']
+        );
+        // A field section too long for a one-byte varint length
+        let big = vec![0u8; 100];
+        let out = request_bytes(&big, b"");
+        assert_eq!(&out[..3], &[0x01, 0x40, 100], "two-byte varint length");
+        assert_eq!(out.len(), 3 + 100);
+    }
+
     #[test]
     fn headers_then_data_yields_the_status() {
         let mut r = ResponseReader::default();

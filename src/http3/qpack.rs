@@ -342,6 +342,36 @@ mod tests {
         assert_eq!(*block.last().unwrap(), 0xc0 | 1, ":path /");
     }
 
+    /// The field-line representations from RFC 9204 Section 4.5, asserted as
+    /// bytes. Without this the encoders are only ever checked against this
+    /// file's own decoder, which is how the Huffman table stayed wrong.
+    #[test]
+    fn representations_match_the_spec() {
+        // 4.5.2 indexed field line: 1, T=1 for the static table, 6-bit index
+        let mut out = Vec::new();
+        indexed(&mut out, 17);
+        assert_eq!(out, [0b1100_0000 | 17]);
+        // an index that does not fit the prefix continues into another octet
+        let mut out = Vec::new();
+        indexed(&mut out, 69);
+        assert_eq!(out, [0b1111_1111, 69 - 63]);
+
+        // 4.5.4 literal with a name reference: 01, N=0, T=1, 4-bit index
+        let mut out = Vec::new();
+        literal_named(&mut out, 4, b"12");
+        assert_eq!(out, [0b0101_0100, 0b0000_0010, b'1', b'2']);
+
+        // 4.5.6 literal with a literal name: 001, N=0, H=0, 3-bit name length
+        let mut out = Vec::new();
+        literal(&mut out, b"ab", b"c");
+        assert_eq!(out, [0b0010_0010, b'a', b'b', 0b0000_0001, b'c']);
+
+        // 4.5.1 field section prefix: both parts zero, since nothing here
+        // references the dynamic table
+        let block = encode_request("GET", "https", "h", "/", &[], 0);
+        assert_eq!(&block[..2], &[0x00, 0x00]);
+    }
+
     #[test]
     fn indexed_status_is_read() {
         assert_eq!(find_status(&section(&[0xc0 | 25])).unwrap(), 200);

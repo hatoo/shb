@@ -392,6 +392,33 @@ mod tests {
         }
     }
 
+    /// The representations from RFC 7541 Section 6, asserted as bytes, so the
+    /// encoders are pinned to the spec and not just to this file's decoder
+    #[test]
+    fn representations_match_the_spec() {
+        // 6.1 indexed header field: 1 then a 7-bit index
+        assert_eq!(0x82, 0b1000_0000 | 2, ":method GET is index 2");
+        // 6.2.1 literal with incremental indexing: 01 then a 6-bit name index
+        let mut out = Vec::new();
+        literal_indexing(&mut out, 1, b"ab");
+        assert_eq!(out, [0b0100_0001, 0b0000_0010, b'a', b'b']);
+        // 6.2.2 literal without indexing: 0000 then a 4-bit name index
+        let mut out = Vec::new();
+        literal_indexed_name(&mut out, 4, b"c");
+        assert_eq!(out, [0b0000_0100, 0b0000_0001, b'c']);
+        // ... and with the name spelled out, the index field is zero
+        let mut out = Vec::new();
+        literal(&mut out, b"ab", b"c");
+        assert_eq!(
+            out,
+            [0b0000_0000, 0b0000_0010, b'a', b'b', 0b0000_0001, b'c']
+        );
+        // A name index too large for the 4-bit prefix continues
+        let mut out = Vec::new();
+        literal_indexed_name(&mut out, 28, b"1");
+        assert_eq!(out, [0b0000_1111, 28 - 15, 0b0000_0001, b'1']);
+    }
+
     #[test]
     fn indexed_status_is_read() {
         assert_eq!(find_status(&[0x88]).unwrap(), 200);

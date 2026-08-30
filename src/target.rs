@@ -260,6 +260,14 @@ mod tests {
         );
     }
 
+    /// The error text of a rejected URL
+    fn err_for_url(url: &str) -> String {
+        match parse_target(url, "GET", &[], None, false) {
+            Ok(_) => panic!("{url} should have been rejected"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     /// The error text of a rejected target
     fn err_for(method: &str, header_args: &[&str]) -> String {
         let headers: Vec<String> = header_args.iter().map(|s| s.to_string()).collect();
@@ -267,6 +275,106 @@ mod tests {
             Ok(_) => panic!("expected a rejection"),
             Err(e) => e.to_string(),
         }
+    }
+
+    fn target(url: &str) -> Target {
+        match parse_target(url, "GET", &[], None, false) {
+            Ok(t) => t,
+            Err(e) => panic!("{url}: {e}"),
+        }
+    }
+
+    /// Only addresses that resolve without DNS, so the test does not depend on
+    /// the network
+    #[test]
+    fn ports_come_from_the_url_or_the_scheme() {
+        for (url, port) in [
+            ("http://127.0.0.1/", 80u16),
+            ("https://127.0.0.1/", 443),
+            ("http://127.0.0.1:8080/", 8080),
+            ("https://127.0.0.1:8080/", 8080),
+        ] {
+            assert_eq!(target(url).addr.port(), port, "{url}");
+        }
+    }
+
+    /// A colon inside an IPv6 literal is not a port separator; only the
+    /// `[::1]:8080` form has one
+    #[test]
+    fn ipv6_literals_keep_their_colons() {
+        let t = target("http://[::1]/");
+        assert_eq!(t.addr.port(), 80);
+        assert_eq!(t.host, "::1", "the SNI name drops the brackets");
+        assert_eq!(t.authority, "[::1]", "the Host header keeps them");
+
+        let t = target("http://[::1]:8080/");
+        assert_eq!(t.addr.port(), 8080);
+        assert_eq!(t.host, "::1");
+        assert_eq!(t.authority, "[::1]:8080");
+    }
+
+    #[test]
+    fn the_path_defaults_to_root_and_keeps_its_query() {
+        assert_eq!(target("http://127.0.0.1:8080").path, "/");
+        assert_eq!(target("http://127.0.0.1:8080/").path, "/");
+        assert_eq!(
+            target("http://127.0.0.1:8080/a/b?c=1&d=2").path,
+            "/a/b?c=1&d=2"
+        );
+    }
+
+    #[test]
+    fn the_scheme_decides_tls() {
+        assert!(!target("http://127.0.0.1/").tls);
+        assert!(target("https://127.0.0.1/").tls);
+        let err = err_for_url("ftp://127.0.0.1/");
+        assert!(err.contains("http"), "{err}");
+    }
+
+    /// Like curl, `-H "Host: ..."` changes what is sent, not where the
+    /// connection goes
+    #[test]
+    fn a_host_override_does_not_move_the_connection() {
+        let headers = vec!["Host: example.com".to_string()];
+        let t =
+            parse_target("http://127.0.0.1:8080/", "GET", &headers, None, false).expect("parse");
+        assert_eq!(t.addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(t.authority, "example.com");
+        assert!(
+            String::from_utf8_lossy(&t.request_bytes).contains("Host: example.com\r\n"),
+            "the override is what goes on the wire"
+        );
+        assert!(
+            !t.headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("host")),
+            "and it is not repeated as a normal header"
+        );
+    }
+
+    #[test]
+    fn a_bad_port_or_missing_host_is_rejected() {
+        for url in [
+            "http://127.0.0.1:70000/",
+            "http://127.0.0.1:x/",
+            "http:///path",
+        ] {
+            err_for_url(url);
+        }
+    }
+
+    #[test]
+    fn disable_keepalive_adds_connection_close_once() {
+        let t = parse_target("http://127.0.0.1:8080/", "GET", &[], None, true).expect("parse");
+        let req = String::from_utf8(t.request_bytes).unwrap();
+        assert_eq!(req.matches("Connection: close").count(), 1);
+
+        // A Connection header the caller wrote themselves is left alone
+        let headers = vec!["Connection: keep-alive".to_string()];
+        let t = parse_target("http://127.0.0.1:8080/", "GET", &headers, None, true).expect("parse");
+        let req = String::from_utf8(t.request_bytes).unwrap();
+        assert!(req.contains("Connection: keep-alive"), "{req:?}");
+        assert!(!req.contains("Connection: close"), "{req:?}");
     }
 
     #[test]

@@ -449,6 +449,44 @@ mod tests {
         assert_eq!(&settings[9..15], &[0, 1, 0, 0, 0, 0]);
     }
 
+    /// The frame header from RFC 9113 Section 4.1, asserted as bytes: a
+    /// 24-bit length, the type, the flags, then a 31-bit stream id
+    #[test]
+    fn frame_headers_match_the_spec() {
+        let mut c = connected();
+        c.take_output();
+        c.frame_header(0x010203, 0x7f, 0x2a, 0x0102_0304);
+        assert_eq!(
+            c.take_output().unwrap(),
+            [0x01, 0x02, 0x03, 0x7f, 0x2a, 0x01, 0x02, 0x03, 0x04]
+        );
+
+        // A request is one HEADERS frame carrying the block, ending the stream
+        let mut c = connected();
+        let blocks = RequestBlocks {
+            first: vec![0x82, 0x86],
+            indexed: vec![0x82],
+            entry_size: 46,
+        };
+        assert_eq!(c.start_stream(&blocks, b""), Some(1));
+        assert_eq!(
+            c.take_output().unwrap(),
+            [
+                0,
+                0,
+                2,
+                HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                0,
+                0,
+                0,
+                1,
+                0x82,
+                0x86
+            ]
+        );
+    }
+
     #[test]
     fn stream_ids_are_odd_and_ascending() {
         let mut c = connected();
