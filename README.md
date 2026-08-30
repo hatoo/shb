@@ -371,6 +371,18 @@ The end-to-end tests start real servers — axum for HTTP/1.1 and h2c, and
 quinn + h3 with a self-signed certificate for HTTP/3 — run the compiled binary
 against them, and assert on its JSON report.
 
+```console
+$ scripts/interop.sh          # or: scripts/interop.sh h3
+```
+
+Local servers only exercise what they happen to do. `scripts/interop.sh` sends
+one request to each of ~50 public endpoints — Cloudflare, Google, Meta,
+Fastly, Akamai, LiteSpeed, nginx, Caddy, HAProxy and others — over all three
+protocols, and reports whether the exchange completed. It is deliberately not
+part of `cargo test`: it depends on other people's servers, and on the network.
+Any HTTP status counts as a pass, since a 403 from a server that blocks unknown
+clients still means the framing, header coding and TLS all worked.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
