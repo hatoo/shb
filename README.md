@@ -372,23 +372,32 @@ quinn + h3 with a self-signed certificate for HTTP/3 — run the compiled binary
 against them, and assert on its JSON report.
 
 ```console
-$ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy in containers
+$ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy, ... in containers
 $ scripts/interop.sh          # or: scripts/interop.sh h3
 ```
 
-`scripts/docker-interop.sh` starts the major HTTP servers in containers and
-sends one request to each over every protocol it speaks — 23 combinations,
-including cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's
-own, quic-go and quiche). Those are servers we start ourselves, so it runs in
-CI.
+`scripts/docker-interop.sh` starts nine HTTP servers in containers — nginx,
+Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat and OpenLiteSpeed — and
+loads each over every protocol it speaks, 35 combinations in all, including
+cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's own,
+quic-go and quiche). Those are servers we start ourselves, so it runs in CI on
+every push, and with enough requests to exercise connection reuse rather than
+just the first exchange.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
-one request to each of ~50 public endpoints — Cloudflare, Google, Meta,
-Fastly, Akamai, LiteSpeed, nginx, Caddy, HAProxy and others — over all three
-protocols, and reports whether the exchange completed. It is deliberately not
-part of `cargo test`: it depends on other people's servers, and on the network.
+one request to each of 152 public endpoints — Cloudflare, Google, Meta, Fastly,
+Akamai, Microsoft, LiteSpeed, nginx, Caddy, HAProxy and others — over all three
+protocols, and reports whether the exchange completed. It runs weekly rather
+than on every push: it depends on other people's servers, and on the network.
 Any HTTP status counts as a pass, since a 403 from a server that blocks unknown
-clients still means the framing, header coding and TLS all worked.
+clients still means the framing, header coding and TLS all worked — with one
+exception, a 1xx, which means we stopped reading before the real response.
+
+That breadth is what finds bugs. Widening this list is what caught an HTTP/3
+connection being torn down by an ICMP reply to our own MTU probe, and a 103
+Early Hints being recorded as the response status; an earlier round caught a
+wrong Huffman table entry and a TLS buffer limit. None of them could be
+reproduced against a local server.
 
 ## License
 
