@@ -270,6 +270,35 @@ mod tests {
         }
     }
 
+    /// The worked examples from RFC 9000 Appendix A.1, so the codec is checked
+    /// against the spec rather than against itself
+    #[test]
+    fn varints_match_the_spec() {
+        let cases: [(&[u8], u64); 5] = [
+            (
+                &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c],
+                151_288_809_941_952_652,
+            ),
+            (&[0x9d, 0x7f, 0x3e, 0x7d], 494_878_333),
+            (&[0x7b, 0xbd], 15_293),
+            (&[0x25], 37),
+            // The spec's example of 37 in the two-byte form; a decoder has to
+            // accept a non-minimal encoding
+            (&[0x40, 0x25], 37),
+        ];
+        for (bytes, value) in cases {
+            assert_eq!(
+                get_varint(bytes),
+                Some((value, bytes.len())),
+                "{bytes:02x?}"
+            );
+        }
+        // Our encoder always picks the shortest form
+        for (bytes, value) in cases.iter().take(4) {
+            assert_eq!(&varint(*value), bytes, "encoding {value}");
+        }
+    }
+
     #[test]
     fn a_truncated_varint_is_incomplete() {
         let encoded = varint(16384);

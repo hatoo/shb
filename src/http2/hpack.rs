@@ -320,6 +320,35 @@ mod tests {
         }
     }
 
+    /// The worked examples from RFC 7541 Appendix C.1, so the integer codec is
+    /// checked against the spec rather than against itself. QPACK reuses this
+    /// encoding unchanged.
+    #[test]
+    fn integers_match_the_spec() {
+        // C.1.1: 10 in a 5-bit prefix fits in the prefix
+        let mut out = Vec::new();
+        encode_int(&mut out, 5, 0, 10);
+        assert_eq!(out, [0x0a]);
+        // C.1.2: 1337 in a 5-bit prefix spills into continuation octets
+        let mut out = Vec::new();
+        encode_int(&mut out, 5, 0, 1337);
+        assert_eq!(out, [0x1f, 0x9a, 0x0a]);
+        // C.1.3: 42 in an 8-bit prefix
+        let mut out = Vec::new();
+        encode_int(&mut out, 8, 0, 42);
+        assert_eq!(out, [0x2a]);
+
+        for (bytes, prefix, value) in [
+            (&[0x0a][..], 5u8, 10u32),
+            (&[0x1f, 0x9a, 0x0a], 5, 1337),
+            (&[0x2a], 8, 42),
+        ] {
+            let mut pos = 0;
+            assert_eq!(decode_int(bytes, &mut pos, prefix).unwrap(), value);
+            assert_eq!(pos, bytes.len());
+        }
+    }
+
     #[test]
     fn get_request_uses_static_entries() {
         let blocks = encode_request("GET", "http", "127.0.0.1:80", "/", &[], 0);
