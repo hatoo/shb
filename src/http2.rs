@@ -24,9 +24,9 @@ use io_uring::{Submitter, cqueue, squeue, types};
 
 /// Build the HPACK block sent for every request on every connection
 ///
-/// It is encoded once and then memcpy'd per request; nothing in it depends on
-/// the stream or the connection.
-fn build_header_block(target: &Target) -> Vec<u8> {
+/// They are encoded once and then memcpy'd per request; nothing in them
+/// depends on the stream or the connection.
+fn build_header_block(target: &Target) -> hpack::RequestBlocks {
     let headers: Vec<(String, String)> = target
         .headers
         .iter()
@@ -128,7 +128,7 @@ impl Conn {
 /// completions.
 fn fill_streams(
     conn: &mut Conn,
-    header_block: &[u8],
+    header_block: &hpack::RequestBlocks,
     body: &[u8],
     parallel: usize,
     started: &mut u64,
