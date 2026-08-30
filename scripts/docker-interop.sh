@@ -36,7 +36,7 @@ set -uo pipefail
 SHB=${SHB:-./target/release/shb}
 # Our own servers, so this is a real if small amount of load rather than one
 # request; it covers connection reuse, which one request cannot
-CONNECTIONS=${CONNECTIONS:-50}
+CONNECTIONS=${CONNECTIONS:-10}
 REQUESTS=${REQUESTS:-200}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 

@@ -390,8 +390,12 @@ frames, and an nginx configured to take the connection away on the fifth
 request — GOAWAY on HTTP/2 and HTTP/3, `Connection: close` on HTTP/1.1. Both
 were checked to actually happen: two CONTINUATION frames arrive, and ten
 GOAWAYs for ten connections. Those are servers we start ourselves, so it runs in CI on
-every push, and with enough requests to exercise connection reuse rather than
-just the first exchange.
+every push, with 200 requests over 10 connections — enough to exercise
+connection reuse rather than just the first exchange, and low enough that the
+run measures protocol correctness rather than how much load each server can
+take. That distinction has teeth: aioquic is a QUIC implementation written in
+Python, and 50 concurrent handshakes cost it eight seconds where nginx needs
+fifty milliseconds.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
 one request to each of 82 public endpoints over all three protocols and reports
