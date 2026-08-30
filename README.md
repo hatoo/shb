@@ -378,11 +378,15 @@ $ scripts/interop.sh          # or: scripts/interop.sh h3
 
 `scripts/docker-interop.sh` starts nine HTTP servers in containers — nginx,
 Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat and OpenLiteSpeed — and
-loads each over every protocol it speaks, 40 combinations in all, including
-cleartext h2c, HTTP/3 against three separate QUIC stacks (nginx's own, quic-go
-and quiche), and a response carrying 48 KB of headers — three times the default
-HTTP/2 frame size, so the server has to split the block across CONTINUATION
-frames. Those are servers we start ourselves, so it runs in CI on
+loads each over every protocol it speaks, 46 combinations in all, including
+cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's own,
+quic-go and quiche). Six of them exist to reach paths a well-behaved page-sized
+response never does: a reply carrying 48 KB of headers, which is three times
+the default HTTP/2 frame size and so has to be split across CONTINUATION
+frames, and an nginx configured to take the connection away on the fifth
+request — GOAWAY on HTTP/2 and HTTP/3, `Connection: close` on HTTP/1.1. Both
+were checked to actually happen: two CONTINUATION frames arrive, and ten
+GOAWAYs for ten connections. Those are servers we start ourselves, so it runs in CI on
 every push, and with enough requests to exercise connection reuse rather than
 just the first exchange.
 

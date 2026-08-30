@@ -13,7 +13,12 @@
 # returns the same body behind 48 KB of response headers: that is three times
 # the default HTTP/2 frame size, so the server has to split the block across
 # CONTINUATION frames, a path no page-sized response reaches and one that only
-# a server we configure ourselves will produce on demand. These are our own containers, so the load
+# a server we configure ourselves will produce on demand. Ports 18090 and 18450
+# are the same nginx with keepalive_requests 5, which makes it take the
+# connection away part way through the run - GOAWAY on HTTP/2 and HTTP/3,
+# Connection: close on HTTP/1.1 - so the run only finishes if reconnecting
+# works. Both were verified to happen rather than assumed: two CONTINUATION
+# frames arrive, and ten GOAWAYs for ten connections. These are our own containers, so the load
 # is real rather than a single request: 200 requests over 50 connections
 # exercises connection reuse and concurrency, not just the first exchange.
 #
@@ -51,6 +56,12 @@ nginx|h2|http://127.0.0.1:18080/bigheaders|the same block, split across CONTINUA
 nginx|h1|https://127.0.0.1:18443/bigheaders|48 KB of headers over TLS
 nginx|h2|https://127.0.0.1:18443/bigheaders|CONTINUATION over TLS
 nginx|h3|https://127.0.0.1:18443/bigheaders|a QPACK field section spanning several reads
+nginx|h1|http://127.0.0.1:18080/noreuse|Connection: close on every response
+nginx|h1|http://127.0.0.1:18090/|Connection: close on the fifth request
+nginx|h2|http://127.0.0.1:18090/|GOAWAY on the fifth request
+nginx|h1|https://127.0.0.1:18450/|Connection: close on the fifth request, TLS
+nginx|h2|https://127.0.0.1:18450/|GOAWAY on the fifth request, TLS
+nginx|h3|https://127.0.0.1:18450/|GOAWAY on the fifth request, over QUIC
 caddy|h1|http://127.0.0.1:18081/|cleartext
 caddy|h2|http://127.0.0.1:18081/|cleartext h2c, prior knowledge
 caddy|h1|https://127.0.0.1:18444/|TLS
