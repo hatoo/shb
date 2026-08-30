@@ -12,8 +12,14 @@
 #
 # One request per endpoint, so it is negligible load on someone else's server.
 #
+# An endpoint earns its place here by having caught something. Probing a new
+# server is worth doing often; adding it to this list is worth doing only when
+# it fails, since one that has always passed costs runtime and finds nothing.
+# The ones that passed are recorded in KNOWN_GOOD below rather than run.
+#
 #   scripts/interop.sh              # every endpoint
 #   scripts/interop.sh h3           # only HTTP/3
+#   EXTRA=1 scripts/interop.sh      # and the known-good list as well
 #   SHB=target/dist/shb scripts/interop.sh
 #   VERBOSE=1 scripts/interop.sh    # show shb's stderr for failures
 #
@@ -183,6 +189,127 @@ h3|https://www.atlassian.com/|Atlassian
 h3|https://www.twitch.tv/|Twitch, which answers with a 103 Early Hints first
 EOF
 )
+
+# Checked once, worked, and kept for reference rather than run
+#
+# The list above is what gets exercised. These do not, because a passing
+# endpoint that has never failed costs runtime without adding coverage - what
+# earns a place in the list above is having caught something. They are worth
+# keeping written down: each line records a server we have confirmed shb can
+# talk to, so a future report of "shb does not work with X" has somewhere to
+# start, and any of them can be promoted into the list above the day it fails.
+#
+# Run them with EXTRA=1. Protocols a host does not offer are simply absent:
+# every omission here was checked with `openssl s_client -alpn h2,http/1.1`
+# for HTTP/2 and for an Alt-Svc advertisement for HTTP/3, and was the server's
+# doing rather than ours.
+KNOWN_GOOD=$(cat <<'EOF'
+h1|https://www.baidu.com/|Baidu, HTTP/1.1-only origin
+h1|https://www.qq.com/|Tencent, HTTP/1.1-only origin
+h1|https://www.yandex.ru/|Yandex
+h2|https://www.yandex.ru/|Yandex
+h3|https://www.yandex.ru/|Yandex
+h1|https://ya.ru/|Yandex
+h2|https://ya.ru/|Yandex
+h3|https://ya.ru/|Yandex
+h1|https://www.naver.com/|Naver
+h2|https://www.naver.com/|Naver
+h1|https://www.taobao.com/|Alibaba
+h2|https://www.taobao.com/|Alibaba
+h3|https://www.taobao.com/|Alibaba
+h1|https://www.aliexpress.com/|Alibaba
+h2|https://www.aliexpress.com/|Alibaba
+h3|https://www.aliexpress.com/|Alibaba
+h1|https://weibo.com/|Weibo
+h2|https://weibo.com/|Weibo
+h1|https://vk.com/|VK
+h2|https://vk.com/|VK
+h1|https://mail.ru/|Mail.ru
+h2|https://mail.ru/|Mail.ru
+h1|https://www.shopify.com/|Shopify
+h2|https://www.shopify.com/|Shopify
+h3|https://www.shopify.com/|Shopify
+h1|https://www.squarespace.com/|Squarespace
+h2|https://www.squarespace.com/|Squarespace
+h1|https://s3.amazonaws.com/|AWS S3, HTTP/1.1-only origin
+h1|https://storage.googleapis.com/|Google Cloud Storage
+h2|https://storage.googleapis.com/|Google Cloud Storage
+h3|https://storage.googleapis.com/|Google Cloud Storage
+h1|https://www.gstatic.com/|Google
+h2|https://www.gstatic.com/|Google
+h3|https://www.gstatic.com/|Google
+h1|https://cdn.jsdelivr.net/|jsDelivr
+h2|https://cdn.jsdelivr.net/|jsDelivr
+h3|https://cdn.jsdelivr.net/|jsDelivr
+h1|https://cdnjs.cloudflare.com/|Cloudflare
+h2|https://cdnjs.cloudflare.com/|Cloudflare
+h3|https://cdnjs.cloudflare.com/|Cloudflare
+h1|https://unpkg.com/|unpkg
+h2|https://unpkg.com/|unpkg
+h3|https://unpkg.com/|unpkg
+h1|https://gcore.com/|Gcore
+h2|https://gcore.com/|Gcore
+h3|https://gcore.com/|Gcore
+h1|https://bunny.net/|Bunny
+h2|https://bunny.net/|Bunny
+h1|https://deno.dev/|Deno Deploy
+h2|https://deno.dev/|Deno Deploy
+h1|https://fly.io/|Fly.io, HTTP/1.1-only origin
+h1|https://www.godaddy.com/|GoDaddy
+h2|https://www.godaddy.com/|GoDaddy
+h1|https://api.github.com/|GitHub API
+h2|https://api.github.com/|GitHub API
+h1|https://httpbin.org/|httpbin
+h2|https://httpbin.org/|httpbin
+h1|https://postman-echo.com/|Postman Echo
+h2|https://postman-echo.com/|Postman Echo
+h1|https://www.ietf.org/|IETF
+h2|https://www.ietf.org/|IETF
+h3|https://www.ietf.org/|IETF
+h1|https://datatracker.ietf.org/|IETF
+h2|https://datatracker.ietf.org/|IETF
+h3|https://datatracker.ietf.org/|IETF
+h1|https://www.rfc-editor.org/|RFC Editor
+h2|https://www.rfc-editor.org/|RFC Editor
+h3|https://www.rfc-editor.org/|RFC Editor
+h1|https://www.w3.org/|W3C
+h2|https://www.w3.org/|W3C
+h3|https://www.w3.org/|W3C
+h1|https://www.iana.org/|IANA
+h2|https://www.iana.org/|IANA
+h1|https://www.gov.uk/|UK Government
+h2|https://www.gov.uk/|UK Government
+h3|https://www.gov.uk/|UK Government
+h1|https://www.lighttpd.net/|lighttpd, HTTP/1.1-only origin
+h1|https://nginx.com/|F5 NGINX
+h2|https://nginx.com/|F5 NGINX
+h1|https://www.f5.com/|F5
+h2|https://www.f5.com/|F5
+h1|https://www.mit.edu/|MIT, HTTP/1.1-only origin
+h1|https://www.stanford.edu/|Stanford
+h2|https://www.stanford.edu/|Stanford
+h1|https://www.u-tokyo.ac.jp/|University of Tokyo, offers no ALPN
+h1|https://www.kyoto-u.ac.jp/|Kyoto University
+h2|https://www.kyoto-u.ac.jp/|Kyoto University
+h1|https://www.soumu.go.jp/|MIC Japan, HTTP/1.1-only origin
+h1|https://www.jst.go.jp/|JST, offers no ALPN
+h1|https://europa.eu/|European Union, offers no ALPN
+h1|https://en.wikipedia.org/|Wikimedia ATS
+h2|https://en.wikipedia.org/|Wikimedia ATS
+h1|https://commons.wikimedia.org/|Wikimedia ATS
+h2|https://commons.wikimedia.org/|Wikimedia ATS
+h1|https://www.mediawiki.org/|Wikimedia ATS
+h2|https://www.mediawiki.org/|Wikimedia ATS
+h1|https://about.gitlab.com/|GitLab
+h2|https://about.gitlab.com/|GitLab
+h3|https://about.gitlab.com/|GitLab
+EOF
+)
+
+if [ -n "${EXTRA:-}" ]; then
+    ENDPOINTS="$ENDPOINTS
+$KNOWN_GOOD"
+fi
 
 flag_for() {
     case "$1" in

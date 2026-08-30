@@ -385,7 +385,7 @@ every push, and with enough requests to exercise connection reuse rather than
 just the first exchange.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
-one request to each of 152 public endpoints — Cloudflare, Google, Meta, Fastly,
+one request to each of 151 public endpoints — Cloudflare, Google, Meta, Fastly,
 Akamai, Microsoft, LiteSpeed, nginx, Caddy, HAProxy and others — over all three
 protocols, and reports whether the exchange completed. It runs weekly rather
 than on every push: it depends on other people's servers, and on the network.
@@ -398,6 +398,13 @@ connection being torn down by an ICMP reply to our own MTU probe, and a 103
 Early Hints being recorded as the response status; an earlier round caught a
 wrong Huffman table entry and a TLS buffer limit. None of them could be
 reproduced against a local server.
+
+An endpoint earns its place in that list by having caught something. Probing a
+new server is cheap and worth doing often, but adding one that passes only
+makes the run longer, so the ones that passed are recorded in a `KNOWN_GOOD`
+list in the same script and not run — `EXTRA=1 scripts/interop.sh` includes
+them. It is a list of servers shb is known to work with, and any line in it can
+be promoted the day it stops passing.
 
 ## License
 
