@@ -1,0 +1,15 @@
+{
+	auto_https off
+	servers {
+		protocols h1 h2 h2c h3
+	}
+}
+
+:80 {
+	respond "hello, world!" 200
+}
+
+:443 {
+	tls /conf/cert.pem /conf/key.pem
+	respond "hello, world!" 200
+}

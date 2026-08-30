@@ -372,8 +372,15 @@ quinn + h3 with a self-signed certificate for HTTP/3 — run the compiled binary
 against them, and assert on its JSON report.
 
 ```console
+$ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy in containers
 $ scripts/interop.sh          # or: scripts/interop.sh h3
 ```
+
+`scripts/docker-interop.sh` starts the major HTTP servers in containers and
+sends one request to each over every protocol it speaks — 23 combinations,
+including cleartext h2c and HTTP/3 against three separate QUIC stacks (nginx's
+own, quic-go and quiche). Those are servers we start ourselves, so it runs in
+CI.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
 one request to each of ~50 public endpoints — Cloudflare, Google, Meta,

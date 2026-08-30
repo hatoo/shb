@@ -1,0 +1,31 @@
+# Major HTTP servers, each answering the same 13-byte body on the same paths,
+# so shb can be pointed at them one after another. The certificate is the
+# self-signed one in conf/; shb trusts every certificate, being a benchmarker.
+#
+# Cleartext ports carry HTTP/1.1 and h2c, TLS ports carry HTTP/1.1, HTTP/2 and
+# — where the server has it — HTTP/3 on the same port number over UDP.
+services:
+  nginx:
+    image: nginx:mainline
+    volumes: ["./conf:/conf:ro", "./conf/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["18080:80", "18443:443", "18443:443/udp"]
+
+  caddy:
+    image: caddy:2
+    volumes: ["./conf:/conf:ro", "./conf/Caddyfile:/etc/caddy/Caddyfile:ro"]
+    ports: ["18081:80", "18444:443", "18444:443/udp"]
+
+  haproxy:
+    image: haproxy:3.0
+    volumes: ["./conf:/conf:ro", "./conf/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["18082:80", "18085:81", "18445:443"]
+
+  httpd:
+    image: httpd:2.4
+    volumes: ["./conf:/conf:ro", "./conf/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro"]
+    ports: ["18083:80", "18446:443"]
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    volumes: ["./conf:/conf:ro", "./conf/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
+    ports: ["18084:80", "18447:443", "18447:443/udp"]
