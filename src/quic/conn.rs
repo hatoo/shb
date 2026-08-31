@@ -62,11 +62,14 @@ struct SpaceState {
     largest_received: Option<u64>,
     ack: AckState,
     sent: SentPackets,
-    /// Handshake bytes rustls has produced and we have not put in a packet
+    /// Handshake bytes the peer has not acknowledged, starting at
+    /// `crypto_offset`. Held rather than dropped when sent: until an
+    /// acknowledgement arrives there is no other copy, and a probe timeout
+    /// has to be able to send them again.
     crypto_out: Vec<u8>,
     crypto_offset: u64,
-    /// Offsets of crypto_out that have to be sent again
-    crypto_lost: Vec<(u64, usize)>,
+    /// How much of `crypto_out` has been put in a packet at least once
+    crypto_sent: usize,
 }
 
 pub struct Connection {
@@ -110,6 +113,9 @@ pub struct Connection {
     rtt: Rtt,
     congestion: Congestion,
     pto_count: u32,
+    /// Probe packets owed to the current timeout, counted down as they are
+    /// sent. Without this a probe goes out on every pass rather than once.
+    pto_probes: u32,
     loss_deadline: Option<Instant>,
     idle_deadline: Option<Instant>,
     events: VecDeque<Event>,
@@ -181,6 +187,7 @@ impl Connection {
             rtt: Rtt::default(),
             congestion: Congestion::default(),
             pto_count: 0,
+            pto_probes: 0,
             loss_deadline: None,
             idle_deadline: None,
             events: VecDeque::new(),
@@ -189,8 +196,48 @@ impl Connection {
         })
     }
 
+    /// Drop everything belonging to a packet number space
+    ///
+    /// RFC 9002 Section 6.2 requires the loss detection state to go with the
+    /// keys. Keeping it means the probe timer keeps firing for packets that
+    /// can never be acknowledged, because there are no longer keys to send in
+    /// that space - the count climbs forever and every expiry sends another
+    /// probe in whatever space still can, which floods the peer.
+    fn discard_space(&mut self, space: Space) {
+        let s = &mut self.spaces[space as usize];
+        s.keys = None;
+        s.ack = AckState::default();
+        s.sent = SentPackets::default();
+        s.crypto_out.clear();
+        s.crypto_sent = 0;
+        self.pto_count = 0;
+        self.pto_probes = 0;
+    }
+
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    /// A one-line summary for working out why a connection is not moving
+    pub fn debug_state(&self) -> String {
+        format!(
+            "connected={} h3_streams={} pto={} closed={:?} initial_keys={} hs_keys={} \
+             crypto_out=[{},{},{}] sent=[{},{},{}] max_bidi={} next_bidi={}",
+            self.connected,
+            self.streams.len(),
+            self.pto_count,
+            self.closed.as_deref().unwrap_or("-"),
+            self.spaces[0].keys.is_some(),
+            self.spaces[1].keys.is_some(),
+            self.spaces[0].crypto_out.len(),
+            self.spaces[1].crypto_out.len(),
+            self.spaces[2].crypto_out.len(),
+            self.spaces[0].sent.bytes_in_flight(),
+            self.spaces[1].sent.bytes_in_flight(),
+            self.spaces[2].sent.bytes_in_flight(),
+            self.max_streams_bidi,
+            self.next_bidi,
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -231,8 +278,7 @@ impl Connection {
                     // as soon as it has Handshake ones. Keeping them means
                     // every datagram carrying an Initial is padded to 1200
                     // bytes, which leaves no room for anything else.
-                    self.spaces[Space::Initial as usize].keys = None;
-                    self.spaces[Space::Initial as usize].ack = AckState::default();
+                    self.discard_space(Space::Initial);
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt_local = Some(keys.local);
@@ -459,56 +505,45 @@ impl Connection {
             return Ok(false);
         }
 
-        // Handshake bytes, retransmissions first
+        // Handshake bytes that have not been sent yet, or that a probe
+        // timeout has put back at the start of the buffer
         loop {
             let s = &self.spaces[space as usize];
             let avail = room(out);
-            if avail < 8 {
+            if avail < 8 || s.crypto_sent >= s.crypto_out.len() {
                 break;
             }
-            let (offset, len) = if let Some(&(offset, len)) = s.crypto_lost.first() {
-                (offset, len.min(avail - 8))
-            } else if s.crypto_out.is_empty() {
-                break;
-            } else {
-                (s.crypto_offset, s.crypto_out.len().min(avail - 8))
-            };
+            let len = (s.crypto_out.len() - s.crypto_sent).min(avail - 8);
             if len == 0 {
                 break;
             }
-            let s = &mut self.spaces[space as usize];
-            let from_lost = s.crypto_lost.first().is_some_and(|&(o, _)| o == offset);
-            let data: Vec<u8> = if from_lost {
-                // The buffer only holds what has not been acknowledged, and a
-                // lost run is inside it
-                let begin = (offset - s.crypto_offset) as usize;
-                s.crypto_out[begin..begin + len].to_vec()
-            } else {
-                s.crypto_out[..len].to_vec()
-            };
+            let offset = s.crypto_offset + s.crypto_sent as u64;
+            let data: Vec<u8> = s.crypto_out[s.crypto_sent..s.crypto_sent + len].to_vec();
             frame::put_crypto(out, offset, &data);
             frames.push(SentFrame::Crypto { offset, len });
             ack_eliciting = true;
-            if from_lost {
-                let (o, l) = s.crypto_lost.remove(0);
-                if l > len {
-                    s.crypto_lost.insert(0, (o + len as u64, l - len));
-                }
-            } else {
-                s.crypto_offset += len as u64;
-                s.crypto_out.drain(..len);
-            }
+            self.spaces[space as usize].crypto_sent += len;
         }
 
         if space == Space::Data {
             ack_eliciting |= self.fill_data_payload(out, budget, start, frames, congested)?;
         }
 
-        // A probe has to make the peer answer, and an ACK alone will not
-        if self.pto_count > 0 && !ack_eliciting && out.len() > start && room(out) > 1 {
-            frame::put_ping(out);
-            frames.push(SentFrame::Ping);
-            ack_eliciting = true;
+        // A probe has to make the peer answer, and an ACK alone will not.
+        // It goes into an otherwise empty packet on purpose: the case a probe
+        // exists for is having nothing else to send while waiting on
+        // something lost. It is also counted down rather than driven by
+        // pto_count, which stays raised until something arrives - sending one
+        // per pass instead of one per timeout floods the peer, and a server
+        // that cannot keep up with the flood never answers, which keeps the
+        // timeout raised.
+        if self.pto_probes > 0 && room(out) > 1 {
+            self.pto_probes -= 1;
+            if !ack_eliciting {
+                frame::put_ping(out);
+                frames.push(SentFrame::Ping);
+                ack_eliciting = true;
+            }
         }
         Ok(ack_eliciting)
     }
@@ -698,6 +733,7 @@ impl Connection {
             self.needs_send = true;
         }
         self.pto_count = 0;
+        self.pto_probes = 0;
         Ok(end)
     }
 
@@ -716,7 +752,7 @@ impl Connection {
                 self.handshake_done = true;
                 // RFC 9001 Section 4.9.2: the handshake keys are no longer
                 // needed and holding them only risks using them
-                self.spaces[Space::Handshake as usize].keys = None;
+                self.discard_space(Space::Handshake);
             }
             Frame::Stream {
                 id,
@@ -843,7 +879,8 @@ impl Connection {
 
     fn on_frame_acked(&mut self, f: SentFrame) {
         match f {
-            SentFrame::Crypto { .. } | SentFrame::Ping => {}
+            SentFrame::Ping => {}
+            SentFrame::Crypto { .. } => {}
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -860,8 +897,13 @@ impl Connection {
         match f {
             SentFrame::Ping => {}
             SentFrame::Crypto { offset, len } => {
-                self.spaces[space as usize].crypto_lost.push((offset, len));
-                self.spaces[space as usize].crypto_lost.sort_unstable();
+                // Rewind to the lost run. Anything after it goes out again
+                // too, which costs a little bandwidth once and avoids
+                // tracking holes in a buffer that is a few kilobytes at most.
+                let s = &mut self.spaces[space as usize];
+                let _ = len;
+                let start = offset.saturating_sub(s.crypto_offset) as usize;
+                s.crypto_sent = s.crypto_sent.min(start);
             }
             SentFrame::Stream {
                 id,
@@ -1016,9 +1058,18 @@ impl Connection {
                 self.events.push_back(Event::Finished { id, reset: false });
             }
             new
+        } else if is_client_initiated(id) && stream_dir(id) == Dir::Bi {
+            // Below the ring's base: a stream we opened, finished and retired.
+            // Data for one of those is ordinary - a retransmission, or a frame
+            // that crossed the response - and dropping it is right. Only an id
+            // we have never handed out is a protocol violation.
+            if id / 4 >= self.next_bidi {
+                bail!("the peer sent data on client stream {id}, which we did not open");
+            }
+            return Ok(());
         } else if is_client_initiated(id) {
-            // A stream we never opened
-            bail!("the peer sent data on client stream {id}, which we did not open");
+            // A unidirectional stream we opened: the peer may not write to it
+            bail!("the peer sent data on our unidirectional stream {id}");
         } else {
             let pos = match self.peer_uni.iter().position(|(i, _)| *i == id) {
                 Some(pos) => pos,
@@ -1111,15 +1162,31 @@ impl Connection {
             &self.spaces[1].sent,
             &self.spaces[2].sent,
         ];
-        if pto_deadline(
+        let due = pto_deadline(
             &spaces,
             &self.rtt,
             Duration::from_millis(self.params.max_ack_delay_ms),
             self.pto_count,
-        )
-        .is_some_and(|(_, at)| now >= at)
-        {
+        );
+        if due.is_some_and(|(space, at)| {
+            if now < at {
+                return false;
+            }
+            // RFC 9002 Section 6.2.4: a probe sends new data or sends
+            // unacknowledged data again. In a handshake space that means the
+            // CRYPTO bytes: a PING would be answered with nothing, because a
+            // peer that never received the ClientHello has no connection to
+            // answer about, and the connection would wait forever.
+            let _ = space;
+            true
+        }) {
+            if let Some((space, _)) = due {
+                self.spaces[space as usize].crypto_sent = 0;
+            }
             self.pto_count += 1;
+            // RFC 9002 Section 6.2.4 allows two, which recovers a lost probe
+            // without another timeout
+            self.pto_probes = 2;
             self.needs_send = true;
         }
     }

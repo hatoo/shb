@@ -25,6 +25,18 @@ use anyhow::{Context, Result, bail};
 
 use self::proto::{ResponseReader, UniReader};
 
+/// Whether to narrate what the QUIC connections are doing
+///
+/// A QUIC stack that is not working is usually not working silently: the peer
+/// stops answering and says nothing about why. These traces are what found a
+/// probe being sent on every pass, a stream retired while its data was still
+/// arriving, and loss detection state outliving the keys it belonged to. They
+/// sit on error paths and behind SHB_DEBUG, so they cost a branch.
+fn narrate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SHB_DEBUG").is_some())
+}
+
 const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
 
 /// UDP_SEGMENT socket option (missing from libc for linux-gnu)
@@ -177,6 +189,12 @@ impl Conn {
 
     /// Count all in-flight requests as errors (used when the connection dies)
     fn fail_inflight(&mut self, stats: &mut Stats) {
+        if narrate() && !self.streams.is_empty() {
+            eprintln!(
+                "[broken] {} requests in flight discarded",
+                self.streams.len()
+            );
+        }
         stats.errors += self.streams.len() as u64;
         self.streams.clear();
     }
@@ -394,7 +412,12 @@ fn drive(
                     }
                     conn.h3_ready = true;
                 }
-                QuicEvent::Lost(_) => alive = false,
+                QuicEvent::Lost(why) => {
+                    if narrate() {
+                        eprintln!("[lost] {why}");
+                    }
+                    alive = false;
+                }
                 QuicEvent::Readable(id) | QuicEvent::Opened(id) => readable.push(id),
                 // Collected rather than acted on: the same datagram that ends
                 // a stream usually carries the response, and completing it
@@ -436,6 +459,12 @@ fn drive(
             // (RFC 9114 Section 4.1); a stream that ends without one never
             // answered the request
             if reset || inflight.reader.status() == 0 {
+                if narrate() {
+                    eprintln!(
+                        "[fail] stream {id} reset={reset} status={}",
+                        inflight.reader.status()
+                    );
+                }
                 stats.errors += 1;
             } else {
                 stats.record_success(inflight.reader.status(), inflight.start);
@@ -448,7 +477,15 @@ fn drive(
         Ok(alive)
     })();
 
-    result.unwrap_or_default()
+    match result {
+        Ok(alive) => alive,
+        Err(e) => {
+            if narrate() {
+                eprintln!("[drive] {e:#}");
+            }
+            false
+        }
+    }
 }
 
 /// Benchmark loop of a single HTTP/3 worker thread
@@ -539,6 +576,9 @@ pub fn run_worker(
     let mut stop = false;
     // How many completions one wait should collect before returning
     let batch = uring::batch_size(connections);
+    // stays: it is what found a probe being sent on every pass rather than
+    // once per timeout
+    let mut last_dump = Instant::now();
 
     loop {
         if stats.completed + stats.errors >= max_requests {
@@ -550,6 +590,16 @@ pub fn run_worker(
 
         // Service expired QUIC timers and bound the wait by the nearest one
         let now = Instant::now();
+        if narrate() && last_dump.elapsed() > Duration::from_secs(2) {
+            last_dump = Instant::now();
+            for (i, conn) in conns.iter().enumerate().take(3) {
+                match conn.quic.as_ref() {
+                    Some(q) => eprintln!("[{i}] ready={} {}", conn.h3_ready, q.debug_state()),
+                    None => eprintln!("[{i}] no connection"),
+                }
+            }
+        }
+
         let mut wait = uring::WAIT_TIMEOUT;
         for (conn_idx, conn) in conns.iter_mut().enumerate() {
             let mut expired = false;
@@ -640,7 +690,9 @@ pub fn run_worker(
                         conn.out_queue.pop_front();
                         push_front_send(&submitter, &mut sq, conn_idx, conn)?;
                     } else if res < 0 {
-                        // e.g. ECONNREFUSED delivered via the connected UDP socket
+                        if narrate() {
+                            eprintln!("[send] {}", std::io::Error::from_raw_os_error(-res));
+                        }
                         conn_broken = true;
                     } else {
                         stats.bytes_sent += res as u64;
@@ -669,7 +721,9 @@ pub fn run_worker(
                             uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                             conn.recv_armed = true;
                         } else {
-                            // e.g. ECONNREFUSED (ICMP port unreachable)
+                            if narrate() {
+                                eprintln!("[recv] {}", std::io::Error::from_raw_os_error(-res));
+                            }
                             conn_broken = true;
                         }
                     } else {
@@ -684,8 +738,11 @@ pub fn run_worker(
                                 datagram.clear();
                                 datagram.extend_from_slice(buf_ring.data(bid, res as usize));
                                 if let Some(quic) = conn.quic.as_mut()
-                                    && quic.handle_datagram(now, &mut datagram).is_err()
+                                    && let Err(e) = quic.handle_datagram(now, &mut datagram)
                                 {
+                                    if narrate() {
+                                        eprintln!("[datagram] {e:#}");
+                                    }
                                     conn_broken = true;
                                 }
                             }
