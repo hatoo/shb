@@ -185,6 +185,15 @@ pub fn set_quickack(fd: RawFd) {
 /// at io_uring_enter instead of interrupting at arbitrary times (kernel 6.1+)
 /// NO_SQARRAY: drop the SQ indirection array (kernel 6.6+)
 /// CQSIZE: avoid CQ overflow from bursts of multishot recv CQEs
+///
+/// Not SQPOLL, which cannot be combined with DEFER_TASKRUN, so the two are a
+/// straight choice. There is nothing for it to save: batching already gets
+/// io_uring_enter down to 0.0015 calls per request on HTTP/2 and 0.025 on
+/// HTTP/3. What it costs is a kernel thread per ring - at 16 threads that is
+/// 16 of them burning ten cores - and it measured slower everywhere, by 29 %
+/// on HTTP/2 and 21 % on HTTP/3 at 16 threads. Giving it cores to spare only
+/// narrows the gap: still 2.6 % down at 4 threads and 10 % at 1. Measured
+/// 2026-08.
 pub fn build_ring(entries: u32) -> Result<IoUring> {
     let ring = build_ring_inner(entries)?;
     MIN_TIMEOUT_OK.store(
