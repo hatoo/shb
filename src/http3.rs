@@ -7,8 +7,8 @@
 //! UDP socket, multishot recv = one CQE per datagram, one Send SQE per
 //! outgoing datagram).
 
-mod proto;
-mod qpack;
+pub mod proto;
+pub mod qpack;
 
 use std::collections::VecDeque;
 use std::net::UdpSocket;

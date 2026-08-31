@@ -227,6 +227,12 @@ impl Connection {
             match change {
                 Some(KeyChange::Handshake { keys }) => {
                     self.spaces[Space::Handshake as usize].keys = Some(keys);
+                    // RFC 9001 Section 4.9.1: a client drops its Initial keys
+                    // as soon as it has Handshake ones. Keeping them means
+                    // every datagram carrying an Initial is padded to 1200
+                    // bytes, which leaves no room for anything else.
+                    self.spaces[Space::Initial as usize].keys = None;
+                    self.spaces[Space::Initial as usize].ack = AckState::default();
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt_local = Some(keys.local);
@@ -428,7 +434,11 @@ impl Connection {
         let mut ack_eliciting = false;
         let room = |out: &Vec<u8>| budget.saturating_sub(out.len() - start);
 
-        if !self.spaces[space as usize].ack.is_empty() && room(out) > 32 {
+        // Only when something arrived that the peer wants acknowledged
+        // (RFC 9000 Section 13.2.1). Sending the same ranges again on every
+        // pass would fill the link with ACK-only packets and, while the
+        // handshake keys are still around, pad each one to 1200 bytes.
+        if self.spaces[space as usize].ack.ack_eliciting_pending && room(out) > 32 {
             let delay = self.spaces[space as usize]
                 .ack
                 .delay(now, self.params.ack_delay_exponent);
@@ -1194,6 +1204,117 @@ mod tests {
         assert!(
             frames.iter().any(|f| matches!(f, Frame::Crypto { .. })),
             "the Initial has to carry the ClientHello, got {frames:?}"
+        );
+    }
+
+    /// A whole HTTP/3 exchange over shb's own QUIC: handshake, control and
+    /// QPACK streams, a request, a response with a status
+    ///
+    ///     cargo test --bin shb request_against_a_real_server -- --ignored
+    #[test]
+    #[ignore]
+    fn request_against_a_real_server() {
+        use crate::http3::proto;
+        use crate::http3::qpack;
+        use std::net::UdpSocket;
+
+        let addr: std::net::SocketAddr = std::env::var("SHB_QUIC_TEST")
+            .unwrap_or_else(|_| "127.0.0.1:3453".into())
+            .parse()
+            .unwrap();
+        let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+        sock.connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let mut conn = Connection::connect(
+            crate::tls::client_config(b"h3").unwrap(),
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 22,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+
+        let mut out = Vec::with_capacity(2048);
+        let mut buf = [0u8; 2048];
+        let mut opened_uni = false;
+        let mut request: Option<u64> = None;
+        let mut reader = proto::ResponseReader::default();
+        let mut scratch = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while Instant::now() < deadline {
+            let now = Instant::now();
+
+            if conn.connected && !opened_uni {
+                // RFC 9114 Section 6.2: the control stream and the two QPACK
+                // streams, each opened with its type
+                for kind in [
+                    proto::STREAM_CONTROL,
+                    proto::STREAM_QPACK_ENCODER,
+                    proto::STREAM_QPACK_DECODER,
+                ] {
+                    let id = conn.open_uni().expect("the server allows three");
+                    let prelude = if kind == proto::STREAM_CONTROL {
+                        proto::control_stream_prelude()
+                    } else {
+                        let mut v = Vec::new();
+                        crate::quic::varint::put_varint(&mut v, kind);
+                        v
+                    };
+                    assert_eq!(conn.write(id, &prelude), prelude.len());
+                }
+                opened_uni = true;
+            }
+
+            if opened_uni
+                && request.is_none()
+                && let Some(id) = conn.open_bi()
+            {
+                let block = qpack::encode_request("GET", "https", "localhost", "/", &[], 0);
+                let bytes = proto::request_bytes(&block, b"");
+                assert_eq!(conn.write(id, &bytes), bytes.len());
+                conn.finish(id);
+                request = Some(id);
+            }
+
+            out.clear();
+            let n = conn.poll_transmit(now, &mut out).unwrap();
+            if n > 0 {
+                sock.send(&out[..n]).unwrap();
+            }
+
+            while let Some(ev) = conn.poll_event() {
+                match ev {
+                    Event::Lost(why) => panic!("connection lost: {why}"),
+                    Event::Readable(id) if Some(id) == request => {
+                        scratch.clear();
+                        conn.read(id, &mut scratch);
+                        reader.feed(&scratch).unwrap();
+                    }
+                    Event::Finished { id, reset } if Some(id) == request => {
+                        assert!(!reset, "the server reset the request stream");
+                        assert_eq!(reader.status(), 200, "the status nginx answers with");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            match sock.recv(&mut buf) {
+                Ok(len) => conn
+                    .handle_datagram(Instant::now(), &mut buf[..len])
+                    .unwrap(),
+                Err(_) => conn.handle_timeout(Instant::now()),
+            }
+        }
+        panic!(
+            "no response within ten seconds (status so far {})",
+            reader.status()
         );
     }
 
