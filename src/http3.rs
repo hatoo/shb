@@ -16,6 +16,7 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::budget::Budget;
 use crate::buf_ring::BufRing;
 use crate::quic::conn::{Connection, Event as QuicEvent, LocalParamsInput};
 use crate::stats::Stats;
@@ -248,7 +249,7 @@ fn fill_streams(
     request: &[u8],
     parallel: usize,
     started: &mut u64,
-    max_requests: u64,
+    budget: Budget,
     stop: bool,
 ) -> Result<()> {
     if stop || conn.goaway || !conn.h3_ready {
@@ -257,7 +258,7 @@ fn fill_streams(
     let Some(quic) = conn.quic.as_mut() else {
         return Ok(());
     };
-    while conn.streams.len() < parallel && *started < max_requests {
+    while conn.streams.len() < parallel && budget.may_start(*started) {
         // None = the server's MAX_STREAMS limit; retry after completions
         let Some(qsid) = quic.open_bi() else {
             break;
@@ -396,7 +397,7 @@ fn drive(
     request: &[u8],
     parallel: usize,
     started: &mut u64,
-    max_requests: u64,
+    budget: Budget,
     stop: bool,
     scratch: &mut Vec<u8>,
 ) -> bool {
@@ -491,7 +492,7 @@ fn drive(
         }
 
         flush_unsent(quic, &mut conn.streams)?;
-        fill_streams(conn, request, parallel, started, max_requests, stop)?;
+        fill_streams(conn, request, parallel, started, budget, stop)?;
         Ok(alive)
     })();
 
@@ -510,12 +511,11 @@ fn drive(
 pub fn run_worker(
     target: &Target,
     connections: usize,
-    max_requests: u64,
-    duration_limit: Option<Duration>,
+    budget: Budget,
     connect_timeout: Duration,
     parallel: usize,
 ) -> Result<Stats> {
-    if connections == 0 || max_requests == 0 {
+    if connections == 0 || budget.is_empty() {
         return Ok(Stats::default());
     }
     if connections > 1 << CONN_IDX_BITS {
@@ -552,13 +552,15 @@ pub fn run_worker(
     }
 
     let mut stats = Stats::default();
-    if duration_limit.is_none() {
-        stats.latencies_ns.reserve(max_requests as usize);
+    if let Some(n) = budget.expected_requests() {
+        stats.latencies_ns.reserve(n as usize);
     }
     let mut started: u64 = 0;
 
     // Duration mode: the deadline is detected solely via the io_uring Timeout CQE
-    let timespec = duration_limit.map(|d| Box::new(io_uring::types::Timespec::from(d)));
+    let timespec = budget
+        .deadline()
+        .map(|d| Box::new(io_uring::types::Timespec::from(d)));
     if let Some(ts) = &timespec {
         let entry = io_uring::opcode::Timeout::new(&**ts as *const io_uring::types::Timespec)
             .build()
@@ -574,7 +576,7 @@ pub fn run_worker(
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(2048);
     let now = Instant::now();
     for (i, conn) in conns.iter_mut().enumerate() {
-        if (i as u64) >= max_requests {
+        if !budget.may_start(i as u64) {
             break;
         }
         conn.fd = uring::make_udp_socket(&target.addr)?;
@@ -599,7 +601,7 @@ pub fn run_worker(
     let mut last_dump = Instant::now();
 
     loop {
-        if stats.completed + stats.errors >= max_requests {
+        if budget.is_met(stats.completed + stats.errors) {
             break;
         }
         if crate::shutdown::requested() {
@@ -642,7 +644,7 @@ pub fn run_worker(
                     &request,
                     parallel,
                     &mut started,
-                    max_requests,
+                    budget,
                     stop,
                     &mut scratch,
                 );
@@ -666,7 +668,7 @@ pub fn run_worker(
                         connect_timeout,
                         target,
                         &mut started,
-                        max_requests,
+                        budget,
                         stop,
                         &mut transmit_buf,
                         gso,
@@ -792,7 +794,7 @@ pub fn run_worker(
                     connect_timeout,
                     target,
                     &mut started,
-                    max_requests,
+                    budget,
                     stop,
                     &mut transmit_buf,
                     gso,
@@ -813,7 +815,7 @@ pub fn run_worker(
                 &request,
                 parallel,
                 &mut started,
-                max_requests,
+                budget,
                 stop,
                 &mut scratch,
             );
@@ -837,7 +839,7 @@ pub fn run_worker(
                     connect_timeout,
                     target,
                     &mut started,
-                    max_requests,
+                    budget,
                     stop,
                     &mut transmit_buf,
                     gso,
@@ -888,7 +890,7 @@ fn handle_broken(
     connect_timeout: Duration,
     target: &Target,
     started: &mut u64,
-    max_requests: u64,
+    budget: Budget,
     stop: bool,
     transmit_buf: &mut Vec<u8>,
     gso: bool,
@@ -903,7 +905,7 @@ fn handle_broken(
         *started += 1;
     }
     conn.close();
-    if stop || *started >= max_requests {
+    if stop || !budget.may_start(*started) {
         return Ok(());
     }
     conn.fd = uring::make_udp_socket(&target.addr)?;

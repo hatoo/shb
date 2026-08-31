@@ -7,6 +7,7 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod budget;
 mod buf_ring;
 mod http1;
 mod http2;
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use crate::budget::Budget;
 use crate::report::{print_json_report, print_report};
 use crate::stats::Stats;
 use crate::target::parse_target;
@@ -172,26 +174,20 @@ fn main() -> Result<()> {
         None
     };
 
-    let duration_limit = args.duration;
+    // -n and -z are mutually exclusive, so what ends the run is one value
+    let budget = match args.duration {
+        Some(d) => Budget::Duration(d),
+        None => Budget::Requests(args.requests),
+    };
 
     // Each thread gets at least one connection
     let threads = args.threads.min(args.connections);
 
-    // Distribute connections and requests across threads (remainder goes to the first threads)
+    // Distribute connections across threads; the remainder goes to the first
     let conns_per_thread: Vec<usize> = (0..threads)
         .map(|i| args.connections / threads + usize::from(i < args.connections % threads))
         .collect();
-    let requests_per_thread: Vec<u64> = if duration_limit.is_some() {
-        // In duration mode the request count is unlimited
-        vec![u64::MAX; threads]
-    } else {
-        (0..threads)
-            .map(|i| {
-                args.requests / threads as u64
-                    + u64::from((i as u64) < args.requests % threads as u64)
-            })
-            .collect()
-    };
+    let budget_per_thread = budget.split(threads);
 
     let bench_start = Instant::now();
     let results: Vec<Result<Stats>> = std::thread::scope(|s| {
@@ -199,7 +195,7 @@ fn main() -> Result<()> {
             .map(|i| {
                 let target = &target;
                 let connections = conns_per_thread[i];
-                let max_requests = requests_per_thread[i];
+                let budget = budget_per_thread[i];
                 let connect_timeout = args.connect_timeout;
                 let http2 = args.http2;
                 let http3 = args.http3;
@@ -207,33 +203,18 @@ fn main() -> Result<()> {
                 let tls = tls_setup.as_ref();
                 s.spawn(move || {
                     if http3 {
-                        http3::run_worker(
-                            target,
-                            connections,
-                            max_requests,
-                            duration_limit,
-                            connect_timeout,
-                            parallel,
-                        )
+                        http3::run_worker(target, connections, budget, connect_timeout, parallel)
                     } else if http2 {
                         http2::run_worker(
                             target,
                             tls,
                             connections,
-                            max_requests,
-                            duration_limit,
+                            budget,
                             connect_timeout,
                             parallel,
                         )
                     } else {
-                        http1::run_worker(
-                            target,
-                            tls,
-                            connections,
-                            max_requests,
-                            duration_limit,
-                            connect_timeout,
-                        )
+                        http1::run_worker(target, tls, connections, budget, connect_timeout)
                     }
                 })
             })

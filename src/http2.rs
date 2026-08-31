@@ -11,6 +11,7 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use self::conn::{Connection, Event};
+use crate::budget::Budget;
 use crate::buf_ring::BufRing;
 use crate::stats::Stats;
 use crate::target::Target;
@@ -132,7 +133,7 @@ fn fill_streams(
     body: &[u8],
     parallel: usize,
     started: &mut u64,
-    max_requests: u64,
+    budget: Budget,
     stop: bool,
 ) {
     if stop || conn.goaway {
@@ -141,7 +142,7 @@ fn fill_streams(
     let Some(h2) = conn.h2.as_mut() else {
         return;
     };
-    while conn.streams.len() < parallel && *started < max_requests {
+    while conn.streams.len() < parallel && budget.may_start(*started) {
         let Some(stream_id) = h2.start_stream(header_block, body) else {
             break;
         };
@@ -242,12 +243,11 @@ pub fn run_worker(
     target: &Target,
     tls_setup: Option<&TlsSetup>,
     connections: usize,
-    max_requests: u64,
-    duration_limit: Option<Duration>,
+    budget: Budget,
     connect_timeout: Duration,
     parallel: usize,
 ) -> Result<Stats> {
-    if connections == 0 || max_requests == 0 {
+    if connections == 0 || budget.is_empty() {
         return Ok(Stats::default());
     }
     if connections > 1 << CONN_IDX_BITS {
@@ -296,8 +296,8 @@ pub fn run_worker(
     let connect_timeout = Box::new(types::Timespec::from(connect_timeout));
 
     let mut stats = Stats::default();
-    if duration_limit.is_none() {
-        stats.latencies_ns.reserve(max_requests as usize);
+    if let Some(n) = budget.expected_requests() {
+        stats.latencies_ns.reserve(n as usize);
     }
     // Number of streams opened (requests actually begun). Failed connect
     // attempts also consume one unit of the request budget so that -n
@@ -305,7 +305,9 @@ pub fn run_worker(
     let mut started: u64 = 0;
 
     // Duration mode: the deadline is detected solely via the io_uring Timeout CQE
-    let timespec = duration_limit.map(|d| Box::new(types::Timespec::from(d)));
+    let timespec = budget
+        .deadline()
+        .map(|d| Box::new(types::Timespec::from(d)));
     if let Some(ts) = &timespec {
         let entry = io_uring::opcode::Timeout::new(&**ts as *const types::Timespec)
             .build()
@@ -315,7 +317,7 @@ pub fn run_worker(
 
     // Kick off the initial connects (streams are opened on connect completion)
     for (i, conn) in conns.iter_mut().enumerate() {
-        if (i as u64) >= max_requests {
+        if !budget.may_start(i as u64) {
             break;
         }
         conn.fd = uring::start_connect(
@@ -336,7 +338,7 @@ pub fn run_worker(
     let batch = uring::batch_size(connections);
 
     'outer: loop {
-        if stats.completed + stats.errors >= max_requests {
+        if budget.is_met(stats.completed + stats.errors) {
             break;
         }
         if crate::shutdown::requested() {
@@ -398,7 +400,7 @@ pub fn run_worker(
                             &target.body,
                             parallel,
                             &mut started,
-                            max_requests,
+                            budget,
                             stop,
                         );
                         flush(&submitter, &mut sq, conn_idx, conn)?;
@@ -504,7 +506,7 @@ pub fn run_worker(
                                 &target.body,
                                 parallel,
                                 &mut started,
-                                max_requests,
+                                budget,
                                 stop,
                             );
                             // Send window updates / ACKs / new request HEADERS
@@ -518,7 +520,7 @@ pub fn run_worker(
             if conn_broken {
                 let conn = &mut conns[conn_idx];
                 conn.close();
-                if !stop && started < max_requests {
+                if !stop && budget.may_start(started) {
                     match uring::start_connect(
                         &submitter,
                         &mut sq,
