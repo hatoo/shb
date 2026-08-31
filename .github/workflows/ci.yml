@@ -57,18 +57,21 @@ jobs:
       # runs and only a changed Dockerfile pays for a rebuild.
       - uses: docker/setup-buildx-action@v3
 
+      # Exposes the credentials the gha cache exporter needs, which the docker
+      # actions inject for themselves but a plain run step does not get
+      - uses: crazy-max/ghaction-github-runtime@v3
+
+      # Run from docker/ rather than through docker/bake-action: bake resolves
+      # a compose file's build contexts against the working directory rather
+      # than against the file, so `./node` only means docker/node when bake is
+      # started there. The action defaults to a git context, where that
+      # directory is not where it expects either.
       - name: Build the containers we build ourselves
-        uses: docker/bake-action@v6
-        with:
-          # From docker/, because the build contexts in the compose file are
-          # relative to it and bake resolves them against its own working
-          # directory rather than the file's
-          workdir: docker
-          files: compose.yml
-          load: true
-          set: |
-            *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
+        working-directory: docker
+        run: |
+          docker buildx bake -f compose.yml --load \
+            --set '*.cache-from=type=gha' \
+            --set '*.cache-to=type=gha,mode=max'
 
       # Seventeen servers in containers, loaded over every protocol each of
       # them speaks, and eight separate QUIC implementations among them.
