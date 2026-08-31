@@ -401,12 +401,12 @@ $ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy, ... in cont
 $ scripts/interop.sh          # or: scripts/interop.sh h3
 ```
 
-`scripts/docker-interop.sh` starts fifteen HTTP servers in containers — nginx,
+`scripts/docker-interop.sh` starts sixteen HTTP servers in containers — nginx,
 Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat, OpenLiteSpeed,
-Hypercorn, Node, Go, picoquic, H2O and nghttpx — and loads each over every
-protocol it speaks, 65 combinations in all, including cleartext h2c and HTTP/3
-against seven separate QUIC implementations: nginx's own, quic-go, Google's
-QUICHE, aioquic, picoquic, quicly and ngtcp2. The last three servers are built
+Hypercorn, Node, Go, picoquic, H2O, nghttpx and Bun — and loads each over
+every protocol it speaks, 69 combinations in all, including cleartext h2c and
+HTTP/3 against eight separate QUIC implementations: nginx's own, quic-go,
+Google's QUICHE, aioquic, picoquic, quicly, ngtcp2 and Bun's. The last three servers are built
 from source, since their projects publish no image to run; nghttpx is there as
 much for HTTP/2, being the reference implementation, as for HTTP/3. The last three servers
 are a few lines each on an official base image, and they are there because the

@@ -7,7 +7,8 @@
 # distinct product. Hypercorn, Node and Go are here because the suite had
 # drifted towards C proxies sharing libraries and those three decode HTTP/2
 # themselves. picoquic, aioquic, quicly and ngtcp2 bring the QUIC
-# implementations to seven, next to nginx's own, quic-go and Google's QUICHE -
+# implementations to eight with Bun's, next to nginx's own, quic-go and
+# Google's QUICHE -
 # which is not Cloudflare's quiche, a different project with nearly the same
 # name. nghttpx is here for its HTTP/2 as much as its HTTP/3: nghttp2 is the
 # reference implementation, and until now it was only reachable through a
@@ -112,6 +113,10 @@ h2o|h3|https://127.0.0.1:18456/|quicly
 nghttpx|h1|https://127.0.0.1:18457/|TLS
 nghttpx|h2|https://127.0.0.1:18457/|TLS, ALPN h2, the HTTP/2 reference implementation
 nghttpx|h3|https://127.0.0.1:18457/|ngtcp2 and nghttp3
+bun|h1|http://127.0.0.1:18459/|cleartext
+bun|h1|https://127.0.0.1:18458/|TLS
+bun|h2|https://127.0.0.1:18461/|TLS, ALPN h2, via node:http2
+bun|h3|https://127.0.0.1:18458/|Bun's own QUIC
 node|h1|http://127.0.0.1:18093/|cleartext
 node|h2|http://127.0.0.1:18092/|cleartext h2c, Node's own HTTP/2
 node|h1|https://127.0.0.1:18452/|TLS

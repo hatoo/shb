@@ -126,3 +126,17 @@ services:
     volumes: ["./conf:/certs:ro"]
     ports: ["18457:443", "18457:443/udp"]
     depends_on: [goserver]
+
+  # Bun, from the image its own project publishes. Another HTTP/1.1 and
+  # HTTP/2, and an eighth QUIC implementation - Bun writes all three itself.
+  bun:
+    image: oven/bun:1.4.0
+    command: ["bun", "run", "/app/server.js"]
+    volumes:
+      - "./conf:/certs:ro"
+      - "./bun/server.js:/app/server.js:ro"
+    ports:
+      - "18458:443"
+      - "18458:443/udp"
+      - "18461:8443"
+      - "18459:8080"
