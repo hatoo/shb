@@ -106,6 +106,11 @@ pub struct Connection {
 
     /// Client-initiated bidirectional streams, indexed by number from `base`
     streams: VecDeque<Option<StreamPair>>,
+    /// Streams with something to send, in the order they became ready. A
+    /// request is written once and then only waits, so walking every open
+    /// stream to build each packet is work proportional to the streams in
+    /// flight; this keeps it proportional to the streams that have data.
+    send_queue: VecDeque<u64>,
     base_stream: u64,
     /// Peer-opened unidirectional streams, few and long-lived
     peer_uni: Vec<(u64, RecvStream)>,
@@ -132,6 +137,8 @@ struct StreamPair {
     recv: RecvStream,
     /// Reported to the worker already
     finished: bool,
+    /// Already in `send_queue`, so it is not queued twice
+    queued: bool,
 }
 
 impl Connection {
@@ -184,6 +191,7 @@ impl Connection {
             next_bidi: 0,
             next_uni: 0,
             streams: VecDeque::new(),
+            send_queue: VecDeque::new(),
             base_stream: 0,
             peer_uni: Vec::new(),
             local_uni: Vec::new(),
@@ -611,25 +619,39 @@ impl Connection {
             }
         }
 
-        for i in 0..self.streams.len() {
+        // Each queued stream gets one turn per packet, and goes to the back if
+        // it still has data, so a stream that cannot be emptied in one packet
+        // does not hold up the ones behind it
+        let mut turns = self.send_queue.len();
+        while turns > 0 {
+            turns -= 1;
             let avail = room(out);
             if avail < 16 {
                 break;
             }
-            let id = client_stream_id(Dir::Bi, self.base_stream + i as u64);
+            let Some(id) = self.send_queue.pop_front() else {
+                break;
+            };
+            let Some(i) = self.stream_index(id) else {
+                continue;
+            };
             let Some(pair) = self.streams[i].as_mut() else {
                 continue;
             };
+            pair.queued = false;
             let cap = self.max_data_peer.saturating_sub(self.data_sent) as usize;
             let avail = avail.min(cap + 16);
             if avail < 16 {
+                // Out of connection-level credit, so no stream can move
+                self.queue_send(id);
                 break;
             }
+            let mut sent_len = 0;
             if let Some((offset, data, fin)) = pair.send.next_send(avail - 16) {
                 let (len, data) = (data.len(), data.to_vec());
                 frame::put_stream(out, id, offset, fin, &data);
                 pair.send.on_sent(offset, len, fin);
-                self.data_sent += len as u64;
+                sent_len = len;
                 frames.push(SentFrame::Stream {
                     id,
                     offset,
@@ -637,6 +659,14 @@ impl Connection {
                     fin,
                 });
                 ack_eliciting = true;
+            }
+            self.data_sent += sent_len as u64;
+            if self
+                .stream_index(id)
+                .and_then(|i| self.streams[i].as_ref())
+                .is_some_and(|p| p.send.has_pending())
+            {
+                self.queue_send(id);
             }
         }
         Ok(ack_eliciting)
@@ -788,6 +818,8 @@ impl Connection {
                 if let Some(pair) = self.stream_mut(id) {
                     pair.send.set_limit(limit);
                 }
+                // A raised limit can unblock bytes that would not fit before
+                self.queue_send(id);
             }
             Frame::MaxStreams { uni, limit } => {
                 if !uni {
@@ -937,6 +969,7 @@ impl Connection {
                 if let Some(send) = self.send_mut(id) {
                     send.on_lost(offset, len, fin);
                 }
+                self.queue_send(id);
             }
         }
     }
@@ -1005,6 +1038,23 @@ impl Connection {
             .map(|(_, send)| send)
     }
 
+    /// Note that a stream has something to send. Called wherever data is
+    /// written, a stream is finished, a loss puts bytes back, or a raised
+    /// limit unblocks one.
+    fn queue_send(&mut self, id: u64) {
+        let Some(i) = self.stream_index(id) else {
+            return;
+        };
+        let Some(pair) = self.streams[i].as_mut() else {
+            return;
+        };
+        if pair.queued {
+            return;
+        }
+        pair.queued = true;
+        self.send_queue.push_back(id);
+    }
+
     /// Open a bidirectional stream, if the peer's limit allows another
     pub fn open_bi(&mut self) -> Option<u64> {
         if self.next_bidi >= self.max_streams_bidi {
@@ -1016,6 +1066,7 @@ impl Connection {
             send: SendStream::new(self.params.initial_max_stream_data_bidi_remote),
             recv: RecvStream::default(),
             finished: false,
+            queued: false,
         }));
         Some(id)
     }
@@ -1034,7 +1085,9 @@ impl Connection {
 
     pub fn write(&mut self, id: u64, data: &[u8]) -> usize {
         self.needs_send = true;
-        self.send_mut(id).map_or(0, |send| send.write(data))
+        let n = self.send_mut(id).map_or(0, |send| send.write(data));
+        self.queue_send(id);
+        n
     }
 
     pub fn finish(&mut self, id: u64) {
@@ -1042,6 +1095,7 @@ impl Connection {
         if let Some(send) = self.send_mut(id) {
             send.finish();
         }
+        self.queue_send(id);
     }
 
     /// Take whatever the stream has ready. Returns how many bytes moved.

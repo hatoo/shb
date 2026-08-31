@@ -82,6 +82,11 @@ impl SendStream {
 
     /// The next run of data to put in a packet: retransmissions first, since
     /// the peer is already waiting on them
+    /// Whether `next_send` would produce anything, without borrowing the data
+    pub fn has_pending(&self) -> bool {
+        !self.lost.is_empty() || self.buf.len() > self.sent || (self.fin && !self.fin_sent)
+    }
+
     pub fn next_send(&self, max: usize) -> Option<(u64, &[u8], bool)> {
         if let Some(&(start, end)) = self.lost.first() {
             let end = end.min(start + max);
@@ -100,8 +105,11 @@ impl SendStream {
                 fin,
             ));
         }
-        // Nothing left but the FIN itself
-        if self.fin && !self.fin_sent {
+        // Nothing left but the FIN itself. Only once the data is all sent:
+        // a FIN sits at the end of the buffer, so sending one while bytes are
+        // still unsent would tell the peer the stream ends at an offset this
+        // end has not written to it yet
+        if self.fin && !self.fin_sent && self.sent >= self.buf.len() {
             return Some((self.base_offset + self.buf.len() as u64, &[], true));
         }
         None
@@ -117,7 +125,10 @@ impl SendStream {
             } else {
                 self.lost[pos] = (s + len, e);
             }
-        } else {
+        } else if len > 0 {
+            // A frame carrying no data must not move the mark: the FIN's
+            // offset is the end of the buffer, and treating that as sent
+            // would strand every byte before it
             self.sent = self.sent.max(start + len);
         }
         if fin {
@@ -272,6 +283,35 @@ impl RecvStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_fin_does_not_go_out_ahead_of_the_data_it_ends() {
+        // A packet with only enough room for a frame header leaves no budget
+        // for data. The FIN sits at the end of the buffer, so sending it here
+        // would tell the peer the stream ends at an offset nothing has been
+        // written to - and marking that offset as sent strands every byte
+        // before it, leaving the peer waiting for a body that never comes.
+        let mut s = SendStream::new(1 << 20);
+        assert_eq!(s.write(b"GET / HTTP/3 request.."), 22);
+        s.finish();
+
+        assert_eq!(s.next_send(0), None);
+        assert!(s.has_pending());
+
+        let (offset, data, fin) = s.next_send(1200).expect("the data is still owed");
+        assert_eq!((offset, data.len(), fin), (0, 22, true));
+    }
+
+    #[test]
+    fn an_empty_frame_never_marks_unsent_bytes_as_sent() {
+        let mut s = SendStream::new(1 << 20);
+        s.write(b"twenty-two bytes here!");
+        s.finish();
+        // As if a zero-length frame had gone out at the end of the buffer
+        s.on_sent(22, 0, true);
+        let (offset, data, _) = s.next_send(1200).expect("the body is still owed");
+        assert_eq!((offset, data.len()), (0, 22));
+    }
     use super::*;
 
     fn read_all(r: &mut RecvStream) -> Vec<u8> {

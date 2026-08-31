@@ -344,6 +344,11 @@ fn pump_transmits(
         transmit_buf.clear();
         let mut segment_size = 0usize;
         let mut count = 0usize;
+        // A packet that cannot join the batch. It still has to be sent: by the
+        // time its size is known its number is spent and its frames are
+        // recorded as sent, so dropping it would leave the peer waiting for
+        // bytes this end believes it already wrote.
+        let mut oversize = None;
         while count < max {
             let before = transmit_buf.len();
             let pad = (count > 0).then_some(segment_size);
@@ -360,10 +365,15 @@ fn pump_transmits(
                     count = 1;
                     break;
                 }
-            } else if n != segment_size {
-                // Padding should have made them equal; if it could not, this
-                // one goes on its own next time
-                transmit_buf.truncate(before);
+            } else if n < segment_size {
+                // A shorter last segment is what GSO allows, so this one still
+                // travels with the batch; it just ends it
+                count += 1;
+                break;
+            } else if n > segment_size {
+                // Padding cannot shrink a packet, so this one cannot be a
+                // segment of this batch. It leaves on its own, behind it.
+                oversize = Some(transmit_buf.split_off(before));
                 break;
             }
             count += 1;
@@ -375,6 +385,12 @@ fn pump_transmits(
             conn.out_queue.push_back(Datagram {
                 buf: std::mem::take(transmit_buf),
                 segment_size: if count > 1 { segment_size } else { 0 },
+            });
+        }
+        if let Some(buf) = oversize {
+            conn.out_queue.push_back(Datagram {
+                buf,
+                segment_size: 0,
             });
         }
     }
