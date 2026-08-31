@@ -85,3 +85,17 @@ services:
     build: ./go
     volumes: ["./conf:/conf:ro"]
     ports: ["18094:80", "18453:443"]
+
+  # picoquic, published by the project for the QUIC interop runner. A fifth
+  # QUIC implementation, and one written by an author of the specification;
+  # the only other endpoint covering it is a public test server.
+  picoquic:
+    image: privateoctopus/picoquic
+    entrypoint: ["/picoquic/picoquicdemo", "-8", "-w", "/www", "-p", "443",
+                 "-k", "/certs/key.pem", "-c", "/certs/cert.pem"]
+    volumes:
+      - "./conf:/certs:ro"
+      # Just the one file: the document root is served, and the certificate
+      # directory has a private key in it
+      - "./conf/index.html:/www/index.html:ro"
+    ports: ["18455:443/udp"]

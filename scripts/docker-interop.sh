@@ -4,10 +4,10 @@
 # every protocol it speaks. Every image is either a Docker Official Image, one
 # published by the project itself, or a few lines built on an official base,
 # and each was picked for being a distinct implementation rather than a
-# distinct product. The last three exist because the suite had drifted towards
-# C proxies sharing libraries: Hypercorn, Node and Go each decode HTTP/2
-# themselves, and Hypercorn brings aioquic, a fourth QUIC stack next to
-# nginx's own, quic-go and quiche. This complements scripts/interop.sh: that one goes
+# distinct product. Hypercorn, Node and Go are here because the suite had
+# drifted towards C proxies sharing libraries and those three decode HTTP/2
+# themselves; picoquic and Hypercorn's aioquic bring the QUIC implementations
+# to five, next to nginx's own, quic-go and quiche. This complements scripts/interop.sh: that one goes
 # out to whatever the public internet happens to be running, this one pins down
 # a known set of server implementations and covers combinations the public one
 # cannot — cleartext h2c, and TLS against a server whose certificate we made.
@@ -101,6 +101,7 @@ hypercorn|h2|http://127.0.0.1:18091/|cleartext h2c, Hypercorn's own HTTP/2
 hypercorn|h1|https://127.0.0.1:18451/|TLS
 hypercorn|h2|https://127.0.0.1:18451/|TLS, ALPN h2
 hypercorn|h3|https://127.0.0.1:18451/|aioquic
+picoquic|h3|https://127.0.0.1:18455/index.html|picoquic
 node|h1|http://127.0.0.1:18093/|cleartext
 node|h2|http://127.0.0.1:18092/|cleartext h2c, Node's own HTTP/2
 node|h1|https://127.0.0.1:18452/|TLS

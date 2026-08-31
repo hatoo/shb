@@ -50,10 +50,10 @@ jobs:
           ./target/release/shb -n 1000 -c 4 http://127.0.0.1:8000/ | tee smoke.txt
           grep -q "1000 ok" smoke.txt
 
-      # Twelve servers in containers, loaded over every protocol each of them
-      # speaks: nginx, Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat,
-      # OpenLiteSpeed, and Hypercorn, Node and Go for HTTP/2 decoders written
-      # independently of the C proxies. Unlike scripts/interop.sh these are
-      # servers we start ourselves, so this can gate a merge.
+      # Thirteen servers in containers, loaded over every protocol each of
+      # them speaks: nginx, Caddy, HAProxy, httpd, Envoy, Varnish, Traefik,
+      # Tomcat, OpenLiteSpeed, Hypercorn, Node, Go and picoquic. Unlike
+      # scripts/interop.sh these are servers we start ourselves, so this can
+      # gate a merge.
       - name: Interop against containerised servers
         run: scripts/docker-interop.sh --down
