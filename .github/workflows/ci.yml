@@ -66,12 +66,15 @@ jobs:
       # than against the file, so `./node` only means docker/node when bake is
       # started there. The action defaults to a git context, where that
       # directory is not where it expects either.
+      # The cache configuration lives in the compose file, per image: a
+      # single --set applies one scope to every target, and type=gha defaults
+      # to one shared scope anyway, so five targets overwrite each other's
+      # manifest and none of them get their expensive layers back. Only H2O
+      # and nghttpx are cached; the other three build in seconds and would
+      # spend the repository's cache budget for nothing.
       - name: Build the containers we build ourselves
         working-directory: docker
-        run: |
-          docker buildx bake -f compose.yml --load \
-            --set '*.cache-from=type=gha' \
-            --set '*.cache-to=type=gha,mode=max'
+        run: docker buildx bake -f compose.yml --load
 
       # Seventeen servers in containers, loaded over every protocol each of
       # them speaks, and eight separate QUIC implementations among them.

@@ -106,7 +106,16 @@ services:
   # H2O, built from source: the project publishes no server image. It brings
   # quicly, a QUIC implementation nothing else here covers, and its own HTTP/2.
   h2o:
-    build: ./h2o
+    build:
+      context: ./h2o
+      # A scope per image: type=gha defaults to one shared scope, so
+      # several targets in the same bake overwrite each other's cache
+      # manifest and none of them get their expensive layers back
+      x-bake:
+        cache-from:
+          - type=gha,scope=h2o
+        cache-to:
+          - type=gha,scope=h2o,mode=max
     image: shb-h2o:ci
     volumes:
       - "./conf:/certs:ro"
@@ -119,7 +128,16 @@ services:
   # nghttp3. It is a proxy, so it answers from the Go server behind it - what
   # is being exercised is its frontend, which is the point.
   nghttpx:
-    build: ./nghttp2
+    build:
+      context: ./nghttp2
+      # A scope per image: type=gha defaults to one shared scope, so
+      # several targets in the same bake overwrite each other's cache
+      # manifest and none of them get their expensive layers back
+      x-bake:
+        cache-from:
+          - type=gha,scope=nghttpx
+        cache-to:
+          - type=gha,scope=nghttpx,mode=max
     image: shb-nghttpx:ci
     command:
       - /opt/nghttp2/bin/nghttpx
