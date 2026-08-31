@@ -66,6 +66,10 @@ struct Conn {
     out_off: usize,
     /// Whether a Send SQE is in flight for `out`
     sending: bool,
+    /// Output is waiting and has not been submitted yet. Set while completions
+    /// are being drained, cleared by the flush pass after them, so requests
+    /// generated across a whole batch leave in one send rather than one each.
+    needs_flush: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
     /// GOAWAY received: no new streams, reconnect once in-flight streams drain
@@ -89,6 +93,7 @@ impl Conn {
             out: Vec::new(),
             out_off: 0,
             sending: false,
+            needs_flush: false,
             recv_armed: false,
             goaway: false,
             generation: 0,
@@ -335,7 +340,7 @@ pub fn run_worker(
     let mut scratch = vec![0u8; 64 * 1024];
     let mut stop = false;
     // How many completions one wait should collect before returning
-    let batch = uring::batch_size(connections);
+    let batch = uring::batch_size_multiplexed(parallel);
 
     'outer: loop {
         if budget.is_met(stats.completed + stats.errors) {
@@ -403,7 +408,7 @@ pub fn run_worker(
                             budget,
                             stop,
                         );
-                        flush(&submitter, &mut sq, conn_idx, conn)?;
+                        conn.needs_flush = true;
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -428,7 +433,7 @@ pub fn run_worker(
                         } else {
                             conn.sending = false;
                             // More output may have accumulated while sending
-                            flush(&submitter, &mut sq, conn_idx, conn)?;
+                            conn.needs_flush = true;
                             if !conn.recv_armed {
                                 // Re-arm if the multishot ended (e.g. due to ENOBUFS)
                                 uring::push_recv_multi(
@@ -509,8 +514,9 @@ pub fn run_worker(
                                 budget,
                                 stop,
                             );
-                            // Send window updates / ACKs / new request HEADERS
-                            flush(&submitter, &mut sq, conn_idx, conn)?;
+                            // Window updates / ACKs / new request HEADERS go
+                            // out in the flush pass below
+                            conn.needs_flush = true;
                         }
                     }
                 }
@@ -537,6 +543,16 @@ pub fn run_worker(
                         }
                     }
                 }
+            }
+        }
+
+        // One send per connection for everything this batch produced. Sending
+        // from each completion instead put a request on the wire on its own,
+        // and TCP_NODELAY made each one its own segment.
+        for (conn_idx, conn) in conns.iter_mut().enumerate() {
+            if conn.needs_flush {
+                conn.needs_flush = false;
+                flush(&submitter, &mut sq, conn_idx, conn)?;
             }
         }
 

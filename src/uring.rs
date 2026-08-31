@@ -54,6 +54,10 @@ pub const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1
 /// and 32 start giving it back.
 const MAX_BATCH: usize = 8;
 
+/// The ceiling for HTTP/2, where waiting pays off for longer. See
+/// [`batch_size_multiplexed`].
+const MAX_BATCH_MULTIPLEXED: usize = 32;
+
 /// How long the kernel may linger collecting a batch before returning with
 /// whatever has arrived
 const BATCH_LINGER: u32 = 500;
@@ -82,6 +86,26 @@ pub fn batch_size(connections: usize) -> usize {
         return 1;
     }
     (connections / BATCH_SHARE).clamp(1, MAX_BATCH)
+}
+
+/// How many completions one wait should collect for HTTP/2
+///
+/// HTTP/2 puts every stream on one socket, so several requests share a segment
+/// only if their completions are handled in one pass and the connection is
+/// flushed once afterwards. The more streams a connection carries, the more
+/// completions land together and the more there is to join up: at 32 streams
+/// this cuts kernel time per request from 11.5 to 3.1 microseconds and adds
+/// nothing to the median latency.
+///
+/// The other two protocols keep to [`batch_size`]. HTTP/1.1 has one request
+/// per connection and so nothing to join; HTTP/3 joins its datagrams inside
+/// its own transmit pass, where waiting for more completions only delays them
+/// - measured at 32 x 32 it costs a third of the throughput.
+pub fn batch_size_multiplexed(parallel: usize) -> usize {
+    if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    (parallel / 2).clamp(1, MAX_BATCH_MULTIPLEXED)
 }
 
 /// Submit pending SQEs and wait for up to `min_complete` CQEs, bounded by
