@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod ack;
+pub mod conn;
 pub mod crypto;
 pub mod frame;
 pub mod header;
