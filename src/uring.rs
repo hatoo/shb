@@ -301,6 +301,16 @@ pub fn start_connect(
 /// Note: WriteFixed + a registered buffer was also tried, but the socket write
 /// path is slower than the send path and fixed buffers gain nothing for ~100B
 /// sends, measuring about 4% worse (2026-08). Keep using Send.
+/// Submit a send from a plain slice
+///
+/// The socket is a registered file but the buffer is not registered, and it
+/// does not need to be: a plain send copies out of user memory, so there are
+/// no pages to pin and nothing for `register_buffers` to save. Registration
+/// would only matter for a zero-copy send, and these are far too small for
+/// one to pay - measured 40 bytes on HTTP/1.1, where every request is its own
+/// send, and 663 to 766 on HTTP/2, where one send carries a couple of dozen.
+/// Zero copy adds a second completion per send and starts winning in the tens
+/// of kilobytes.
 pub fn push_send_slice(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
