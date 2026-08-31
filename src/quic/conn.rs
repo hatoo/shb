@@ -281,28 +281,29 @@ impl Connection {
             if self.local_keys(space).is_none() {
                 continue;
             }
-            // A packet carrying only an ACK is not congestion controlled
-            // (RFC 9002 Section 7), so it still goes out when the window is full
-            self.write_packet(space, now, out, start, congested)?;
+            // RFC 9000 Section 14.1: a datagram carrying an Initial has to
+            // be at least 1200 bytes, so a server knows the path carries that
+            // much before it commits memory. The padding is PADDING frames
+            // inside the packet, covered by the length field and the AEAD -
+            // zeroes appended after the tag would read to the peer as a
+            // second, broken packet, and it drops the datagram.
+            let pad_to =
+                (space == Space::Initial && !self.handshake_done).then_some(MIN_INITIAL_DATAGRAM);
+            let wrote = self.write_packet(space, now, out, start, congested, pad_to)?;
+            if wrote && pad_to.is_some() {
+                // The datagram is full of padding now, so nothing can be
+                // coalesced behind it; the next space goes in its own
+                break;
+            }
         }
 
-        let written = out.len() - start;
-        if written == 0 {
-            return Ok(0);
-        }
-        // RFC 9000 Section 14.1: any datagram carrying an Initial has to be
-        // padded, so a server can be sure the path carries 1200 bytes before
-        // it commits memory to the connection
-        let needs_padding = self.spaces[Space::Initial as usize].keys.is_some()
-            && !self.handshake_done
-            && written < MIN_INITIAL_DATAGRAM;
-        if needs_padding {
-            out.resize(start + MIN_INITIAL_DATAGRAM, 0);
-        }
         Ok(out.len() - start)
     }
 
     /// Append one packet for `space`, if there is anything to put in it
+    ///
+    /// `pad_to` makes the finished datagram exactly that long, with PADDING
+    /// frames inside this packet's payload.
     fn write_packet(
         &mut self,
         space: Space,
@@ -310,11 +311,12 @@ impl Connection {
         out: &mut Vec<u8>,
         datagram_start: usize,
         congested: bool,
-    ) -> Result<()> {
+        pad_to: Option<usize>,
+    ) -> Result<bool> {
         let room = MAX_DATAGRAM.saturating_sub(out.len() - datagram_start);
         // Header, packet number and tag all have to fit with something left over
         if room < 64 {
-            return Ok(());
+            return Ok(false);
         }
 
         let pn = self.spaces[space as usize].next_packet_number;
@@ -347,7 +349,7 @@ impl Connection {
         if out.len() == payload_start {
             // Nothing to say in this space
             out.truncate(header_start);
-            return Ok(());
+            return Ok(false);
         }
 
         // RFC 9001 Section 5.4.2: the sample starts four bytes past the packet
@@ -355,6 +357,23 @@ impl Connection {
         let min_payload = 4 + 16 - pn_len;
         if out.len() - payload_start < min_payload {
             out.resize(payload_start + min_payload, 0);
+        }
+        // PADDING is a run of zero bytes, so filling to the target length is
+        // the whole of it
+        if let Some(target) = pad_to {
+            let want = (datagram_start + target).saturating_sub(TAG_LEN);
+            if out.len() < want {
+                out.resize(want, 0);
+            }
+        }
+
+        // The length field is part of the additional authenticated data, so
+        // it has to hold its final value before anything is encrypted: the
+        // peer computes the AAD from the header it received, and a length of
+        // zero here would make every packet fail to decrypt.
+        if let Some(at) = length_field {
+            let length = pn_len + (out.len() - payload_start) + TAG_LEN;
+            header::set_varint_fixed4(out, at, length as u64);
         }
 
         // The header is the additional authenticated data and the payload is
@@ -368,11 +387,6 @@ impl Connection {
             .encrypt_in_place(pn, &head[header_start..], body)
             .map_err(|e| anyhow::anyhow!("packet encryption: {e}"))?;
         out.extend_from_slice(tag.as_ref());
-
-        if let Some(at) = length_field {
-            let length = pn_len + (out.len() - payload_start);
-            header::set_varint_fixed4(out, at, length as u64);
-        }
         let hp = self.local_keys(space).expect("checked by the caller");
         protect_header(
             hp.header.as_ref(),
@@ -391,7 +405,7 @@ impl Connection {
             ack_eliciting,
             frames,
         });
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1110,5 +1124,136 @@ impl Connection {
 
     pub fn wants_send(&self) -> bool {
         self.needs_send || self.close_pending.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a client Initial and read it back the way a server would
+    ///
+    /// Needs no server, and pinpoints whether a handshake that goes nowhere
+    /// is a packet we built wrong or something later.
+    #[test]
+    fn our_own_initial_packet_decodes_as_a_server_would_read_it() {
+        let tls = crate::tls::client_config(b"h3").unwrap();
+        let mut conn = Connection::connect(
+            tls,
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 20,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+        let dcid = conn.initial_dcid;
+
+        let mut out = Vec::new();
+        let n = conn.poll_transmit(Instant::now(), &mut out).unwrap();
+        assert_eq!(
+            n, MIN_INITIAL_DATAGRAM,
+            "an Initial datagram is padded to 1200"
+        );
+
+        // A server derives its keys from the destination connection ID we chose
+        let keys = initial_keys(dcid.as_slice(), rustls::Side::Server).unwrap();
+        let Incoming::Long {
+            space,
+            dcid: seen,
+            pn_offset,
+            end,
+            ..
+        } = header::decode_header(&out, 0).unwrap()
+        else {
+            panic!("a client Initial has a long header");
+        };
+        assert_eq!(space, Space::Initial);
+        assert_eq!(seen.as_slice(), dcid.as_slice());
+        assert_eq!(end, out.len(), "the length field must cover the datagram");
+
+        let (first, pn_len) =
+            unprotect_header(keys.remote.header.as_ref(), &mut out[..end], pn_offset).unwrap();
+        assert_eq!(first & 0x30, 0x00, "still an Initial after unmasking");
+        let mut pn = 0u64;
+        for &b in &out[pn_offset..pn_offset + pn_len] {
+            pn = (pn << 8) | b as u64;
+        }
+        assert_eq!(pn, 0, "the first packet is number zero");
+
+        let payload_start = pn_offset + pn_len;
+        let (head, body) = out[..end].split_at_mut(payload_start);
+        let plain = keys
+            .remote
+            .packet
+            .decrypt_in_place(pn, head, body)
+            .expect("a server must be able to decrypt our Initial");
+        let frames: Vec<_> = frame::Iter::new(plain).map(|f| f.unwrap()).collect();
+        assert!(
+            frames.iter().any(|f| matches!(f, Frame::Crypto { .. })),
+            "the Initial has to carry the ClientHello, got {frames:?}"
+        );
+    }
+
+    /// The moment of truth: a real handshake against a real server
+    ///
+    /// Ignored by default because it needs something listening; run it with
+    ///     cargo test --bin shb handshake_against_a_real_server -- --ignored
+    #[test]
+    #[ignore]
+    fn handshake_against_a_real_server() {
+        use std::net::UdpSocket;
+
+        let addr: std::net::SocketAddr = std::env::var("SHB_QUIC_TEST")
+            .unwrap_or_else(|_| "127.0.0.1:3453".into())
+            .parse()
+            .unwrap();
+        let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+        sock.connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        let tls = crate::tls::client_config(b"h3").unwrap();
+        let mut conn = Connection::connect(
+            tls,
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 20,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+
+        let mut out = Vec::with_capacity(2048);
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            out.clear();
+            let n = conn.poll_transmit(now, &mut out).unwrap();
+            if n > 0 {
+                sock.send(&out[..n]).unwrap();
+            }
+            while let Some(ev) = conn.poll_event() {
+                match ev {
+                    Event::Connected => return,
+                    Event::Lost(why) => panic!("connection lost: {why}"),
+                    _ => {}
+                }
+            }
+            match sock.recv(&mut buf) {
+                Ok(len) => {
+                    if let Err(e) = conn.handle_datagram(Instant::now(), &mut buf[..len]) {
+                        panic!("handling the datagram failed: {e:#}");
+                    }
+                }
+                Err(_) => conn.handle_timeout(Instant::now()),
+            }
+        }
+        panic!("the handshake did not finish within five seconds");
     }
 }
