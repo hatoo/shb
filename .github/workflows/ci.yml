@@ -50,10 +50,25 @@ jobs:
           ./target/release/shb -n 1000 -c 4 http://127.0.0.1:8000/ | tee smoke.txt
           grep -q "1000 ok" smoke.txt
 
+      # Five of the seventeen servers are built from source, because their
+      # projects publish no image to run. Building them on every push takes
+      # longer than everything else here put together - OpenSSL 3.5, ngtcp2
+      # and nghttp2 in sequence, and H2O - so the layers are cached between
+      # runs and only a changed Dockerfile pays for a rebuild.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the containers we build ourselves
+        uses: docker/bake-action@v6
+        with:
+          files: docker/compose.yml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
       # Seventeen servers in containers, loaded over every protocol each of
       # them speaks, and eight separate QUIC implementations among them.
       # Unlike scripts/interop.sh these are servers we start ourselves, so
-      # this can gate a merge. Three of them are built from source, which is
-      # why this step is the slow one.
+      # this can gate a merge.
       - name: Interop against containerised servers
         run: scripts/docker-interop.sh --down

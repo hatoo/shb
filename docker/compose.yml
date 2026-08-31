@@ -73,16 +73,19 @@ services:
   # same libraries. These are decoders written independently of those.
   hypercorn:
     build: ./hypercorn
+    image: shb-hypercorn:ci
     volumes: ["./conf:/conf:ro"]
     ports: ["18091:8080", "18451:443", "18451:443/udp"]
 
   node:
     build: ./node
+    image: shb-node:ci
     volumes: ["./conf:/conf:ro"]
     ports: ["18092:80", "18093:8080", "18452:443"]
 
   goserver:
     build: ./go
+    image: shb-goserver:ci
     volumes: ["./conf:/conf:ro"]
     ports: ["18094:80", "18453:443"]
 
@@ -104,6 +107,7 @@ services:
   # quicly, a QUIC implementation nothing else here covers, and its own HTTP/2.
   h2o:
     build: ./h2o
+    image: shb-h2o:ci
     volumes:
       - "./conf:/certs:ro"
       - "./conf/h2o.conf:/conf/h2o.conf:ro"
@@ -116,6 +120,7 @@ services:
   # is being exercised is its frontend, which is the point.
   nghttpx:
     build: ./nghttp2
+    image: shb-nghttpx:ci
     command:
       - /opt/nghttp2/bin/nghttpx
       - --frontend=0.0.0.0,443;tls
