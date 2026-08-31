@@ -184,7 +184,18 @@ pub fn set_quickack(fd: RawFd) {
 /// COOP_TASKRUN / DEFER_TASKRUN: run socket-completion task work in batches
 /// at io_uring_enter instead of interrupting at arbitrary times (kernel 6.1+)
 /// NO_SQARRAY: drop the SQ indirection array (kernel 6.6+)
-/// CQSIZE: avoid CQ overflow from bursts of multishot recv CQEs
+/// CQSIZE: a multishot recv breaks the assumption the default completion
+/// queue is sized on - that one submission yields one completion - because a
+/// single SQE arms a receive that then produces completions for as long as the
+/// peer keeps sending. Overflowing is not fatal (IORING_FEAT_NODROP moves the
+/// spill to a backlog rather than dropping it) but it is expensive: forced by
+/// shrinking the ring, it costs 28 % of HTTP/1.1's throughput and 39 % of
+/// HTTP/2's. It has never been seen at the sizes actually used - zero
+/// overflows even with the queue no larger than the submission ring, since the
+/// floor of 256 entries already dwarfs the connections one worker holds. The
+/// headroom is not free: it costs about 1.7 % on HTTP/1.1 at 1000 connections,
+/// reproducibly and in both orders of testing. Kept as insurance against
+/// traffic shapes that have not been measured. Measured 2026-08.
 ///
 /// Not SQPOLL, which cannot be combined with DEFER_TASKRUN, so the two are a
 /// straight choice. There is nothing for it to save: batching already gets
