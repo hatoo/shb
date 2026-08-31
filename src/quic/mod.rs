@@ -10,4 +10,6 @@
 #![allow(dead_code)]
 
 pub mod crypto;
+pub mod frame;
 pub mod packet;
+pub mod varint;
