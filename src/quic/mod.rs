@@ -11,6 +11,7 @@
 
 pub mod crypto;
 pub mod frame;
+pub mod header;
 pub mod packet;
 pub mod recovery;
 pub mod stream;
