@@ -7,11 +7,11 @@ An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
 and HTTP/3.
 
 Protocol handling is Sans-I/O throughout, so the whole client is one
-completion-driven event loop per thread with no async runtime underneath. All
-three protocol stacks are written for this one job — see
-[How it works](#how-it-works) — over [quinn-proto] for the QUIC transport.
-
-[quinn-proto]: https://github.com/quinn-rs/quinn
+completion-driven event loop per thread with no async runtime underneath.
+Every protocol stack is written for this one job — HTTP/1.1, HTTP/2, HTTP/3,
+QPACK, HPACK and the QUIC transport itself — see
+[How it works](#how-it-works). The only thing under them is [rustls], for TLS
+and the QUIC key schedule.
 
 ## Features
 
@@ -249,8 +249,7 @@ single HPACK block encoded once at start-up, and responses are walked for
 there: QPACK, where a profile of a saturated worker used to spend 47 % of its
 time Huffman-decoding response header values that the scanner now steps over,
 and turning the QUIC state machine once per batch of datagrams rather than
-once per datagram. QUIC itself is still [quinn-proto], and it is now most of
-what a worker spends its time on.
+once per datagram.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
@@ -363,6 +362,17 @@ cheap:
   the peer inserting, so responses decode without a dynamic table and never
   block on one. Only `:status` is read; DATA and unknown frames are skipped by
   length.
+- **QUIC is shb's own**, because a benchmark client needs a fraction of what a
+  general implementation carries. There is no server role, no connection
+  migration, no datagram extension and one congestion controller. Packets are
+  built straight into the datagram buffer the kernel will send, so a datagram
+  costs no allocation; decoded frames borrow from the datagram rather than
+  taking a reference count on it; and the streams a client opens are numbered
+  in order, so they live in a ring indexed by arithmetic instead of a hash
+  map. Against a profile of the same workload on quinn-proto that is 36 % less
+  userspace CPU per request and 11 % more throughput. rustls still does the
+  TLS handshake, the QUIC key schedule and the packet protection — that part
+  is not worth anyone rewriting.
 - **HTTP/3 sends with UDP GSO**, batching up to 64 QUIC packets into one
   `sendmsg` when the kernel supports it.
 - **`-z` deadlines and QUIC timers are io_uring timeouts**, so an idle worker
@@ -382,7 +392,9 @@ $ cargo fmt
 
 The end-to-end tests start real servers — axum for HTTP/1.1 and h2c, and
 quinn + h3 with a self-signed certificate for HTTP/3 — run the compiled binary
-against them, and assert on its JSON report.
+against them, and assert on its JSON report. quinn is a dependency of the tests
+only, and deliberately so: since shb has its own QUIC, the end-to-end tests
+answer it with somebody else's.
 
 ```console
 $ scripts/docker-interop.sh   # nginx, Caddy, HAProxy, httpd, Envoy, ... in containers
@@ -435,6 +447,17 @@ connection being torn down by an ICMP reply to our own MTU probe, and a 103
 Early Hints being recorded as the response status; an earlier round caught a
 wrong Huffman table entry and a TLS buffer limit. None of them could be
 reproduced against a local server.
+
+Writing shb's own QUIC made that concrete. Five of its bugs only ever appeared
+against somebody else's implementation, because a server on loopback does not
+drop packets, does not reorder them, and does not send anything after a stream
+ends: a probe sent on every pass rather than once per timeout, handshake bytes
+dropped before they were acknowledged, a retired stream mistaken for one never
+opened, loss detection outliving the keys it belonged to, and handshake data
+fed to rustls in whatever order it arrived. The last of those was a deliberate
+decision, written down as one — reordering is rare on a single path — and it
+held right up until it met the internet, where a certificate chain spans
+several packets.
 
 Servers that were probed and simply worked are recorded in a `KNOWN_GOOD` list
 in the same script rather than run — 288 more endpoints, most of them behind a
