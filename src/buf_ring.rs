@@ -15,6 +15,15 @@ pub const RECV_BUF_SIZE: usize = 16 * 1024;
 /// until the buffer group is unregistered (= the io_uring is dropped), so this
 /// struct must be declared before the ring so that reverse drop order destroys
 /// it after the ring.
+///
+/// Callers size the ring from the connection count alone, which ignores that
+/// one HTTP/2 connection can carry a hundred responses arriving at once: at
+/// 100 x 100 the ring runs dry about 18,000 times in nine million requests,
+/// and each time the multishot recv ends and has to be re-armed. Raising the
+/// count to 256 removes every one of those and does not make it faster - the
+/// buffer area goes from 1 MB to 4 MB per worker and loses more to cache than
+/// the re-arms cost, and larger is worse again. Measured 2026-08; the sizing
+/// is deliberate.
 pub struct BufRing {
     /// io_uring_buf entry array (page-aligned, shared with the kernel)
     pub ring_ptr: *mut types::BufRingEntry,
