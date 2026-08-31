@@ -99,3 +99,30 @@ services:
       # directory has a private key in it
       - "./conf/index.html:/www/index.html:ro"
     ports: ["18455:443/udp"]
+
+  # H2O, built from source: the project publishes no server image. It brings
+  # quicly, a QUIC implementation nothing else here covers, and its own HTTP/2.
+  h2o:
+    build: ./h2o
+    volumes:
+      - "./conf:/certs:ro"
+      - "./conf/h2o.conf:/conf/h2o.conf:ro"
+      - "./conf/index.html:/www/index.html:ro"
+    ports: ["18456:443", "18456:443/udp"]
+
+  # nghttpx, built from source: two implementations in one image. nghttp2 is
+  # the HTTP/2 reference implementation, and its HTTP/3 is ngtcp2 plus
+  # nghttp3. It is a proxy, so it answers from the Go server behind it - what
+  # is being exercised is its frontend, which is the point.
+  nghttpx:
+    build: ./nghttp2
+    command:
+      - /opt/nghttp2/bin/nghttpx
+      - --frontend=0.0.0.0,443;tls
+      - --frontend=0.0.0.0,443;quic
+      - --backend=goserver,80
+      - /certs/key.pem
+      - /certs/cert.pem
+    volumes: ["./conf:/certs:ro"]
+    ports: ["18457:443", "18457:443/udp"]
+    depends_on: [goserver]

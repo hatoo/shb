@@ -6,8 +6,12 @@
 # and each was picked for being a distinct implementation rather than a
 # distinct product. Hypercorn, Node and Go are here because the suite had
 # drifted towards C proxies sharing libraries and those three decode HTTP/2
-# themselves; picoquic and Hypercorn's aioquic bring the QUIC implementations
-# to five, next to nginx's own, quic-go and quiche. This complements scripts/interop.sh: that one goes
+# themselves. picoquic, aioquic, quicly and ngtcp2 bring the QUIC
+# implementations to seven, next to nginx's own, quic-go and Google's QUICHE -
+# which is not Cloudflare's quiche, a different project with nearly the same
+# name. nghttpx is here for its HTTP/2 as much as its HTTP/3: nghttp2 is the
+# reference implementation, and until now it was only reachable through a
+# public test server. This complements scripts/interop.sh: that one goes
 # out to whatever the public internet happens to be running, this one pins down
 # a known set of server implementations and covers combinations the public one
 # cannot — cleartext h2c, and TLS against a server whose certificate we made.
@@ -83,7 +87,7 @@ envoy|h1|http://127.0.0.1:18084/|cleartext
 envoy|h2|http://127.0.0.1:18084/|cleartext h2c, prior knowledge
 envoy|h1|https://127.0.0.1:18447/|TLS
 envoy|h2|https://127.0.0.1:18447/|TLS, ALPN h2
-envoy|h3|https://127.0.0.1:18447/|quiche
+envoy|h3|https://127.0.0.1:18447/|Google's QUICHE
 varnish|h1|http://127.0.0.1:18086/|cleartext
 varnish|h2|http://127.0.0.1:18086/|cleartext h2c, prior knowledge
 traefik|h1|http://127.0.0.1:18087/|cleartext
@@ -102,6 +106,12 @@ hypercorn|h1|https://127.0.0.1:18451/|TLS
 hypercorn|h2|https://127.0.0.1:18451/|TLS, ALPN h2
 hypercorn|h3|https://127.0.0.1:18451/|aioquic
 picoquic|h3|https://127.0.0.1:18455/index.html|picoquic
+h2o|h1|https://127.0.0.1:18456/|TLS
+h2o|h2|https://127.0.0.1:18456/|TLS, ALPN h2, H2O's own HTTP/2
+h2o|h3|https://127.0.0.1:18456/|quicly
+nghttpx|h1|https://127.0.0.1:18457/|TLS
+nghttpx|h2|https://127.0.0.1:18457/|TLS, ALPN h2, the HTTP/2 reference implementation
+nghttpx|h3|https://127.0.0.1:18457/|ngtcp2 and nghttp3
 node|h1|http://127.0.0.1:18093/|cleartext
 node|h2|http://127.0.0.1:18092/|cleartext h2c, Node's own HTTP/2
 node|h1|https://127.0.0.1:18452/|TLS
