@@ -6,9 +6,6 @@
 //! userspace work inside it. This is the subset shb actually uses, written
 //! against the same rustls primitives quinn-proto uses for the crypto.
 
-// Built bottom-up, so parts of this are unused until the connection lands
-#![allow(dead_code)]
-
 pub mod ack;
 pub mod conn;
 pub mod crypto;

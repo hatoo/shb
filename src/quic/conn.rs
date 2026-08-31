@@ -86,8 +86,6 @@ pub struct Connection {
     local_cid: ConnectionId,
     /// Where to address packets: the peer's chosen connection ID
     peer_cid: ConnectionId,
-    /// The one used to derive initial keys, kept for a Retry
-    initial_dcid: ConnectionId,
 
     params: Params,
     handshake_done: bool,
@@ -143,6 +141,8 @@ impl Connection {
         local_params: LocalParamsInput,
     ) -> Result<Self> {
         let local_cid = ConnectionId::random();
+        // The first destination connection ID doubles as the secret both
+        // sides derive their initial keys from (RFC 9001 Section 5.2)
         let initial_dcid = ConnectionId::random();
         let params = LocalParams {
             initial_max_data: local_params.initial_max_data,
@@ -171,7 +171,6 @@ impl Connection {
             one_rtt_remote: None,
             local_cid,
             peer_cid: initial_dcid,
-            initial_dcid,
             params: Params::default(),
             handshake_done: false,
             connected: false,
@@ -243,10 +242,6 @@ impl Connection {
             self.max_streams_bidi,
             self.next_bidi,
         )
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.closed.is_some()
     }
 }
 
@@ -891,14 +886,13 @@ impl Connection {
 
     fn on_frame_acked(&mut self, f: SentFrame) {
         match f {
-            SentFrame::Ping => {}
-            SentFrame::Crypto { .. } => {}
+            // A PING is only there to draw an acknowledgement, and CRYPTO is
+            // released by the handshake advancing rather than by this
+            SentFrame::Ping | SentFrame::Crypto { .. } => {}
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
-                if let Some(pair) = self.stream_mut(id) {
-                    pair.send.on_acked(offset, len);
-                } else if let Some((_, send)) = self.local_uni.iter_mut().find(|(i, _)| *i == id) {
+                if let Some(send) = self.send_mut(id) {
                     send.on_acked(offset, len);
                 }
             }
@@ -923,9 +917,7 @@ impl Connection {
                 len,
                 fin,
             } => {
-                if let Some(pair) = self.stream_mut(id) {
-                    pair.send.on_lost(offset, len, fin);
-                } else if let Some((_, send)) = self.local_uni.iter_mut().find(|(i, _)| *i == id) {
+                if let Some(send) = self.send_mut(id) {
                     send.on_lost(offset, len, fin);
                 }
             }
@@ -980,6 +972,22 @@ impl Connection {
         self.streams[i].as_mut()
     }
 
+    /// The send half of a stream, wherever it lives
+    ///
+    /// Request streams and the three HTTP/3 control streams are kept apart -
+    /// one kind is numbered and retired, the other is opened once and lives
+    /// for the connection - but everything that writes, finishes,
+    /// acknowledges or resends is indifferent to which it has.
+    fn send_mut(&mut self, id: u64) -> Option<&mut SendStream> {
+        if let Some(i) = self.stream_index(id) {
+            return self.streams[i].as_mut().map(|pair| &mut pair.send);
+        }
+        self.local_uni
+            .iter_mut()
+            .find(|(uid, _)| *uid == id)
+            .map(|(_, send)| send)
+    }
+
     /// Open a bidirectional stream, if the peer's limit allows another
     pub fn open_bi(&mut self) -> Option<u64> {
         if self.next_bidi >= self.max_streams_bidi {
@@ -1009,20 +1017,12 @@ impl Connection {
 
     pub fn write(&mut self, id: u64, data: &[u8]) -> usize {
         self.needs_send = true;
-        if let Some(pair) = self.stream_mut(id) {
-            return pair.send.write(data);
-        }
-        if let Some((_, send)) = self.local_uni.iter_mut().find(|(i, _)| *i == id) {
-            return send.write(data);
-        }
-        0
+        self.send_mut(id).map_or(0, |send| send.write(data))
     }
 
     pub fn finish(&mut self, id: u64) {
         self.needs_send = true;
-        if let Some(pair) = self.stream_mut(id) {
-            pair.send.finish();
-        } else if let Some((_, send)) = self.local_uni.iter_mut().find(|(i, _)| *i == id) {
+        if let Some(send) = self.send_mut(id) {
             send.finish();
         }
     }
@@ -1210,10 +1210,6 @@ impl Connection {
             self.closed = Some("closed locally".to_string());
         }
     }
-
-    pub fn wants_send(&self) -> bool {
-        self.needs_send || self.close_pending.is_some()
-    }
 }
 
 #[cfg(test)]
@@ -1238,8 +1234,6 @@ mod tests {
             },
         )
         .unwrap();
-        let dcid = conn.initial_dcid;
-
         let mut out = Vec::new();
         let n = conn.poll_transmit(Instant::now(), &mut out).unwrap();
         assert_eq!(
@@ -1247,11 +1241,15 @@ mod tests {
             "an Initial datagram is padded to 1200"
         );
 
+        // Taken off the wire rather than out of the connection: what a server
+        // derives its keys from is what we actually sent, and the decryption
+        // below is what would notice if those two ever disagreed
+        let dcid = ConnectionId::new(&out[6..6 + out[5] as usize]).unwrap();
+
         // A server derives its keys from the destination connection ID we chose
         let keys = initial_keys(dcid.as_slice(), rustls::Side::Server).unwrap();
         let Incoming::Long {
             space,
-            dcid: seen,
             pn_offset,
             end,
             ..
@@ -1260,7 +1258,6 @@ mod tests {
             panic!("a client Initial has a long header");
         };
         assert_eq!(space, Space::Initial);
-        assert_eq!(seen.as_slice(), dcid.as_slice());
         assert_eq!(end, out.len(), "the length field must cover the datagram");
 
         let (first, pn_len) =

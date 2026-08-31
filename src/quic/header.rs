@@ -12,31 +12,31 @@ const FORM_LONG: u8 = 0x80;
 const FIXED_BIT: u8 = 0x40;
 const LONG_TYPE_MASK: u8 = 0x30;
 const TYPE_INITIAL: u8 = 0x00;
-const TYPE_ZERO_RTT: u8 = 0x10;
 const TYPE_HANDSHAKE: u8 = 0x20;
 const TYPE_RETRY: u8 = 0x30;
 
 /// What a datagram turned out to hold, before it is decrypted
+/// Only what the connection acts on. The connection IDs are stepped over
+/// rather than returned: a client socket carries one connection, so the
+/// destination is ours by construction, and copying one out of every 1-RTT
+/// packet would cost more than it tells us.
 pub enum Incoming<'a> {
     Long {
         space: Space,
-        dcid: ConnectionId,
+        /// The server picks its own connection ID in its first flight
         scid: ConnectionId,
         /// Where the packet number starts
         pn_offset: usize,
         /// One past the end of this packet's payload
         end: usize,
-        token: &'a [u8],
     },
     Short {
-        dcid: ConnectionId,
         pn_offset: usize,
         end: usize,
     },
     Retry {
         scid: ConnectionId,
         token: &'a [u8],
-        integrity_tag: &'a [u8],
     },
     VersionNegotiation,
 }
@@ -56,7 +56,6 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
             bail!("short header packet is truncated");
         }
         return Ok(Incoming::Short {
-            dcid: ConnectionId::new(&buf[1..1 + local_cid_len])?,
             pn_offset,
             // A short header packet always runs to the end of the datagram
             end: buf.len(),
@@ -73,7 +72,6 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
     if dcid_len > MAX_CID_LEN || buf.len() < pos + dcid_len + 1 {
         bail!("long header destination connection ID is bad");
     }
-    let dcid = ConnectionId::new(&buf[pos..pos + dcid_len])?;
     pos += dcid_len;
     let scid_len = buf[pos] as usize;
     pos += 1;
@@ -96,15 +94,18 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
             if buf.len() < pos + 16 {
                 bail!("Retry packet is truncated");
             }
+            // The last 16 bytes are the integrity tag, which only matters to
+            // a client that follows a Retry
             let split = buf.len() - 16;
             Ok(Incoming::Retry {
                 scid,
                 token: &buf[pos..split],
-                integrity_tag: &buf[split..],
             })
         }
         kind @ (TYPE_INITIAL | TYPE_HANDSHAKE) => {
-            let token = if kind == TYPE_INITIAL {
+            if kind == TYPE_INITIAL {
+                // A server's Initial carries an empty token, but the field is
+                // there and has to be stepped over to reach the length
                 let Some((len, n)) = get_varint(&buf[pos..]) else {
                     bail!("truncated token length");
                 };
@@ -112,12 +113,8 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
                 if buf.len() < pos + len as usize {
                     bail!("token runs past the end");
                 }
-                let token = &buf[pos..pos + len as usize];
                 pos += len as usize;
-                token
-            } else {
-                &[][..]
-            };
+            }
             let Some((len, n)) = get_varint(&buf[pos..]) else {
                 bail!("truncated length field");
             };
@@ -132,11 +129,9 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
                 } else {
                     Space::Handshake
                 },
-                dcid,
                 scid,
                 pn_offset: pos,
                 end,
-                token,
             })
         }
         // 0-RTT, which a server never sends to a client
@@ -176,17 +171,6 @@ impl LongHeader {
         }
         put_varint_fixed4(out, payload_len as u64);
     }
-
-    /// How many bytes `put` writes, which does not depend on the payload:
-    /// the length field is always four bytes wide
-    pub fn len(&self) -> usize {
-        let token = if self.space == Space::Initial {
-            varint_len(self.token.len() as u64) + self.token.len()
-        } else {
-            0
-        };
-        1 + 4 + 1 + self.dcid.len() + 1 + self.scid.len() + token + 4
-    }
 }
 
 /// A short header: just the first byte and the peer's connection ID
@@ -216,15 +200,6 @@ pub fn put_varint_fixed4(out: &mut Vec<u8>, value: u64) {
 pub fn set_varint_fixed4(buf: &mut [u8], at: usize, value: u64) {
     debug_assert!(value < (1 << 30));
     buf[at..at + 4].copy_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
-}
-
-pub const fn varint_len(value: u64) -> usize {
-    match value {
-        0..=0x3f => 1,
-        0x40..=0x3fff => 2,
-        0x4000..=0x3fff_ffff => 4,
-        _ => 8,
-    }
 }
 
 #[cfg(test)]
@@ -274,21 +249,20 @@ mod tests {
         packet.extend(std::iter::repeat_n(0u8, 1182));
         let Incoming::Long {
             space,
-            dcid,
             scid,
             pn_offset,
             end,
-            token,
         } = decode_header(&packet, 0).unwrap()
         else {
             panic!("expected a long header");
         };
         assert_eq!(space, Space::Initial);
-        assert_eq!(format!("{dcid:?}"), "8394c8f03e515708");
         assert_eq!(scid.len(), 0);
+        // The connection ID, token and length are stepped over rather than
+        // returned, so where the packet number lands is what proves they were
+        // all read at their true widths
         assert_eq!(pn_offset, 18, "where RFC 9001 Appendix A.2 puts it");
         assert_eq!(end, 18 + 1182);
-        assert!(token.is_empty());
     }
 
     #[test]
@@ -301,22 +275,19 @@ mod tests {
         };
         let mut out = Vec::new();
         h.put(&mut out, 2, 100);
-        assert_eq!(out.len(), h.len(), "len() must agree with what put writes");
         let mut packet = out.clone();
         packet.extend(std::iter::repeat_n(0u8, 100));
         let Incoming::Long {
             space,
-            dcid,
             scid,
             pn_offset,
             end,
-            ..
         } = decode_header(&packet, 0).unwrap()
         else {
             panic!("expected a long header");
         };
         assert_eq!(space, Space::Handshake);
-        assert_eq!(dcid.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(&packet[6..10], &[1, 2, 3, 4], "the destination we wrote");
         assert_eq!(scid.as_slice(), &[5, 6]);
         assert_eq!(pn_offset, out.len());
         assert_eq!(end, out.len() + 100);
@@ -332,13 +303,15 @@ mod tests {
         };
         let mut out = Vec::new();
         h.put(&mut out, 1, 50);
-        assert_eq!(out.len(), h.len());
         let mut packet = out.clone();
         packet.extend(std::iter::repeat_n(0u8, 50));
-        let Incoming::Long { token, .. } = decode_header(&packet, 0).unwrap() else {
+        let Incoming::Long { pn_offset, .. } = decode_header(&packet, 0).unwrap() else {
             panic!("expected a long header");
         };
-        assert_eq!(token, &[7, 7, 7]);
+        // The token is stepped over, so the packet number landing after it is
+        // what says its length was read correctly
+        assert_eq!(&packet[11..14], &[7, 7, 7], "the token we wrote");
+        assert_eq!(pn_offset, out.len());
     }
 
     /// A short header has no length field, so the connection ID length has to
@@ -349,15 +322,11 @@ mod tests {
         let cid = ConnectionId::new(&[9, 9, 9, 9, 9, 9, 9, 9]).unwrap();
         put_short_header(&mut out, &cid, 1, false);
         out.extend(std::iter::repeat_n(0u8, 20));
-        let Incoming::Short {
-            dcid,
-            pn_offset,
-            end,
-        } = decode_header(&out, 8).unwrap()
-        else {
+        let Incoming::Short { pn_offset, end } = decode_header(&out, 8).unwrap() else {
             panic!("expected a short header");
         };
-        assert_eq!(dcid.as_slice(), &[9u8; 8]);
+        // Nothing tells a short header how long its connection ID is, so the
+        // packet number offset comes from the length we told the peer to use
         assert_eq!(pn_offset, 9);
         assert_eq!(end, out.len(), "it runs to the end of the datagram");
     }
@@ -384,17 +353,11 @@ mod tests {
         buf.extend_from_slice(&[0xab, 0xcd]);
         buf.extend_from_slice(b"token");
         buf.extend_from_slice(&[0xee; 16]);
-        let Incoming::Retry {
-            scid,
-            token,
-            integrity_tag,
-        } = decode_header(&buf, 0).unwrap()
-        else {
+        let Incoming::Retry { scid, token } = decode_header(&buf, 0).unwrap() else {
             panic!("expected a Retry");
         };
         assert_eq!(scid.as_slice(), &[0xab, 0xcd]);
-        assert_eq!(token, b"token");
-        assert_eq!(integrity_tag, &[0xee; 16]);
+        assert_eq!(token, b"token", "the tag is split off the end");
     }
 
     #[test]

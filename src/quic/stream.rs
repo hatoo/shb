@@ -52,7 +52,6 @@ pub struct SendStream {
     fin: bool,
     /// The FIN has been put into a packet
     fin_sent: bool,
-    reset: bool,
 }
 
 impl SendStream {
@@ -169,18 +168,10 @@ impl SendStream {
         }
     }
 
-    pub fn is_finished(&self) -> bool {
-        self.fin && self.fin_sent && self.buf.is_empty()
-    }
-
+    /// STOP_SENDING: the peer does not want the rest, so drop it
     pub fn reset(&mut self) {
-        self.reset = true;
         self.buf.clear();
         self.lost.clear();
-    }
-
-    pub fn is_reset(&self) -> bool {
-        self.reset
     }
 }
 
@@ -195,7 +186,6 @@ pub struct RecvStream {
     pending: Vec<(u64, Vec<u8>)>,
     /// Offset the stream ends at, once the peer says so
     final_size: Option<u64>,
-    reset: bool,
     /// Total bytes delivered, for connection-level flow control accounting
     received: u64,
 }
@@ -276,12 +266,7 @@ impl RecvStream {
             bail!("RESET_STREAM final size disagrees with the data already sent");
         }
         self.final_size = Some(final_size);
-        self.reset = true;
         Ok(())
-    }
-
-    pub fn is_reset(&self) -> bool {
-        self.reset
     }
 }
 
@@ -411,10 +396,12 @@ mod tests {
         let (off, data, fin) = s.next_send(4).unwrap();
         assert_eq!((off, data, fin), (4, &b"ef"[..], true));
         s.on_sent(off, data.len(), fin);
-        assert!(s.next_send(4).is_none());
-        assert!(!s.is_finished(), "still waiting to be acknowledged");
+        assert!(s.next_send(4).is_none(), "nothing left to send");
         s.on_acked(0, 6);
-        assert!(s.is_finished());
+        assert!(
+            s.next_send(4).is_none(),
+            "and nothing comes back after the ack"
+        );
     }
 
     /// An empty stream still has to send its FIN

@@ -58,10 +58,6 @@ impl AckState {
         self.ranges.push((pn, pn));
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
     /// The ranges to put in an ACK frame, largest first
     ///
     /// Capped, because a connection that loses packets steadily would

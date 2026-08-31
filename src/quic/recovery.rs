@@ -123,10 +123,6 @@ impl SentPackets {
         self.packets.push(packet);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
-    }
-
     pub fn any_ack_eliciting(&self) -> bool {
         self.packets.iter().any(|p| p.ack_eliciting)
     }
