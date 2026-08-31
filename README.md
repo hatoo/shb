@@ -220,11 +220,11 @@ threads for every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **976,811** | 852,738 | 778,146 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **910,012** | — | 857,197 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,249,219** | — | 1,163,175 |
-| HTTP/3 | 32 conns × 32 streams | **2,273,042** | — | 1,230,824 |
-| HTTP/3 | 16 conns × 128 streams | **1,571,571** | — | 1,011,889 |
+| HTTP/1.1 | 1000 connections | **958,673** | 856,220 | 777,407 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **1,045,403** | — | 865,804 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,436,174** | — | 1,161,671 |
+| HTTP/3 | 32 conns × 32 streams | **2,327,922** | — | 1,308,714 |
+| HTTP/3 | 16 conns × 128 streams | **1,576,998** | — | 981,294 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -235,18 +235,24 @@ $ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 15 % over wrk and 26 % over h2load. Its
+**On HTTP/1.1 shb is ahead of both** — 12 % over wrk and 23 % over h2load. Its
 response path is a boundary scanner rather than a parser (see
 [How it works](#how-it-works)), which is worth ~10 % on its own. The three land
 closer together at low connection counts, where the ceiling is a round trip
-rather than the client: at 64 connections it is 471k / 433k / 389k.
+rather than the client: at 64 connections it is 470k / 441k / 412k.
 
-**On HTTP/2 shb is 6 % ahead** at 32 × 32 and 7 % at 100 × 100. Like the
+**On HTTP/2 shb is 21 % ahead** at 32 × 32 and 24 % at 100 × 100. Like the
 HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
-`:status` with every other field measured and skipped.
+`:status` with every other field measured and skipped. The larger share comes
+from how it writes: every stream shares one socket, so the loop collects a
+batch of completions and writes the connection once afterwards, and the
+requests that batch produced leave together. Sending from each completion
+instead put the first request of a batch on the wire alone and left the rest
+behind it, which is what 93 % of HTTP/2's CPU sitting in the kernel looked
+like.
 
-**On HTTP/3 shb is 85 % ahead** at 32 × 32 and 55 % at 16 × 128. Three things
+**On HTTP/3 shb is 78 % ahead** at 32 × 32 and 61 % at 16 × 128. Three things
 get it there: QPACK, where a profile of a saturated worker used to spend 47 %
 of its time Huffman-decoding response header values that the scanner now steps
 over; turning the QUIC state machine once per batch of datagrams rather than
