@@ -7,8 +7,6 @@
 //! appends in-order data straight through and only sorts when a datagram
 //! actually arrives out of order.
 
-use std::collections::VecDeque;
-
 use anyhow::{Result, bail};
 
 /// Which side opened a stream, and whether it carries data both ways
@@ -178,8 +176,10 @@ impl SendStream {
 /// One end of a stream we read from
 #[derive(Default)]
 pub struct RecvStream {
-    /// Contiguous data from `read_offset` that the application has not taken
-    ready: VecDeque<u8>,
+    /// Contiguous data from `read_offset` that the application has not taken.
+    /// Only ever appended to and taken whole, so a Vec beats a VecDeque: both
+    /// halves of the operation become a memcpy.
+    ready: Vec<u8>,
     /// Stream offset of the next byte the application will see
     read_offset: u64,
     /// Data that arrived early, sorted by offset
@@ -215,7 +215,7 @@ impl RecvStream {
             // and it costs one extend
             let skip = (self.read_offset + self.ready.len() as u64 - offset) as usize;
             if skip < data.len() {
-                self.ready.extend(&data[skip..]);
+                self.ready.extend_from_slice(&data[skip..]);
             }
             self.drain_pending();
         } else if !data.is_empty() {
@@ -235,7 +235,7 @@ impl RecvStream {
             let (offset, data) = self.pending.remove(0);
             let skip = (head - offset) as usize;
             if skip < data.len() {
-                self.ready.extend(&data[skip..]);
+                self.ready.extend_from_slice(&data[skip..]);
             }
         }
     }
@@ -243,7 +243,7 @@ impl RecvStream {
     /// Hand the application everything contiguous that is ready
     pub fn read(&mut self, out: &mut Vec<u8>) -> usize {
         let n = self.ready.len();
-        out.extend(self.ready.drain(..));
+        out.append(&mut self.ready);
         self.read_offset += n as u64;
         n
     }
