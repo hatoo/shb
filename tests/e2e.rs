@@ -30,6 +30,16 @@ async fn handler(method: Method, headers: HeaderMap, body: Bytes) -> (StatusCode
     } else if !body.is_empty() {
         return (StatusCode::BAD_REQUEST, "unexpected body");
     }
+    // A request naming the method it expects proves the method arrived
+    // intact, which a status code alone cannot: an unknown method and a
+    // mangled one both come back the same way otherwise.
+    if let Some(want) = headers.get("x-expect-method") {
+        return if want.as_bytes() == method.as_str().as_bytes() {
+            (StatusCode::OK, "method matched")
+        } else {
+            (StatusCode::CONFLICT, "method mismatch")
+        };
+    }
     match method {
         // hyper strips the body for HEAD responses but keeps Content-Length,
         // which is exactly the case the h1 HEAD decoding must handle
@@ -39,6 +49,57 @@ async fn handler(method: Method, headers: HeaderMap, body: Bytes) -> (StatusCode
         _ => (StatusCode::METHOD_NOT_ALLOWED, ""),
     }
 }
+
+/// Every method in the IANA HTTP Method Registry
+///
+/// shb does not know what any of them mean - it validates the token and puts
+/// it on the wire - but that is exactly why the list is worth walking: a
+/// hyphen or an unusual length is the kind of thing a request builder gets
+/// wrong, and a benchmark of a WebDAV or CalDAV server is a real use.
+///
+/// CONNECT is left out. It establishes a tunnel and takes an authority-form
+/// target rather than a path, so there is nothing here for a load generator
+/// to send and every protocol rejects it in the ordinary request shape.
+const REGISTERED_METHODS: &[&str] = &[
+    "ACL",
+    "BASELINE-CONTROL",
+    "BIND",
+    "CHECKIN",
+    "CHECKOUT",
+    "COPY",
+    "DELETE",
+    "GET",
+    "HEAD",
+    "LABEL",
+    "LINK",
+    "LOCK",
+    "MERGE",
+    "MKACTIVITY",
+    "MKCALENDAR",
+    "MKCOL",
+    "MKREDIRECTREF",
+    "MKWORKSPACE",
+    "MOVE",
+    "OPTIONS",
+    "ORDERPATCH",
+    "PATCH",
+    "POST",
+    "PROPFIND",
+    "PROPPATCH",
+    "PUT",
+    "QUERY",
+    "REBIND",
+    "REPORT",
+    "SEARCH",
+    "TRACE",
+    "UNBIND",
+    "UNCHECKOUT",
+    "UNLINK",
+    "UNLOCK",
+    "UPDATE",
+    "UPDATEREDIRECTREF",
+    "VERSION-CONTROL",
+];
 
 /// Bound addresses of the shared test server: (IPv4, IPv6)
 fn server_addrs() -> (SocketAddr, SocketAddr) {
@@ -102,6 +163,31 @@ fn assert_all_ok(report: &serde_json::Value, n: u64, status: &str) {
     assert_eq!(report["requests"]["ok"], n, "report: {report}");
     assert_eq!(report["requests"]["errors"], 0, "report: {report}");
     assert_eq!(report["statusCodes"][status], n, "report: {report}");
+}
+
+/// Send every registered method and report the ones that did not arrive
+///
+/// The server answers 200 only when the method it saw equals the one the
+/// request named, so this checks transmission rather than just that something
+/// came back. Every failure is collected: which methods fail is the useful
+/// part, not that one did.
+fn assert_every_method_arrives(protocol: &[&str], url: &str) {
+    let mut failed = Vec::new();
+    for method in REGISTERED_METHODS {
+        let expect = format!("x-expect-method: {method}");
+        let mut args = protocol.to_vec();
+        args.extend([
+            "-m", method, "-H", &expect, "-n", "2", "-c", "1", "-t", "1", url,
+        ]);
+        let report = shb_json(&args);
+        if report["requests"]["ok"] != 2 || report["statusCodes"]["200"] != 2 {
+            failed.push(format!("{method} -> {}", report["statusCodes"]));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "methods that did not arrive: {failed:#?}"
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -511,6 +597,18 @@ fn h1_keepalive_reuses_the_connection_by_default() {
     );
 }
 
+/// Every registered method reaches the server intact over HTTP/1.1
+///
+/// The server answers 200 only when the method it saw equals the one the
+/// request said it was sending, so this checks transmission rather than
+/// just that something arrived.
+#[test]
+fn h1_every_registered_method_arrives() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    assert_every_method_arrives(&[], &url);
+}
+
 // ------------------------------------------------------------------------
 // HTTP/2
 //
@@ -557,6 +655,15 @@ fn h2_custom_header_and_body() {
         &url,
     ]);
     assert_all_ok(&report, 30, "201");
+}
+
+/// The same over HTTP/2, where the method is a pseudo-header rather than
+/// the first word of a request line
+#[test]
+fn h2_every_registered_method_arrives() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    assert_every_method_arrives(&["--http2"], &url);
 }
 
 // ------------------------------------------------------------------------
@@ -630,12 +737,27 @@ fn h3_server_addr() -> SocketAddr {
                                     .headers()
                                     .get("x-echo")
                                     .map(|v| v.as_bytes().to_vec());
+                                // Same rule as the axum server: a request that
+                                // names its method proves the method arrived
+                                let expect = request
+                                    .headers()
+                                    .get("x-expect-method")
+                                    .map(|v| v.as_bytes().to_vec());
                                 let (status, body) = match echo {
                                     Some(ref e) if *e != req_body => {
                                         (http::StatusCode::BAD_REQUEST, "")
                                     }
                                     None if !req_body.is_empty() => {
                                         (http::StatusCode::BAD_REQUEST, "")
+                                    }
+                                    _ if expect.is_some() => {
+                                        if expect.as_deref()
+                                            == Some(request.method().as_str().as_bytes())
+                                        {
+                                            (http::StatusCode::OK, "method matched")
+                                        } else {
+                                            (http::StatusCode::CONFLICT, "method mismatch")
+                                        }
                                     }
                                     _ => match *request.method() {
                                         http::Method::GET | http::Method::HEAD => {
@@ -711,4 +833,12 @@ fn h3_custom_header_and_body() {
         &url,
     ]);
     assert_all_ok(&report, 20, "201");
+}
+
+/// And over HTTP/3, where the method goes through QPACK
+#[test]
+fn h3_every_registered_method_arrives() {
+    let addr = h3_server_addr();
+    let url = format!("https://{addr}/");
+    assert_every_method_arrives(&["--http3"], &url);
 }
