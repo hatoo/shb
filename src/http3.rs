@@ -1,8 +1,8 @@
-//! HTTP/3 benchmark worker (QUIC via quinn-proto, H3 and QPACK in [`proto`]
+//! HTTP/3 benchmark worker (QUIC in [`crate::quic`], H3 and QPACK in [`proto`]
 //! and [`qpack`])
 //!
-//! Both layers are Sans I/O: quinn-proto turns UDP datagrams into QUIC stream
-//! data and this module turns stream data into completed requests. UDP datagrams
+//! Every layer is Sans I/O: the QUIC connection turns UDP datagrams into
+//! stream data and this module turns stream data into completed requests. UDP datagrams
 //! are moved with the same io_uring machinery as the TCP workers (connected
 //! UDP socket, multishot recv = one CQE per datagram, one Send SQE per
 //! outgoing datagram).
@@ -16,23 +16,15 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use bytes::BytesMut;
-use quinn_proto::crypto::rustls::QuicClientConfig;
-use quinn_proto::{
-    ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event as QuicEvent, ReadError,
-    StreamEvent, StreamId, VarInt, WriteError,
-};
-
 use crate::buf_ring::BufRing;
+use crate::quic::conn::{Connection, Event as QuicEvent, LocalParamsInput};
 use crate::stats::Stats;
 use crate::target::Target;
 use crate::uring::{self, BUF_GROUP, CONN_IDX_BITS, OP_RECV, OP_SEND, TIMEOUT_USER_DATA};
+use anyhow::{Context, Result, bail};
 
 use self::proto::{ResponseReader, UniReader};
 
-/// QUIC receive windows, large enough that flow control never stalls a
-/// benchmark whose responses are a few hundred bytes
 const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
 
 /// UDP_SEGMENT socket option (missing from libc for linux-gnu)
@@ -40,12 +32,6 @@ const UDP_SEGMENT: libc::c_int = 103;
 
 /// Max segments per UDP GSO send (kernel limit is 64)
 const GSO_SEGMENTS: usize = 64;
-
-/// Largest datagram IPv4 can carry: 65535 less the IP and UDP headers
-///
-/// QUIC's own limit is 65527, which the kernel rejects with EMSGSIZE, so MTU
-/// discovery must not probe above this.
-const MAX_UDP_PAYLOAD: u16 = 65507;
 
 /// One outgoing UDP send: either a single datagram (segment_size == 0) or a
 /// GSO batch of equally sized segments with a shorter tail
@@ -103,39 +89,18 @@ fn build_field_section(target: &Target) -> Vec<u8> {
     )
 }
 
-fn make_quic_client_config(connect_timeout: Duration) -> Result<quinn_proto::ClientConfig> {
-    let rustls_config = crate::tls::client_config(b"h3")?;
-    let crypto = QuicClientConfig::try_from(rustls_config)
-        .context("rustls config not usable for QUIC (TLS 1.3 required)")?;
-    let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
-    let mut transport = quinn_proto::TransportConfig::default();
-    // Benchmark-friendly congestion behavior: a large initial window skips
-    // slow start (loopback/LAN loss is negligible)
-    let mut cubic = quinn_proto::congestion::CubicConfig::default();
-    cubic.initial_window(10 * 1024 * 1024);
-    // Allow MTU discovery to grow datagrams well past the Ethernet default;
-    // on loopback this greatly reduces per-packet costs for large bodies
-    let mut mtud = quinn_proto::MtuDiscoveryConfig::default();
-    mtud.upper_bound(MAX_UDP_PAYLOAD);
-    transport
-        .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
-        .stream_receive_window(VarInt::from_u32(RECEIVE_WINDOW))
-        // Server push (server-initiated bidi streams) does not exist in HTTP/3
-        .max_concurrent_bidi_streams(VarInt::from_u32(0))
-        .congestion_controller_factory(Arc::new(cubic))
-        .initial_mtu(1452)
-        .mtu_discovery_config(Some(mtud))
-        // The spec default of 333ms only matters before the first RTT sample,
-        // but a small value speeds up connection ramp-up on fast networks
-        .initial_rtt(Duration::from_millis(1))
-        // Doubles as the connect timeout: a handshake that gets no response
-        // dies when the idle timeout fires
-        .max_idle_timeout(Some(
-            quinn_proto::IdleTimeout::try_from(connect_timeout)
-                .map_err(|e| anyhow::anyhow!("connect timeout too large: {e}"))?,
-        ));
-    config.transport_config(Arc::new(transport));
-    Ok(config)
+/// What shb asks of the peer, and what it promises in return
+///
+/// The windows are large because the point is to keep the link full: a
+/// benchmark client that stalls on flow control is measuring its own limits.
+fn local_params(connect_timeout: Duration) -> LocalParamsInput {
+    LocalParamsInput {
+        initial_max_data: RECEIVE_WINDOW as u64,
+        initial_max_stream_data: RECEIVE_WINDOW as u64,
+        // The control stream and the two QPACK streams, and nothing else
+        initial_max_streams_uni: 3,
+        max_idle_timeout_ms: connect_timeout.as_millis() as u64,
+    }
 }
 
 /// An in-flight request (one open request stream)
@@ -150,8 +115,7 @@ struct InFlight {
 
 struct Conn {
     fd: RawFd,
-    handle: Option<ConnectionHandle>,
-    quic: Option<quinn_proto::Connection>,
+    quic: Option<Connection>,
     /// QUIC handshake finished and the H3 control/QPACK streams are set up
     h3_ready: bool,
     /// Peer-opened unidirectional streams, by QUIC stream id
@@ -179,7 +143,6 @@ impl Conn {
     fn new() -> Self {
         Conn {
             fd: -1,
-            handle: None,
             quic: None,
             h3_ready: false,
             uni: Vec::new(),
@@ -200,7 +163,6 @@ impl Conn {
             drop(unsafe { UdpSocket::from_raw_fd(self.fd) });
             self.fd = -1;
         }
-        self.handle = None;
         self.quic = None;
         self.uni.clear();
         self.h3_ready = false;
@@ -225,18 +187,12 @@ impl Conn {
 /// A fresh stream has its whole window free and requests are tiny, so this
 /// normally moves nothing; it exists so a peer with a small
 /// `initial_max_stream_data` cannot lose a request.
-fn flush_unsent(quic: &mut quinn_proto::Connection, streams: &mut [InFlight]) -> Result<()> {
+fn flush_unsent(quic: &mut Connection, streams: &mut [InFlight]) -> Result<()> {
     for inflight in streams.iter_mut().filter(|s| !s.unsent.is_empty()) {
-        let qsid = StreamId::from(VarInt::from_u64(inflight.stream_id).context("stream id")?);
-        match quic.send_stream(qsid).write(&inflight.unsent) {
-            Ok(n) => {
-                inflight.unsent.drain(..n);
-                if inflight.unsent.is_empty() {
-                    let _ = quic.send_stream(qsid).finish();
-                }
-            }
-            Err(WriteError::Blocked) => {}
-            Err(e) => bail!("QUIC stream write failed: {e}"),
+        let n = quic.write(inflight.stream_id, &inflight.unsent);
+        inflight.unsent.drain(..n);
+        if inflight.unsent.is_empty() {
+            quic.finish(inflight.stream_id);
         }
     }
     Ok(())
@@ -245,41 +201,18 @@ fn flush_unsent(quic: &mut quinn_proto::Connection, streams: &mut [InFlight]) ->
 /// Read everything currently readable from one QUIC stream
 ///
 /// Returns whether the peer reset the stream and whether it finished.
+/// Take everything a stream has ready, handing it to `sink`
 fn read_quic_stream(
-    quic: &mut quinn_proto::Connection,
-    qsid: StreamId,
+    quic: &mut Connection,
+    id: u64,
+    scratch: &mut Vec<u8>,
     mut sink: impl FnMut(&[u8]) -> Result<()>,
-) -> Result<(bool, bool)> {
-    let mut recv = quic.recv_stream(qsid);
-    let mut chunks = match recv.read(true) {
-        Ok(chunks) => chunks,
-        // Already closed/finished: nothing more to deliver
-        Err(_) => return Ok((false, false)),
-    };
-    let (mut reset, mut fin) = (false, false);
-    let mut result = Ok(());
-    loop {
-        match chunks.next(usize::MAX) {
-            Ok(Some(chunk)) => {
-                if let Err(e) = sink(&chunk.bytes) {
-                    result = Err(e);
-                    break;
-                }
-            }
-            Ok(None) => {
-                fin = true;
-                break;
-            }
-            Err(ReadError::Blocked) => break,
-            Err(ReadError::Reset(_)) => {
-                reset = true;
-                break;
-            }
-        }
+) -> Result<()> {
+    scratch.clear();
+    if quic.read(id, scratch) > 0 {
+        sink(scratch)?;
     }
-    let _ = chunks.finalize();
-    result?;
-    Ok((reset, fin))
+    Ok(())
 }
 
 /// Open new request streams until the parallelism target or budget is hit
@@ -302,19 +235,15 @@ fn fill_streams(
     };
     while conn.streams.len() < parallel && *started < max_requests {
         // None = the server's MAX_STREAMS limit; retry after completions
-        let Some(qsid) = quic.streams().open(Dir::Bi) else {
+        let Some(qsid) = quic.open_bi() else {
             break;
         };
-        let sent = match quic.send_stream(qsid).write(request) {
-            Ok(n) => n,
-            Err(WriteError::Blocked) => 0,
-            Err(e) => bail!("QUIC stream write failed: {e}"),
-        };
+        let sent = quic.write(qsid, request);
         if sent == request.len() {
-            let _ = quic.send_stream(qsid).finish();
+            quic.finish(qsid);
         }
         conn.streams.push(InFlight {
-            stream_id: u64::from(qsid),
+            stream_id: qsid,
             start: Instant::now(),
             reader: ResponseReader::default(),
             unsent: request[sent..].to_vec(),
@@ -378,24 +307,38 @@ fn pump_transmits(
     gso: bool,
 ) -> Result<()> {
     if let Some(quic) = conn.quic.as_mut() {
-        let max_datagrams = if gso { GSO_SEGMENTS } else { 1 };
-        loop {
-            transmit_buf.clear();
-            match quic.poll_transmit(now, max_datagrams, transmit_buf) {
-                Some(transmit) => {
-                    // segment_size is only meaningful when the batch holds
-                    // more than one segment
-                    let segment_size = transmit
-                        .segment_size
-                        .filter(|s| transmit.size > *s)
-                        .unwrap_or(0);
-                    conn.out_queue.push_back(Datagram {
-                        buf: transmit_buf[..transmit.size].to_vec(),
-                        segment_size,
-                    });
-                }
-                None => break,
+        // Datagrams are built back to back into one buffer so the kernel can
+        // send them as a single GSO batch. They all come out the same size
+        // except possibly the last, which is what GSO requires.
+        let max = if gso { GSO_SEGMENTS } else { 1 };
+        transmit_buf.clear();
+        let mut segment_size = 0usize;
+        let mut count = 0usize;
+        while count < max {
+            let before = transmit_buf.len();
+            let n = quic.poll_transmit(now, transmit_buf)?;
+            if n == 0 {
+                break;
             }
+            if count == 0 {
+                segment_size = n;
+            } else if n > segment_size {
+                // A later datagram may not be longer than the first, or the
+                // kernel would split it wrongly; send it on its own next time
+                transmit_buf.truncate(before);
+                break;
+            }
+            count += 1;
+            if n < segment_size {
+                // A short datagram can only be the last one in a batch
+                break;
+            }
+        }
+        if !transmit_buf.is_empty() {
+            conn.out_queue.push_back(Datagram {
+                buf: std::mem::take(transmit_buf),
+                segment_size: if count > 1 { segment_size } else { 0 },
+            });
         }
     }
     if !conn.sending {
@@ -408,8 +351,10 @@ fn pump_transmits(
 ///
 /// Returns false if the connection is broken.
 #[allow(clippy::too_many_arguments)]
+/// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
+///
+/// Returns false if the connection is broken.
 fn drive(
-    endpoint: &mut Endpoint,
     conn: &mut Conn,
     stats: &mut Stats,
     request: &[u8],
@@ -417,115 +362,93 @@ fn drive(
     started: &mut u64,
     max_requests: u64,
     stop: bool,
+    scratch: &mut Vec<u8>,
 ) -> bool {
     let result = (|| -> Result<bool> {
         let Some(quic) = conn.quic.as_mut() else {
             return Ok(true);
         };
-
-        // 1. QUIC events: connection state, newly readable streams
-        let mut readable: Vec<StreamId> = Vec::new();
         let mut alive = true;
-        while let Some(event) = quic.poll() {
+        let mut readable: Vec<u64> = Vec::new();
+        let mut finished: Vec<(u64, bool)> = Vec::new();
+
+        while let Some(event) = quic.poll_event() {
             match event {
                 QuicEvent::Connected => {
-                    // Set up the control and QPACK streams. The QPACK streams
-                    // stay empty for the rest of the connection - neither side
-                    // may insert - but RFC 9204 Section 4.2 requires opening
-                    // them all the same.
+                    // RFC 9114 Section 6.2: the control stream and the two
+                    // QPACK streams. The QPACK ones stay empty for the life of
+                    // the connection - neither side may insert - but they have
+                    // to exist.
                     let mut encoder = Vec::new();
                     proto::put_varint(&mut encoder, proto::STREAM_QPACK_ENCODER);
                     let mut decoder = Vec::new();
                     proto::put_varint(&mut decoder, proto::STREAM_QPACK_DECODER);
                     for prelude in [proto::control_stream_prelude(), encoder, decoder] {
-                        let qsid = quic.streams().open(Dir::Uni).context("no uni stream")?;
-                        // The windows are fresh, so a short write cannot happen
-                        let n = quic
-                            .send_stream(qsid)
-                            .write(&prelude)
-                            .map_err(|e| anyhow::anyhow!("H3 init write: {e}"))?;
-                        if n != prelude.len() {
+                        let id = quic.open_uni().context("the peer allowed no uni streams")?;
+                        if quic.write(id, &prelude) != prelude.len() {
                             bail!("short write of H3 init data");
                         }
+                        // Not finished: RFC 9114 Section 6.2.1 makes the
+                        // control and QPACK streams critical, and closing one
+                        // is H3_CLOSED_CRITICAL_STREAM
                     }
                     conn.h3_ready = true;
                 }
-                QuicEvent::ConnectionLost { .. } => {
-                    alive = false;
-                }
-                QuicEvent::Stream(StreamEvent::Opened { dir }) => {
-                    // Server-initiated uni streams (control/QPACK); accept and
-                    // read them like any other stream
-                    while let Some(qsid) = quic.streams().accept(dir) {
-                        readable.push(qsid);
-                    }
-                }
-                QuicEvent::Stream(StreamEvent::Readable { id }) => readable.push(id),
-                QuicEvent::Stream(_) | QuicEvent::HandshakeDataReady => {}
-                QuicEvent::DatagramReceived | QuicEvent::DatagramsUnblocked => {}
+                QuicEvent::Lost(_) => alive = false,
+                QuicEvent::Readable(id) | QuicEvent::Opened(id) => readable.push(id),
+                // Collected rather than acted on: the same datagram that ends
+                // a stream usually carries the response, and completing it
+                // here would retire the stream before its body is read
+                QuicEvent::Finished { id, reset } => finished.push((id, reset)),
             }
         }
 
-        // 2. Read the streams QUIC says have data, and record what finished
-        for qsid in readable {
-            let sid = u64::from(qsid);
-            // Client-initiated bidirectional streams (id & 3 == 0) are ours;
-            // peer-initiated unidirectional ones (id & 3 == 3) are its control
-            // and QPACK streams
-            if sid & 0x3 == 0 {
-                let Some(pos) = conn.streams.iter().position(|s| s.stream_id == sid) else {
-                    continue;
-                };
+        readable.sort_unstable();
+        readable.dedup();
+        for id in readable {
+            if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == id) {
                 let reader = &mut conn.streams[pos].reader;
-                let (reset, fin) = read_quic_stream(quic, qsid, |data| reader.feed(data))?;
-                if reset {
-                    conn.streams.swap_remove(pos);
-                    stats.errors += 1;
-                } else if fin {
-                    let inflight = conn.streams.swap_remove(pos);
-                    if inflight.reader.status() == 0 {
-                        // Every response begins with a HEADERS frame carrying
-                        // :status (RFC 9114 Section 4.1); a stream that ends
-                        // without one never answered the request
-                        stats.errors += 1;
-                    } else {
-                        stats.record_success(inflight.reader.status(), inflight.start);
-                    }
-                }
+                read_quic_stream(quic, id, scratch, |data| reader.feed(data))?;
                 continue;
             }
-            let pos = match conn.uni.iter().position(|(id, _)| *id == sid) {
+            // A peer-opened stream: its control stream, or one of its QPACK
+            // streams, which never carry anything shb acts on beyond GOAWAY
+            let slot = match conn.uni.iter().position(|(uid, _)| *uid == id) {
                 Some(pos) => pos,
                 None => {
-                    conn.uni.push((sid, UniReader::default()));
+                    conn.uni.push((id, UniReader::default()));
                     conn.uni.len() - 1
                 }
             };
-            let uni = &mut conn.uni[pos].1;
-            read_quic_stream(quic, qsid, |data| uni.feed(data))?;
-            if uni.goaway {
+            let reader = &mut conn.uni[slot].1;
+            read_quic_stream(quic, id, scratch, |data| reader.feed(data))?;
+            if conn.uni[slot].1.goaway {
                 conn.goaway = true;
             }
         }
 
-        // 3. Open new requests, and retry anything a stream would not take
-        fill_streams(conn, request, parallel, started, max_requests, stop)?;
-        if let Some(quic) = conn.quic.as_mut() {
-            flush_unsent(quic, &mut conn.streams)?;
-        }
-
-        // 4. Endpoint event plumbing (CID rotation, drain notifications, ...)
-        if let (Some(quic), Some(handle)) = (conn.quic.as_mut(), conn.handle) {
-            while let Some(endpoint_event) = quic.poll_endpoint_events() {
-                if let Some(conn_event) = endpoint.handle_event(handle, endpoint_event) {
-                    quic.handle_event(conn_event);
-                }
+        for (id, reset) in finished {
+            let Some(pos) = conn.streams.iter().position(|s| s.stream_id == id) else {
+                continue;
+            };
+            let inflight = conn.streams.swap_remove(pos);
+            // Every response begins with a HEADERS frame carrying :status
+            // (RFC 9114 Section 4.1); a stream that ends without one never
+            // answered the request
+            if reset || inflight.reader.status() == 0 {
+                stats.errors += 1;
+            } else {
+                stats.record_success(inflight.reader.status(), inflight.start);
             }
+            quic.retire(id);
         }
 
+        flush_unsent(quic, &mut conn.streams)?;
+        fill_streams(conn, request, parallel, started, max_requests, stop)?;
         Ok(alive)
     })();
-    result.unwrap_or(false)
+
+    result.unwrap_or_default()
 }
 
 /// Benchmark loop of a single HTTP/3 worker thread
@@ -549,9 +472,8 @@ pub fn run_worker(
 
     let field_section = build_field_section(target);
     let request = proto::request_bytes(&field_section, &target.body);
-    let quic_config = make_quic_client_config(connect_timeout)?;
+    let tls_config = crate::tls::client_config(b"h3")?;
     let gso = probe_gso(&target.addr);
-    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
     // Declare buf_ring / conns before the ring (see the h1/h2 workers)
     let buf_entries = (connections * 2).next_power_of_two().clamp(64, 32768) as u16;
@@ -590,6 +512,10 @@ pub fn run_worker(
     }
 
     // Kick off the initial connections
+    // Decryption happens in place, so the datagram is copied out of the
+    // provided buffer ring once and reused
+    let mut datagram: Vec<u8> = Vec::with_capacity(2048);
+    let mut scratch: Vec<u8> = Vec::with_capacity(4096);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(2048);
     let now = Instant::now();
     for (i, conn) in conns.iter_mut().enumerate() {
@@ -600,11 +526,11 @@ pub fn run_worker(
         submitter
             .register_files_update(i as u32, &[conn.fd])
             .context("register_files_update failed")?;
-        let (handle, quic) = endpoint
-            .connect(now, quic_config.clone(), target.addr, &target.host)
-            .context("QUIC connect failed")?;
-        conn.handle = Some(handle);
-        conn.quic = Some(quic);
+        conn.quic = Some(Connection::connect(
+            tls_config.clone(),
+            &target.host,
+            local_params(connect_timeout),
+        )?);
         uring::push_recv_multi(&submitter, &mut sq, i, conn.generation)?;
         conn.recv_armed = true;
         pump_transmits(&submitter, &mut sq, i, conn, now, &mut transmit_buf, gso)?;
@@ -643,7 +569,6 @@ pub fn run_worker(
             }
             if expired {
                 let alive = drive(
-                    &mut endpoint,
                     conn,
                     &mut stats,
                     &request,
@@ -651,6 +576,7 @@ pub fn run_worker(
                     &mut started,
                     max_requests,
                     stop,
+                    &mut scratch,
                 );
                 pump_transmits(
                     &submitter,
@@ -663,13 +589,13 @@ pub fn run_worker(
                 )?;
                 if !alive {
                     handle_broken(
-                        &mut endpoint,
                         &submitter,
                         &mut sq,
                         conn_idx,
                         conn,
                         &mut stats,
-                        &quic_config,
+                        &tls_config,
+                        connect_timeout,
                         target,
                         &mut started,
                         max_requests,
@@ -752,28 +678,15 @@ pub fn run_worker(
                         stats.bytes_received += res as u64;
                         if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
                             if res > 0 {
-                                let datagram = BytesMut::from(buf_ring.data(bid, res as usize));
-                                transmit_buf.clear();
-                                match endpoint.handle(
-                                    now,
-                                    target.addr,
-                                    None,
-                                    None,
-                                    datagram,
-                                    &mut transmit_buf,
-                                ) {
-                                    Some(DatagramEvent::ConnectionEvent(_, conn_event)) => {
-                                        if let Some(quic) = conn.quic.as_mut() {
-                                            quic.handle_event(conn_event);
-                                        }
-                                    }
-                                    Some(DatagramEvent::Response(transmit)) => {
-                                        conn.out_queue.push_back(Datagram {
-                                            buf: transmit_buf[..transmit.size].to_vec(),
-                                            segment_size: 0,
-                                        });
-                                    }
-                                    Some(DatagramEvent::NewConnection(_)) | None => {}
+                                // Straight into the connection: there is no
+                                // endpoint to route through, since a client
+                                // socket carries exactly one connection
+                                datagram.clear();
+                                datagram.extend_from_slice(buf_ring.data(bid, res as usize));
+                                if let Some(quic) = conn.quic.as_mut()
+                                    && quic.handle_datagram(now, &mut datagram).is_err()
+                                {
+                                    conn_broken = true;
                                 }
                             }
                             buf_ring.recycle(bid);
@@ -795,13 +708,13 @@ pub fn run_worker(
             if conn_broken {
                 let conn = &mut conns[conn_idx];
                 handle_broken(
-                    &mut endpoint,
                     &submitter,
                     &mut sq,
                     conn_idx,
                     conn,
                     &mut stats,
-                    &quic_config,
+                    &tls_config,
+                    connect_timeout,
                     target,
                     &mut started,
                     max_requests,
@@ -820,7 +733,6 @@ pub fn run_worker(
             }
             conn.pending = false;
             let alive = drive(
-                &mut endpoint,
                 conn,
                 &mut stats,
                 &request,
@@ -828,6 +740,7 @@ pub fn run_worker(
                 &mut started,
                 max_requests,
                 stop,
+                &mut scratch,
             );
             pump_transmits(
                 &submitter,
@@ -840,13 +753,13 @@ pub fn run_worker(
             )?;
             if !alive {
                 handle_broken(
-                    &mut endpoint,
                     &submitter,
                     &mut sq,
                     conn_idx,
                     conn,
                     &mut stats,
-                    &quic_config,
+                    &tls_config,
+                    connect_timeout,
                     target,
                     &mut started,
                     max_requests,
@@ -866,19 +779,18 @@ pub fn run_worker(
     let now = Instant::now();
     for conn in &mut conns {
         if let Some(quic) = conn.quic.as_mut() {
-            quic.close(now, VarInt::from_u32(0), bytes::Bytes::new());
-            loop {
-                transmit_buf.clear();
-                match quic.poll_transmit(now, 1, &mut transmit_buf) {
-                    Some(transmit) => unsafe {
-                        libc::send(
-                            conn.fd,
-                            transmit_buf.as_ptr() as *const libc::c_void,
-                            transmit.size,
-                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                        );
-                    },
-                    None => break,
+            quic.close(0, b"");
+            transmit_buf.clear();
+            if let Ok(n) = quic.poll_transmit(now, &mut transmit_buf)
+                && n > 0
+            {
+                unsafe {
+                    libc::send(
+                        conn.fd,
+                        transmit_buf.as_ptr() as *const libc::c_void,
+                        n,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    );
                 }
             }
         }
@@ -892,13 +804,13 @@ pub fn run_worker(
 /// request budget allows
 #[allow(clippy::too_many_arguments)]
 fn handle_broken(
-    endpoint: &mut Endpoint,
     submitter: &io_uring::Submitter<'_>,
     sq: &mut io_uring::squeue::SubmissionQueue<'_>,
     conn_idx: usize,
     conn: &mut Conn,
     stats: &mut Stats,
-    quic_config: &quinn_proto::ClientConfig,
+    tls_config: &Arc<rustls::ClientConfig>,
+    connect_timeout: Duration,
     target: &Target,
     started: &mut u64,
     max_requests: u64,
@@ -924,11 +836,11 @@ fn handle_broken(
         .register_files_update(conn_idx as u32, &[conn.fd])
         .context("register_files_update failed")?;
     let now = Instant::now();
-    let (handle, quic) = endpoint
-        .connect(now, quic_config.clone(), target.addr, &target.host)
-        .context("QUIC connect failed")?;
-    conn.handle = Some(handle);
-    conn.quic = Some(quic);
+    conn.quic = Some(Connection::connect(
+        tls_config.clone(),
+        &target.host,
+        local_params(connect_timeout),
+    )?);
     uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
     conn.recv_armed = true;
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;

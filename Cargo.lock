@@ -1124,7 +1124,6 @@ dependencies = [
  "mimalloc",
  "num_cpus",
  "quinn",
- "quinn-proto",
  "rcgen",
  "rustls",
  "serde_json",
