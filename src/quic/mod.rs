@@ -9,6 +9,7 @@
 // Built bottom-up, so parts of this are unused until the connection lands
 #![allow(dead_code)]
 
+pub mod ack;
 pub mod crypto;
 pub mod frame;
 pub mod header;
