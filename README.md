@@ -220,11 +220,11 @@ threads for every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **937,151** | 833,164 | 766,325 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **895,327** | — | 862,520 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,211,563** | — | 1,139,660 |
-| HTTP/3 | 32 conns × 32 streams | **2,237,865** | — | 1,232,642 |
-| HTTP/3 | 16 conns × 128 streams | **1,477,195** | — | 974,860 |
+| HTTP/1.1 | 1000 connections | **976,811** | 852,738 | 778,146 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **910,012** | — | 857,197 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,249,219** | — | 1,163,175 |
+| HTTP/3 | 32 conns × 32 streams | **2,273,042** | — | 1,230,824 |
+| HTTP/3 | 16 conns × 128 streams | **1,571,571** | — | 1,011,889 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -235,18 +235,18 @@ $ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 12 % over wrk and 22 % over h2load. Its
+**On HTTP/1.1 shb is ahead of both** — 15 % over wrk and 26 % over h2load. Its
 response path is a boundary scanner rather than a parser (see
 [How it works](#how-it-works)), which is worth ~10 % on its own. The three land
 closer together at low connection counts, where the ceiling is a round trip
-rather than the client: at 64 connections it is 458k / 435k / 398k.
+rather than the client: at 64 connections it is 471k / 433k / 389k.
 
-**On HTTP/2 shb is 4 % ahead** at 32 × 32 and 6 % at 100 × 100. Like the
+**On HTTP/2 shb is 6 % ahead** at 32 × 32 and 7 % at 100 × 100. Like the
 HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
 `:status` with every other field measured and skipped.
 
-**On HTTP/3 shb is 82 % ahead** at 32 × 32 and 52 % at 16 × 128. Three things
+**On HTTP/3 shb is 85 % ahead** at 32 × 32 and 55 % at 16 × 128. Three things
 get it there: QPACK, where a profile of a saturated worker used to spend 47 %
 of its time Huffman-decoding response header values that the scanner now steps
 over; turning the QUIC state machine once per batch of datagrams rather than
@@ -281,9 +281,12 @@ mean anything.
 - h2load from nghttp2 1.71.0-DEV, built against ngtcp2 + nghttp3 + BoringSSL —
   the distro build of h2load has no HTTP/3 support.
 
-**Server** — nginx 1.31.4 (mainline, `--with-http_v3_module`) on the same host,
-serving HTTP/1.1 and h2c on one cleartext socket and HTTP/3 on a QUIC socket
-with a self-signed certificate. `return 200` keeps it off the disk entirely:
+**Server** — nginx 1.31.4 (mainline) built from source with
+`--with-http_v3_module` against BoringSSL, on the same host, serving HTTP/1.1
+and h2c on one cleartext socket and HTTP/3 on a QUIC socket with a self-signed
+certificate. The TLS library is worth naming: the same nginx built against
+OpenSSL 3.0 serves shb's HTTP/3 about 8 % slower, while h2load's is unchanged.
+`return 200` keeps it off the disk entirely:
 
 ```nginx
 worker_processes auto;
