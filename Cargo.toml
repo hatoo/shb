@@ -19,7 +19,6 @@ categories = [
 
 [dependencies]
 anyhow = "1.0.104"
-bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 humantime = "2.4.0"
 io-uring = "0.7.14"

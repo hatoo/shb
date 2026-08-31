@@ -42,6 +42,12 @@ const RECEIVE_WINDOW: u32 = (1 << 30) - 1;
 /// UDP_SEGMENT socket option (missing from libc for linux-gnu)
 const UDP_SEGMENT: libc::c_int = 103;
 
+/// A datagram within this much of the limit was cut off by the limit rather
+/// than by running out of things to say, so there is probably more behind it.
+/// A full one never reaches the limit exactly: the header and the frame
+/// lengths take a variable few bytes off the top.
+const NEARLY_FULL: usize = crate::quic::conn::MAX_DATAGRAM - 64;
+
 /// Max segments per UDP GSO send (kernel limit is 64)
 const GSO_SEGMENTS: usize = 64;
 
@@ -328,31 +334,43 @@ fn pump_transmits(
         // Datagrams are built back to back into one buffer so the kernel can
         // send them as a single GSO batch. They all come out the same size
         // except possibly the last, which is what GSO requires.
+        // The first datagram sets the segment size and the rest are padded to
+        // match, because GSO splits one send into equal parts and only the
+        // last may be shorter. Left to themselves they vary by a few bytes -
+        // a packet number or a stream offset crossing a varint width - which
+        // is enough to make every batch one segment long.
         let max = if gso { GSO_SEGMENTS } else { 1 };
         transmit_buf.clear();
         let mut segment_size = 0usize;
         let mut count = 0usize;
         while count < max {
             let before = transmit_buf.len();
-            let n = quic.poll_transmit(now, transmit_buf)?;
+            let pad = (count > 0).then_some(segment_size);
+            let n = quic.poll_transmit(now, transmit_buf, pad)?;
             if n == 0 {
                 break;
             }
             if count == 0 {
                 segment_size = n;
-            } else if n > segment_size {
-                // A later datagram may not be longer than the first, or the
-                // kernel would split it wrongly; send it on its own next time
+                // Only worth batching if the first one filled up; a short
+                // datagram means there was nothing more to send, and padding
+                // the next one to match would truncate it
+                if n < NEARLY_FULL {
+                    count = 1;
+                    break;
+                }
+            } else if n != segment_size {
+                // Padding should have made them equal; if it could not, this
+                // one goes on its own next time
                 transmit_buf.truncate(before);
                 break;
             }
             count += 1;
-            if n < segment_size {
-                // A short datagram can only be the last one in a batch
-                break;
-            }
         }
         if !transmit_buf.is_empty() {
+            if narrate() {
+                eprintln!("[gso] {count} segments of {segment_size}");
+            }
             conn.out_queue.push_back(Datagram {
                 buf: std::mem::take(transmit_buf),
                 segment_size: if count > 1 { segment_size } else { 0 },
@@ -838,7 +856,7 @@ pub fn run_worker(
         if let Some(quic) = conn.quic.as_mut() {
             quic.close(0, b"");
             transmit_buf.clear();
-            if let Ok(n) = quic.poll_transmit(now, &mut transmit_buf)
+            if let Ok(n) = quic.poll_transmit(now, &mut transmit_buf, None)
                 && n > 0
             {
                 unsafe {

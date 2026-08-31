@@ -314,7 +314,15 @@ impl Connection {
     /// Returns how many bytes were written. Packets from different spaces are
     /// coalesced into the same datagram, which is what keeps a handshake to
     /// two round trips.
-    pub fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Result<usize> {
+    /// `pad_to` makes the datagram exactly that many bytes, which is what a
+    /// GSO batch needs: the kernel splits one send into equal segments, and
+    /// only the last may be shorter.
+    pub fn poll_transmit(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        pad_to: Option<usize>,
+    ) -> Result<usize> {
         if self.closed.is_some() && self.close_pending.is_none() {
             return Ok(0);
         }
@@ -339,10 +347,13 @@ impl Connection {
             // inside the packet, covered by the length field and the AEAD -
             // zeroes appended after the tag would read to the peer as a
             // second, broken packet, and it drops the datagram.
-            let pad_to =
-                (space == Space::Initial && !self.handshake_done).then_some(MIN_INITIAL_DATAGRAM);
-            let wrote = self.write_packet(space, now, out, start, congested, pad_to)?;
-            if wrote && pad_to.is_some() {
+            let pad = if space == Space::Initial && !self.handshake_done {
+                Some(MIN_INITIAL_DATAGRAM)
+            } else {
+                pad_to
+            };
+            let wrote = self.write_packet(space, now, out, start, congested, pad)?;
+            if wrote && pad.is_some() {
                 // The datagram is full of padding now, so nothing can be
                 // coalesced behind it; the next space goes in its own
                 break;
@@ -394,7 +405,13 @@ impl Connection {
         out.extend_from_slice(&truncated_pn.to_be_bytes()[8 - pn_len..]);
 
         let payload_start = out.len();
-        let budget = MAX_DATAGRAM.saturating_sub(out.len() - datagram_start + TAG_LEN);
+        // A padded datagram has to come out exactly the requested size, so the
+        // payload is capped there rather than at the usual limit: topping it
+        // up afterwards cannot help if the frames already overshot, and they
+        // do - a wider packet number or stream offset moves the total by a
+        // byte or two, which is enough to break a GSO batch.
+        let limit = pad_to.unwrap_or(MAX_DATAGRAM);
+        let budget = limit.saturating_sub(out.len() - datagram_start + TAG_LEN);
         let mut frames = Vec::new();
         let ack_eliciting = self.fill_payload(space, now, out, budget, &mut frames, congested)?;
 
@@ -1235,7 +1252,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        let n = conn.poll_transmit(Instant::now(), &mut out).unwrap();
+        let n = conn.poll_transmit(Instant::now(), &mut out, None).unwrap();
         assert_eq!(
             n, MIN_INITIAL_DATAGRAM,
             "an Initial datagram is padded to 1200"
@@ -1359,7 +1376,7 @@ mod tests {
             }
 
             out.clear();
-            let n = conn.poll_transmit(now, &mut out).unwrap();
+            let n = conn.poll_transmit(now, &mut out, None).unwrap();
             if n > 0 {
                 sock.send(&out[..n]).unwrap();
             }
@@ -1431,7 +1448,7 @@ mod tests {
         while Instant::now() < deadline {
             let now = Instant::now();
             out.clear();
-            let n = conn.poll_transmit(now, &mut out).unwrap();
+            let n = conn.poll_transmit(now, &mut out, None).unwrap();
             if n > 0 {
                 sock.send(&out[..n]).unwrap();
             }
