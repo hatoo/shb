@@ -12,5 +12,6 @@
 pub mod crypto;
 pub mod frame;
 pub mod packet;
+pub mod recovery;
 pub mod stream;
 pub mod varint;
