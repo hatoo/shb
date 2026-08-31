@@ -11,6 +11,7 @@ mod buf_ring;
 mod http1;
 mod http2;
 mod http3;
+mod quic;
 mod report;
 mod shutdown;
 mod stats;
