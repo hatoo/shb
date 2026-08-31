@@ -70,6 +70,10 @@ struct SpaceState {
     crypto_offset: u64,
     /// How much of `crypto_out` has been put in a packet at least once
     crypto_sent: usize,
+    /// Incoming handshake bytes, reassembled. rustls needs the handshake in
+    /// order, and a certificate chain spans several packets, so on a real
+    /// network the pieces do arrive out of order.
+    crypto_in: RecvStream,
 }
 
 pub struct Connection {
@@ -210,6 +214,7 @@ impl Connection {
         s.sent = SentPackets::default();
         s.crypto_out.clear();
         s.crypto_sent = 0;
+        s.crypto_in = RecvStream::default();
         self.pto_count = 0;
         self.pto_probes = 0;
     }
@@ -810,12 +815,19 @@ impl Connection {
     }
 
     fn on_crypto(&mut self, space: Space, offset: u64, data: &[u8]) -> Result<()> {
-        // rustls wants the handshake stream in order. Out-of-order CRYPTO is
-        // rare enough on a single path that buffering it is not worth the
-        // machinery; the peer will resend after the probe timeout.
-        let _ = (space, offset);
+        // rustls needs the handshake in order and rejects anything else as a
+        // corrupt message, so the pieces are reassembled first. A certificate
+        // chain spans several packets, which is exactly where a real network
+        // reorders them; a server on loopback never does, which is why this
+        // only shows up against someone else's.
+        let s = &mut self.spaces[space as usize];
+        s.crypto_in.push(offset, data, false)?;
+        let mut ordered = Vec::new();
+        if s.crypto_in.read(&mut ordered) == 0 {
+            return Ok(());
+        }
         self.tls
-            .read_hs(data)
+            .read_hs(&ordered)
             .map_err(|e| anyhow::anyhow!("TLS handshake: {e}"))?;
         if self.params.initial_max_data == 0
             && let Some(raw) = self.tls.quic_transport_parameters()
