@@ -220,10 +220,11 @@ threads for every tool. Numbers are requests/sec; higher is better.
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **1,043,685** | 915,864 | 828,703 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **931,124** | — | 909,564 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,252,889** | — | 1,199,664 |
-| HTTP/3 | 32 conns × 32 streams | **1,938,777** | — | 1,430,755 |
+| HTTP/1.1 | 1000 connections | **937,151** | 833,164 | 766,325 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **895,327** | — | 862,520 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,211,563** | — | 1,139,660 |
+| HTTP/3 | 32 conns × 32 streams | **2,237,865** | — | 1,232,642 |
+| HTTP/3 | 16 conns × 128 streams | **1,477,195** | — | 974,860 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -234,22 +235,24 @@ $ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 14 % over wrk and 26 % over h2load. Its
+**On HTTP/1.1 shb is ahead of both** — 12 % over wrk and 22 % over h2load. Its
 response path is a boundary scanner rather than a parser (see
 [How it works](#how-it-works)), which is worth ~10 % on its own. The three land
 closer together at low connection counts, where the ceiling is a round trip
-rather than the client: at 64 connections it is 503k / 462k / 433k.
+rather than the client: at 64 connections it is 458k / 435k / 398k.
 
-**On HTTP/2 shb is 2 % ahead** at 32 × 32 and 4 % at 100 × 100. Like the
+**On HTTP/2 shb is 4 % ahead** at 32 × 32 and 6 % at 100 × 100. Like the
 HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
 single HPACK block encoded once at start-up, and responses are walked for
 `:status` with every other field measured and skipped.
 
-**On HTTP/3 shb is 36 % ahead**, and 66 % at 16 × 128. Two things get it
-there: QPACK, where a profile of a saturated worker used to spend 47 % of its
-time Huffman-decoding response header values that the scanner now steps over,
-and turning the QUIC state machine once per batch of datagrams rather than
-once per datagram.
+**On HTTP/3 shb is 82 % ahead** at 32 × 32 and 52 % at 16 × 128. Three things
+get it there: QPACK, where a profile of a saturated worker used to spend 47 %
+of its time Huffman-decoding response header values that the scanner now steps
+over; turning the QUIC state machine once per batch of datagrams rather than
+once per datagram; and keeping the streams that have something to send in a
+queue, so building a packet costs what the connection is actually sending
+rather than what it has open.
 
 An earlier version of this table measured against a server that saturated
 before any of the clients did, which flattered every number and reversed some
@@ -266,7 +269,7 @@ mean anything.
 | CPU | AMD Ryzen 9 3950X — 16 cores / 32 threads |
 | Memory | 31 GiB |
 | OS | Ubuntu 24.04.4 LTS on **WSL2** (WSL 2.7.11.0) |
-| Kernel | 6.18.40.1-microsoft-standard-WSL2+ |
+| Kernel | 6.18.33.2-microsoft-standard-WSL2 |
 | Rust | 1.98.0 |
 
 **Tools**
