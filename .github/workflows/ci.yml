@@ -60,7 +60,11 @@ jobs:
       - name: Build the containers we build ourselves
         uses: docker/bake-action@v6
         with:
-          files: docker/compose.yml
+          # From docker/, because the build contexts in the compose file are
+          # relative to it and bake resolves them against its own working
+          # directory rather than the file's
+          workdir: docker
+          files: compose.yml
           load: true
           set: |
             *.cache-from=type=gha
