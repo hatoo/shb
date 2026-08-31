@@ -117,6 +117,10 @@ bun|h1|http://127.0.0.1:18459/|cleartext
 bun|h1|https://127.0.0.1:18458/|TLS
 bun|h2|https://127.0.0.1:18461/|TLS, ALPN h2, via node:http2
 bun|h3|https://127.0.0.1:18458/|Bun's own QUIC
+deno|h1|http://127.0.0.1:18463/|cleartext
+deno|h2|http://127.0.0.1:18463/|cleartext h2c, prior knowledge
+deno|h1|https://127.0.0.1:18462/|TLS
+deno|h2|https://127.0.0.1:18462/|TLS, ALPN h2, undocumented but present
 node|h1|http://127.0.0.1:18093/|cleartext
 node|h2|http://127.0.0.1:18092/|cleartext h2c, Node's own HTTP/2
 node|h1|https://127.0.0.1:18452/|TLS

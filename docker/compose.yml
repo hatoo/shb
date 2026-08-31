@@ -140,3 +140,14 @@ services:
       - "18458:443/udp"
       - "18461:8443"
       - "18459:8080"
+
+  # Deno, from the image its own project publishes. Its HTTP/2 is hyper's, so
+  # this is not a new decoder, but it is a different integration of one and it
+  # answers h2c on a cleartext socket, which not every server here does.
+  deno:
+    image: denoland/deno:2.9.6
+    command: ["deno", "run", "--allow-net", "--allow-read", "/app/server.js"]
+    volumes:
+      - "./conf:/certs:ro"
+      - "./deno/server.js:/app/server.js:ro"
+    ports: ["18462:443", "18463:8080"]
