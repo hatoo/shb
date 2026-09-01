@@ -89,6 +89,8 @@ pub fn setup(host: &str, alpn: &[u8]) -> Result<TlsSetup> {
 /// - HTTP bytes -> [`write_plaintext`] -> [`take_ciphertext`] -> socket send
 pub struct TlsSession {
     conn: ClientConnection,
+    /// Plaintext rustls would not take yet, offered again on every flush
+    pending_plaintext: Vec<u8>,
 }
 
 impl TlsSession {
@@ -96,6 +98,7 @@ impl TlsSession {
         Ok(TlsSession {
             conn: ClientConnection::new(setup.config.clone(), setup.server_name.clone())
                 .context("failed to create TLS session")?,
+            pending_plaintext: Vec::new(),
         })
     }
 
@@ -148,18 +151,49 @@ impl TlsSession {
     }
 
     /// Queue plaintext to be encrypted and sent
+    ///
+    /// rustls will not take unbounded plaintext: before the handshake finishes
+    /// it can only buffer it, and the buffer is 64 KiB by default, so a request
+    /// body larger than that is refused outright - and the first request goes
+    /// out while the handshake is still in flight. Whatever it will not take
+    /// waits here and is offered again from `take_ciphertext`, which is called
+    /// on every flush and so runs as the handshake completes and as ciphertext
+    /// leaves.
     pub fn write_plaintext(&mut self, data: &[u8]) -> Result<()> {
-        self.conn
-            .writer()
-            .write_all(data)
-            .context("TLS plaintext write failed")
+        self.pending_plaintext.extend_from_slice(data);
+        self.push_plaintext()
+    }
+
+    /// Hand rustls as much of the backlog as it will take
+    fn push_plaintext(&mut self) -> Result<()> {
+        while !self.pending_plaintext.is_empty() {
+            let n = self
+                .conn
+                .writer()
+                .write(&self.pending_plaintext)
+                .context("TLS plaintext write failed")?;
+            if n == 0 {
+                break;
+            }
+            self.pending_plaintext.drain(..n);
+        }
+        Ok(())
     }
 
     /// Drain pending ciphertext (handshake messages included) to send
     pub fn take_ciphertext(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        while self.conn.wants_write() {
-            self.conn.write_tls(&mut out).context("write_tls failed")?;
+        loop {
+            self.push_plaintext()?;
+            let before = out.len();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut out).context("write_tls failed")?;
+            }
+            // Encrypting frees room, so a backlog may fit now; stop when a
+            // round makes no ciphertext, or there is nothing left to place
+            if self.pending_plaintext.is_empty() || out.len() == before {
+                break;
+            }
         }
         Ok(out)
     }
