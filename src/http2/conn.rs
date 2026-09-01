@@ -35,6 +35,12 @@ const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
 const SETTINGS_ENABLE_PUSH: u16 = 0x2;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
+/// The frame size every peer must accept, and what to assume until it says
+/// otherwise (RFC 9113 Section 6.5.2)
+const DEFAULT_MAX_FRAME: u32 = 16384;
+/// The largest a peer may ask for
+const MAX_FRAME_CEILING: u32 = (1 << 24) - 1;
 
 /// Largest window HTTP/2 allows
 const MAX_WINDOW: u32 = (1 << 31) - 1;
@@ -79,6 +85,9 @@ pub struct Connection {
     send_window: i64,
     /// The peer's SETTINGS_INITIAL_WINDOW_SIZE, the credit each new stream gets
     peer_initial_window: u32,
+    /// The peer's SETTINGS_MAX_FRAME_SIZE. A header block or body larger than
+    /// this has to be split, or the peer answers with FRAME_SIZE_ERROR
+    peer_max_frame: u32,
     /// Bytes received against the connection window since the last update
     recv_consumed: u32,
     /// A GOAWAY has been received
@@ -98,6 +107,7 @@ impl Connection {
             max_concurrent: u32::MAX,
             send_window: 65535,
             peer_initial_window: 65535,
+            peer_max_frame: DEFAULT_MAX_FRAME,
             recv_consumed: 0,
             goaway: false,
         }
@@ -141,11 +151,35 @@ impl Connection {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(2);
         let end_stream = if body.is_empty() { FLAG_END_STREAM } else { 0 };
-        self.frame_header(block.len(), HEADERS, FLAG_END_HEADERS | end_stream, id);
-        self.out.extend_from_slice(block);
+        let max = self.peer_max_frame as usize;
+
+        // A header block longer than one frame continues in CONTINUATION, and
+        // only the last of them carries END_HEADERS
+        let mut chunks = block.chunks(max).peekable();
+        let mut first = true;
+        while let Some(chunk) = chunks.next() {
+            let last = chunks.peek().is_none();
+            let kind = if first { HEADERS } else { CONTINUATION };
+            let mut flags = if last { FLAG_END_HEADERS } else { 0 };
+            if first {
+                flags |= end_stream;
+            }
+            self.frame_header(chunk.len(), kind, flags, id);
+            self.out.extend_from_slice(chunk);
+            first = false;
+        }
+
         if !body.is_empty() {
-            self.frame_header(body.len(), DATA, FLAG_END_STREAM, id);
-            self.out.extend_from_slice(body);
+            let mut chunks = body.chunks(max).peekable();
+            while let Some(chunk) = chunks.next() {
+                let flags = if chunks.peek().is_none() {
+                    FLAG_END_STREAM
+                } else {
+                    0
+                };
+                self.frame_header(chunk.len(), DATA, flags, id);
+                self.out.extend_from_slice(chunk);
+            }
             self.send_window -= body.len() as i64;
         }
         self.open.push(id);
@@ -356,6 +390,12 @@ impl Connection {
                     self.peer_initial_window = value
                 }
                 SETTINGS_INITIAL_WINDOW_SIZE => bail!("SETTINGS_INITIAL_WINDOW_SIZE out of range"),
+                SETTINGS_MAX_FRAME_SIZE
+                    if (DEFAULT_MAX_FRAME..=MAX_FRAME_CEILING).contains(&value) =>
+                {
+                    self.peer_max_frame = value
+                }
+                SETTINGS_MAX_FRAME_SIZE => bail!("SETTINGS_MAX_FRAME_SIZE out of range"),
                 _ => {}
             }
         }
