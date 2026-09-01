@@ -115,6 +115,7 @@ nginx|h2|http://127.0.0.1:18090/|GOAWAY on the fifth request
 nginx|h1|https://127.0.0.1:18450/|Connection: close on the fifth request, TLS
 nginx|h2|https://127.0.0.1:18450/|GOAWAY on the fifth request, TLS
 nginx|h3|https://127.0.0.1:18450/|GOAWAY on the fifth request, over QUIC
+nginx|h3|https://127.0.0.1:18464/|address validation: the handshake starts over with a Retry token
 caddy|h1|http://127.0.0.1:18081/|cleartext
 caddy|h2|http://127.0.0.1:18081/|cleartext h2c, prior knowledge
 caddy|h1|https://127.0.0.1:18444/|TLS

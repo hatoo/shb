@@ -1125,6 +1125,7 @@ dependencies = [
  "num_cpus",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "serde_json",
  "socket2",

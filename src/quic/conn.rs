@@ -16,6 +16,43 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys};
 
+/// Whether a Retry authenticates as coming from the server we addressed
+///
+/// RFC 9001 Section 5.8 fixes the key and nonce, and the tag covers the
+/// connection ID our first Initial was addressed to followed by the Retry
+/// itself without its last sixteen bytes. Off-path attackers can forge the
+/// rest of a Retry; they cannot forge this.
+fn retry_tag_is_valid(original_dcid: &ConnectionId, packet: &[u8]) -> bool {
+    const KEY: [u8; 16] = [
+        0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
+        0x4e,
+    ];
+    const NONCE: [u8; 12] = [
+        0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+    ];
+    const TAG_LEN: usize = 16;
+
+    let Some(body_len) = packet.len().checked_sub(TAG_LEN) else {
+        return false;
+    };
+    let (body, tag) = packet.split_at(body_len);
+
+    let mut pseudo = Vec::with_capacity(1 + original_dcid.len() + body.len());
+    pseudo.push(original_dcid.len() as u8);
+    pseudo.extend_from_slice(original_dcid.as_slice());
+    pseudo.extend_from_slice(body);
+
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &KEY).expect("a 16-byte AES key"),
+    );
+    let nonce = ring::aead::Nonce::assume_unique_for_key(NONCE);
+    let mut empty: [u8; 0] = [];
+    match key.seal_in_place_separate_tag(nonce, ring::aead::Aad::from(&pseudo), &mut empty) {
+        Ok(computed) => computed.as_ref() == tag,
+        Err(_) => false,
+    }
+}
+
 /// Which generation of 1-RTT keys a packet was protected with
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Generation {
@@ -115,6 +152,13 @@ pub struct Connection {
     prev_1rtt_remote: Option<Box<dyn rustls::quic::PacketKey>>,
     /// Which generation is in use: the bit the peer flips to update its keys
     key_phase: bool,
+    /// The Destination Connection ID of our first Initial, which is what a
+    /// Retry's integrity tag is computed over
+    original_dcid: ConnectionId,
+    /// The token a Retry gave us, to be repeated in every Initial after it
+    retry_token: Vec<u8>,
+    /// One Retry is followed; a second is ignored (RFC 9000 Section 17.2.5.2)
+    retried: bool,
     /// The first packet number seen under the current generation, which is
     /// what tells a late packet from the old generation apart from the first
     /// of a new one - both carry the phase bit we are not using
@@ -220,6 +264,9 @@ impl Connection {
             rotate_at: 0,
             local_cid,
             peer_cid: initial_dcid,
+            original_dcid: initial_dcid,
+            retry_token: Vec::new(),
+            retried: false,
             params: Params::default(),
             handshake_done: false,
             connected: false,
@@ -483,7 +530,11 @@ impl Connection {
                 space,
                 dcid: self.peer_cid,
                 scid: self.local_cid,
-                token: Vec::new(),
+                token: if space == Space::Initial {
+                    self.retry_token.clone()
+                } else {
+                    Vec::new()
+                },
             }),
         };
         match &long {
@@ -793,7 +844,8 @@ impl Connection {
                     return Ok(0);
                 }
                 Incoming::Retry { scid, token, .. } => {
-                    self.on_retry(scid, token)?;
+                    let (scid, token) = (scid, token.to_vec());
+                    self.on_retry(scid, &token, buf)?;
                     return Ok(0);
                 }
                 Incoming::Long {
@@ -1109,13 +1161,41 @@ impl Connection {
         }
     }
 
-    fn on_retry(&mut self, scid: ConnectionId, _token: &[u8]) -> Result<()> {
-        // A benchmark client has nothing to gain from following a Retry: it
-        // would mean starting the handshake again with a token, and a server
-        // that demands one under load is a server whose numbers would not
-        // mean anything anyway
-        let _ = scid;
-        self.lose("the server asked for a Retry, which shb does not follow");
+    /// Start the handshake again with the token the server asked for
+    ///
+    /// A server that validates addresses answers the first Initial with a
+    /// Retry instead of a handshake, and will not talk to a client that
+    /// carries on without the token. Not following one meant every such server
+    /// was simply unreachable.
+    ///
+    /// `packet` is the whole Retry, tag included, which is what the integrity
+    /// tag is computed over.
+    fn on_retry(&mut self, scid: ConnectionId, token: &[u8], packet: &[u8]) -> Result<()> {
+        // RFC 9000 Section 17.2.5.2: at most one, and none once the handshake
+        // has produced keys - a late one is an attacker, not the server
+        if self.retried || self.handshake_done || token.is_empty() {
+            return Ok(());
+        }
+        if !retry_tag_is_valid(&self.original_dcid, packet) {
+            // RFC 9001 Section 5.8: one that does not authenticate is discarded
+            return Ok(());
+        }
+
+        self.retried = true;
+        self.retry_token = token.to_vec();
+        self.peer_cid = scid;
+        // RFC 9001 Section 5.2: the Initial secrets follow the connection ID
+        // the server chose, so they have to be derived again
+        self.spaces[Space::Initial as usize].keys =
+            Some(initial_keys(scid.as_slice(), rustls::Side::Client)?);
+        // The first flight was never received, so it goes again - and the
+        // packets carrying it can never be acknowledged, since the keys that
+        // protected them are gone
+        self.spaces[Space::Initial as usize].crypto_sent = 0;
+        self.spaces[Space::Initial as usize].sent = SentPackets::default();
+        self.pto_count = 0;
+        self.pto_probes = 0;
+        self.needs_send = true;
         Ok(())
     }
 
@@ -1738,5 +1818,28 @@ mod tests {
             Generation::Next,
             "above the changeover it is the peer updating again"
         );
+    }
+    #[test]
+    fn the_retry_from_the_rfc_authenticates_and_a_tampered_one_does_not() {
+        // RFC 9001 Appendix A.4, which exists so an implementation can check
+        // exactly this without a server
+        let odcid = ConnectionId::new(&[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]).unwrap();
+        let mut packet = vec![
+            0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62,
+            0xb5, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x04, 0xa2, 0x65, 0xba, 0x2e, 0xff, 0x4d, 0x82,
+            0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba,
+        ];
+        assert!(retry_tag_is_valid(&odcid, &packet));
+
+        // A Retry an off-path attacker made up: everything else can be
+        // guessed, the tag cannot
+        let last = packet.len() - 1;
+        packet[last] ^= 1;
+        assert!(!retry_tag_is_valid(&odcid, &packet));
+
+        // Nor does it authenticate against a different first Initial
+        packet[last] ^= 1;
+        let other = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert!(!retry_tag_is_valid(&other, &packet));
     }
 }
