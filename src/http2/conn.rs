@@ -66,8 +66,13 @@ pub struct Connection {
     header_end_stream: bool,
     /// Next client stream id (odd, ascending)
     next_id: u32,
-    /// Streams opened and not yet finished
-    open: u32,
+    /// Ids of the streams opened and not yet finished. A count is not enough:
+    /// a server that answers without reading the request body follows the
+    /// response with RST_STREAM, and that arrives after the stream has already
+    /// ended. Decrementing a counter for it takes the slot of whichever stream
+    /// happens to be open instead, and that stream's own end is then dropped -
+    /// it never completes and the run stops making progress.
+    open: Vec<u32>,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Our remaining connection-level send credit
@@ -89,7 +94,7 @@ impl Connection {
             header_stream: 0,
             header_end_stream: false,
             next_id: 1,
-            open: 0,
+            open: Vec::new(),
             max_concurrent: u32::MAX,
             send_window: 65535,
             peer_initial_window: 65535,
@@ -120,7 +125,7 @@ impl Connection {
 
     /// Whether another stream may be opened right now
     pub fn can_open(&self) -> bool {
-        !self.goaway && self.open < self.max_concurrent
+        !self.goaway && (self.open.len() as u32) < self.max_concurrent
     }
 
     /// Open a stream carrying `block` (and `body`), returning its id
@@ -143,7 +148,7 @@ impl Connection {
             self.out.extend_from_slice(body);
             self.send_window -= body.len() as i64;
         }
-        self.open += 1;
+        self.open.push(id);
         Some(id)
     }
 
@@ -231,7 +236,7 @@ impl Connection {
                 WINDOW_UPDATE => self.on_window_update(stream, payload)?,
                 PING => self.on_ping(flags, payload),
                 RST_STREAM => {
-                    if self.finish_stream() {
+                    if self.finish_stream(stream) {
                         events.push(Event::Reset { stream_id: stream });
                     }
                 }
@@ -254,7 +259,7 @@ impl Connection {
             self.recv_consumed = 0;
             self.window_update(0, credit);
         }
-        if flags & FLAG_END_STREAM != 0 && self.finish_stream() {
+        if flags & FLAG_END_STREAM != 0 && self.finish_stream(stream) {
             events.push(Event::End { stream_id: stream });
         }
     }
@@ -326,7 +331,7 @@ impl Connection {
                 status,
             });
         }
-        if end_stream && self.finish_stream() {
+        if end_stream && self.finish_stream(stream) {
             events.push(Event::End { stream_id: stream });
         }
         Ok(())
@@ -379,12 +384,17 @@ impl Connection {
     }
 
     /// Account for a stream ending, returning false if none was open
-    fn finish_stream(&mut self) -> bool {
-        if self.open == 0 {
-            return false;
+    /// Retire `stream` if it is still open. False means it had already
+    /// finished, which is ordinary: RST_STREAM routinely follows a response
+    /// the peer has already ended.
+    fn finish_stream(&mut self, stream: u32) -> bool {
+        match self.open.iter().position(|&id| id == stream) {
+            Some(pos) => {
+                self.open.swap_remove(pos);
+                true
+            }
+            None => false,
         }
-        self.open -= 1;
-        true
     }
 }
 
@@ -654,5 +664,49 @@ mod tests {
         c.feed(&frame(DATA, 0, id, &[0]), &mut events).unwrap();
         let out = c.take_output().unwrap();
         assert_eq!(out[3], WINDOW_UPDATE);
+    }
+    #[test]
+    fn a_late_reset_does_not_swallow_another_stream() {
+        // A server that answers without reading the request body ends the
+        // stream and then resets it. That RST_STREAM lands after the next
+        // request has gone out, and retiring streams by count rather than by
+        // id let it take the new stream's place: the new stream's own end was
+        // then ignored and it never completed.
+        let mut c = connected();
+        let mut events = Vec::new();
+
+        let first = c.start_stream(&[0x82], b"body").unwrap();
+        c.feed(
+            &frame(HEADERS, FLAG_END_HEADERS, first, &[0x88]),
+            &mut events,
+        )
+        .unwrap();
+        c.feed(&frame(DATA, FLAG_END_STREAM, first, b""), &mut events)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::End { stream_id } if *stream_id == first))
+        );
+
+        let second = c.start_stream(&[0x82], b"body").unwrap();
+        // The reset for the finished stream arrives while `second` is open
+        c.feed(&frame(RST_STREAM, 0, first, &[0, 0, 0, 0]), &mut events)
+            .unwrap();
+
+        events.clear();
+        c.feed(
+            &frame(HEADERS, FLAG_END_HEADERS, second, &[0x88]),
+            &mut events,
+        )
+        .unwrap();
+        c.feed(&frame(DATA, FLAG_END_STREAM, second, b""), &mut events)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::End { stream_id } if *stream_id == second)),
+            "the second stream has to finish too, got {events:?}"
+        );
     }
 }
