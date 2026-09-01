@@ -38,6 +38,13 @@
 # reassembling a stream across datagrams. The file is written below rather than
 # kept in the repository.
 #
+# A third pass sends a large request header block, which nothing else here
+# does: every request otherwise carries about fifty bytes of headers, so the
+# HTTP/2 encoder never had to split one across CONTINUATION frames and HTTP/3
+# never had to put a QPACK field section across several datagrams. nginx's
+# /bigheaders covers the same ground in the other direction - reading a large
+# block - and only nginx and caddy serve it.
+#
 # A second pass repeats the run with a request body, because every HTTP/2 bug
 # found so far was invisible without one. Every endpoint in the list above
 # sends GET, and the one end-to-end test that posts a body talks to a server
@@ -77,6 +84,9 @@ BODY_CONNECTIONS=${BODY_CONNECTIONS:-4}
 # Past a receive buffer (16 KiB), a TLS record and a QUIC datagram, several
 # times over
 BIGBODY_BYTES=${BIGBODY_BYTES:-262144}
+# Four of these is about 32 KB encoded, twice the frame size a peer may assume,
+# so the block cannot go in one HEADERS frame
+BIGHEADER_BYTES=${BIGHEADER_BYTES:-8000}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
 if [ ! -x "$SHB" ]; then
@@ -115,6 +125,8 @@ nginx|h2|http://127.0.0.1:18080/bigbody|256 KB body, h2c
 nginx|h1|https://127.0.0.1:18443/bigbody|256 KB body, TLS
 nginx|h2|https://127.0.0.1:18443/bigbody|256 KB body, TLS
 nginx|h3|https://127.0.0.1:18443/bigbody|256 KB body over QUIC
+caddy|h2|http://127.0.0.1:18081/bigheaders|48 KB of response headers, h2c
+caddy|h3|https://127.0.0.1:18444/bigheaders|a QPACK field section spanning several reads
 caddy|h1|http://127.0.0.1:18081/bigbody|256 KB body, cleartext
 caddy|h2|https://127.0.0.1:18444/bigbody|256 KB body, TLS
 caddy|h3|https://127.0.0.1:18444/bigbody|256 KB body over QUIC
@@ -239,8 +251,8 @@ while IFS='|' read -r server proto url note; do
     [ -z "$server" ] && continue
     # See the header: HTTP/3 through Docker's UDP publishing measures Docker
     [ "$proto" = h3 ] && continue
-    # /bigbody is about what the server sends, not what it is sent
-    case "$url" in *"/bigbody") continue ;; esac
+    # These two are about what the server sends, not what it is sent
+    case "$url" in *"/bigbody" | *"/bigheaders") continue ;; esac
     skip=""
     case "$server|$proto" in
         # Two of these on one connection wedge it, and curl hangs there too
@@ -294,6 +306,65 @@ while IFS='|' read -r server proto url note; do
             '"ok=\(.requests.ok) err=\(.requests.errors) connErr=\(.requests.connectErrors) \(.statusCodes)"' 2>/dev/null)
         printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"
         failures+=("$server $proto $url with a ${BODY_BYTES}-byte body  ${detail:-no JSON report; shb itself failed}")
+        fail=$((fail + 1))
+    fi
+done <<< "$ENDPOINTS"
+
+# ---------------------------------------------------------------------------
+# Third pass: the same endpoints, with a large request header block
+# ---------------------------------------------------------------------------
+
+big_header=$(head -c "$BIGHEADER_BYTES" /dev/zero | tr '\0' 'h')
+
+echo
+printf '%-8s %-5s %-30s %-9s %s\n' SERVER PROTO "BIG REQUEST HEADERS" RESULT NOTE
+printf '%-8s %-5s %-30s %-9s %s\n' -------- ----- ------------------------------ --------- ----
+
+while IFS='|' read -r server proto url note; do
+    [ -z "$server" ] && continue
+    # These two answer about what the server sends, not what it is sent
+    case "$url" in *"/bigbody" | *"/bigheaders") continue ;; esac
+    skip=""
+    case "$server|$proto" in
+        # Both cut the stream off rather than answer; their HTTP/1.1 says why,
+        # with a 400 for the same block
+        haproxy\|h2 | tomcat\|h2) skip="header block over its limit, reset rather than answered" ;;
+    esac
+    if [ -n "$skip" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "skipped" "$skip"
+        continue
+    fi
+
+    # As with the body pass: what is being checked is that a block too large
+    # for one frame is encoded, sent and understood, so any answer counts -
+    # several of these servers have their own limit and say 400 or 431, which
+    # still means they read it.
+    for attempt in 1 2; do
+        out=$(timeout 60 "$SHB" $(flag_for "$proto") \
+            -H "X-Big-A: $big_header" -H "X-Big-B: $big_header" \
+            -H "X-Big-C: $big_header" -H "X-Big-D: $big_header" \
+            -c "$BODY_CONNECTIONS" -n "$BODY_REQUESTS" --connect-timeout 10s -j "$url" 2>/dev/null)
+
+        if [ -n "$out" ] && [ "${out:0:1}" = "{" ]; then
+            ok=$(printf '%s' "$out" | jq -r '.requests.ok')
+            conn_err=$(printf '%s' "$out" | jq -r '.requests.connectErrors')
+            codes=$(printf '%s' "$out" | jq -r '.statusCodes | keys | join(",")')
+        else
+            ok=0; conn_err=1; codes=""
+        fi
+
+        [ "$ok" -ge "$threshold" ] && [ "$conn_err" = "0" ] && break
+        [ "$attempt" = "1" ] && sleep 2
+    done
+
+    if [ "$ok" -ge "$threshold" ] && [ "$conn_err" = "0" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "$ok ok" "$codes"
+        pass=$((pass + 1))
+    else
+        detail=$(printf '%s' "$out" | jq -rc \
+            '"ok=\(.requests.ok) err=\(.requests.errors) connErr=\(.requests.connectErrors) \(.statusCodes)"' 2>/dev/null)
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"
+        failures+=("$server $proto $url with a large header block  ${detail:-no JSON report; shb itself failed}")
         fail=$((fail + 1))
     fi
 done <<< "$ENDPOINTS"
