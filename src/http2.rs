@@ -253,6 +253,7 @@ pub fn run_worker(
     connections: usize,
     budget: Budget,
     connect_timeout: Duration,
+    timeout: Option<Duration>,
     parallel: usize,
 ) -> Result<Stats> {
     if connections == 0 || budget.is_empty() {
@@ -357,6 +358,40 @@ pub fn run_worker(
         uring::submit_and_wait_timeout(&submitter, uring::WAIT_TIMEOUT, batch)?;
 
         cq.sync();
+
+        // A response that never comes would otherwise hold the run open for
+        // ever: a wedged server is a result to report, not a reason to wait
+        if let Some(limit) = timeout {
+            let now = Instant::now();
+            for (conn_idx, conn) in conns.iter_mut().enumerate() {
+                if !conn
+                    .streams
+                    .iter()
+                    .any(|s| now.duration_since(s.start) >= limit)
+                {
+                    continue;
+                }
+                conn.fail_inflight(&mut stats);
+                conn.close();
+                if !stop && budget.may_start(started) {
+                    match uring::start_connect(
+                        &submitter,
+                        &mut sq,
+                        conn_idx,
+                        conn.generation,
+                        &target.addr,
+                        &raw_addr,
+                        &connect_timeout,
+                    ) {
+                        Ok(fd) => conn.fd = fd,
+                        Err(e) => {
+                            eprintln!("reconnect failed: {e}");
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
 
         for cqe in &mut cq {
             let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());

@@ -956,3 +956,56 @@ fn h1_body_larger_than_the_h2_initial_window() {
     ]);
     assert_all_ok(&report, 6, "200");
 }
+
+/// A server that accepts and then says nothing at all
+///
+/// Without --timeout a run against one of these never ends: there is no error
+/// to report and no response to count, so the loop waits for a reply that is
+/// not coming. Every hang found this week looked like this from the outside.
+fn silent_server_addr() -> SocketAddr {
+    static SERVER: OnceLock<SocketAddr> = OnceLock::new();
+    *SERVER.get_or_init(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                // Hold it open and never write: the point is a peer that is
+                // there and answers nothing
+                held.push(stream);
+            }
+        });
+        addr
+    })
+}
+
+#[test]
+fn a_silent_server_ends_the_run_instead_of_hanging() {
+    let addr = silent_server_addr();
+    let url = format!("http://{addr}/");
+    let report = shb_json(&["--timeout", "500ms", "-n", "2", "-c", "1", "-t", "1", &url]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 2, "report: {report}");
+}
+
+/// The same over HTTP/2, where the wait is for a response on a stream rather
+/// than for bytes on the socket
+#[test]
+fn a_silent_server_ends_an_http2_run_too() {
+    let addr = silent_server_addr();
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "--timeout",
+        "500ms",
+        "-n",
+        "2",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 2, "report: {report}");
+}

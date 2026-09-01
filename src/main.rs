@@ -80,6 +80,13 @@ pub struct Args {
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     pub connect_timeout: Duration,
 
+    /// How long to wait for a response before giving up on it (e.g. 30s).
+    /// The request is counted as an error and its connection is replaced.
+    /// Off by default, so a run against a server that stops answering waits
+    /// rather than reporting
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub timeout: Option<Duration>,
+
     /// Number of worker threads
     #[arg(short = 't', long, default_value_t = default_threads(), value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub threads: usize,
@@ -197,13 +204,21 @@ fn main() -> Result<()> {
                 let connections = conns_per_thread[i];
                 let budget = budget_per_thread[i];
                 let connect_timeout = args.connect_timeout;
+                let timeout = args.timeout;
                 let http2 = args.http2;
                 let http3 = args.http3;
                 let parallel = args.parallel;
                 let tls = tls_setup.as_ref();
                 s.spawn(move || {
                     if http3 {
-                        http3::run_worker(target, connections, budget, connect_timeout, parallel)
+                        http3::run_worker(
+                            target,
+                            connections,
+                            budget,
+                            connect_timeout,
+                            timeout,
+                            parallel,
+                        )
                     } else if http2 {
                         http2::run_worker(
                             target,
@@ -211,10 +226,18 @@ fn main() -> Result<()> {
                             connections,
                             budget,
                             connect_timeout,
+                            timeout,
                             parallel,
                         )
                     } else {
-                        http1::run_worker(target, tls, connections, budget, connect_timeout)
+                        http1::run_worker(
+                            target,
+                            tls,
+                            connections,
+                            budget,
+                            connect_timeout,
+                            timeout,
+                        )
                     }
                 })
             })

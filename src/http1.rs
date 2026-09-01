@@ -39,6 +39,9 @@ struct Conn {
     /// user_data and ignored
     generation: u64,
     request_start: Instant,
+    /// When the request in flight stops being worth waiting for, if --timeout
+    /// was given. None means nothing is outstanding.
+    deadline: Option<Instant>,
 }
 
 impl Conn {
@@ -54,6 +57,7 @@ impl Conn {
             recv_armed: false,
             generation: 0,
             request_start: Instant::now(),
+            deadline: None,
         }
     }
 
@@ -74,8 +78,9 @@ impl Conn {
     }
 
     /// Reset per-request state for the next request
-    fn begin_request(&mut self) {
+    fn begin_request(&mut self, timeout: Option<Duration>) {
         self.request_start = Instant::now();
+        self.deadline = timeout.map(|t| self.request_start + t);
     }
 }
 
@@ -149,6 +154,7 @@ pub fn run_worker(
     connections: usize,
     budget: Budget,
     connect_timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Stats> {
     if connections == 0 || budget.is_empty() {
         return Ok(Stats::default());
@@ -229,7 +235,7 @@ pub fn run_worker(
             break;
         }
         started += 1;
-        conn.begin_request();
+        conn.begin_request(timeout);
         conn.fd = uring::start_connect(
             &submitter,
             &mut sq,
@@ -259,6 +265,39 @@ pub fn run_worker(
         uring::submit_and_wait_timeout(&submitter, uring::WAIT_TIMEOUT, batch)?;
 
         cq.sync();
+
+        // A response that never comes would otherwise hold the run open for
+        // ever: a wedged server is a result to report, not a reason to wait
+        if timeout.is_some() {
+            let now = Instant::now();
+            for (conn_idx, conn) in conns.iter_mut().enumerate() {
+                if conn.deadline.is_some_and(|d| now >= d) {
+                    stats.errors += 1;
+                    conn.deadline = None;
+                    conn.close();
+                    conn.parser.reset();
+                    if stop || !budget.may_start(started) {
+                        continue;
+                    }
+                    started += 1;
+                    match uring::start_connect(
+                        &submitter,
+                        &mut sq,
+                        conn_idx,
+                        conn.generation,
+                        &target.addr,
+                        &raw_addr,
+                        &connect_timeout,
+                    ) {
+                        Ok(fd) => conn.fd = fd,
+                        Err(e) => {
+                            eprintln!("reconnect failed: {e}");
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
 
         for cqe in &mut cq {
             let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
@@ -299,8 +338,9 @@ pub fn run_worker(
                         }
                         // Latency is measured from send start (excludes TCP
                         // connect; the first request on a TLS connection does
-                        // include the handshake)
-                        conn.request_start = Instant::now();
+                        // include the handshake). This re-arms the response
+                        // deadline too, which a reconnect otherwise loses.
+                        conn.begin_request(timeout);
                         queue_request(conn, &target.request_bytes)?;
                         flush(&submitter, &mut sq, conn_idx, conn)?;
                     }
@@ -367,6 +407,7 @@ pub fn run_worker(
                         // EOF: a close-delimited body completes normally here
                         if conn.parser.mark_eof() {
                             stats.record_success(conn.parser.status(), conn.request_start);
+                            conn.deadline = None;
                         } else {
                             stats.errors += 1;
                         }
@@ -425,7 +466,7 @@ pub fn run_worker(
                 let conn = &mut conns[conn_idx];
                 if !stop && budget.may_start(started) {
                     started += 1;
-                    conn.begin_request();
+                    conn.begin_request(timeout);
                     if keep_conn && conn.connected {
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;

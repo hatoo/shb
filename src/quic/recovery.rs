@@ -19,6 +19,8 @@ const TIME_THRESHOLD_NUM: u32 = 9;
 const TIME_THRESHOLD_DEN: u32 = 8;
 /// RFC 9002 Section 6.2.1
 const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+/// RFC 9002 Section 7.6.1 calls this kPersistentCongestionThreshold
+const PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 /// RFC 9002 Section 6.2.2, the value to use before the first RTT sample
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 
@@ -96,6 +98,12 @@ impl Rtt {
     /// RFC 9002 Section 6.2.1
     pub fn pto(&self, max_ack_delay: Duration) -> Duration {
         self.smoothed_or_initial() + (self.var * 4).max(TIMER_GRANULARITY) + max_ack_delay
+    }
+
+    /// How long everything has to be lost for before the path counts as gone
+    /// rather than merely congested (RFC 9002 Section 7.6.1)
+    pub fn persistent_congestion_duration(&self, max_ack_delay: Duration) -> Duration {
+        self.pto(max_ack_delay) * PERSISTENT_CONGESTION_THRESHOLD
     }
 
     /// RFC 9002 Section 6.1.2
@@ -204,7 +212,7 @@ pub struct Congestion {
 /// far above that because the path it cares about does not lose packets and
 /// slow start would otherwise dominate a short run
 const INITIAL_WINDOW: usize = 4 * 1024 * 1024;
-const MIN_WINDOW: usize = 2 * 1200;
+pub const MIN_WINDOW: usize = 2 * 1200;
 
 impl Default for Congestion {
     fn default() -> Self {
@@ -237,6 +245,21 @@ impl Congestion {
         self.window = (self.window / 2).max(MIN_WINDOW);
         self.ssthresh = self.window;
         self.recovery_until = Some(now);
+    }
+
+    /// Everything sent across a whole stretch was lost, so the path is not
+    /// congested but unusable, and halving is not enough: RFC 9002 Section
+    /// 7.6.2 puts the window on the floor and starts again from there.
+    ///
+    /// This is what recovers a connection whose every datagram is being
+    /// dropped for being too big or too bursty. Halving from a window that
+    /// starts megabytes wide would take a dozen round trips of loss to reach a
+    /// size that gets through, and each of those round trips is a probe
+    /// timeout that has already doubled.
+    pub fn on_persistent_congestion(&mut self) {
+        self.window = MIN_WINDOW;
+        self.ssthresh = usize::MAX;
+        self.recovery_until = None;
     }
 
     pub fn can_send(&self, in_flight: usize) -> bool {
@@ -531,5 +554,32 @@ mod tests {
         let (_, first) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0).unwrap();
         let (_, second) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 1).unwrap();
         assert_eq!(second - now, (first - now) * 2);
+    }
+    #[test]
+    fn persistent_congestion_puts_the_window_on_the_floor() {
+        // Halving is for a path that is congested. A path where nothing at all
+        // arrives for three probe timeouts is not congested, and halving from
+        // a window that starts megabytes wide would take a dozen rounds of
+        // loss to reach a size that gets through - each of them a timeout that
+        // has already doubled.
+        let mut c = Congestion::default();
+        assert!(c.window > MIN_WINDOW * 100, "the window starts wide");
+        c.on_persistent_congestion();
+        assert_eq!(c.window, MIN_WINDOW);
+        // And it grows again from there rather than staying pinned
+        let now = Instant::now();
+        c.on_ack(1200, now);
+        assert!(c.window > MIN_WINDOW);
+    }
+
+    #[test]
+    fn the_persistent_congestion_window_spans_three_probe_timeouts() {
+        let mut rtt = Rtt::default();
+        let max_ack_delay = Duration::from_millis(25);
+        rtt.update(Duration::from_millis(100), Duration::ZERO, max_ack_delay);
+        assert_eq!(
+            rtt.persistent_congestion_duration(max_ack_delay),
+            rtt.pto(max_ack_delay) * 3
+        );
     }
 }

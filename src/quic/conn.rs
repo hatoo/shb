@@ -226,6 +226,13 @@ impl Connection {
         self.pto_probes = 0;
     }
 
+    /// Whether a probe is owed. RFC 9002 Section 7.5 allows two datagrams for
+    /// one, and no more: a probe that goes out as a full batch is no use on a
+    /// path that is dropping full batches, which is the case it exists for.
+    pub fn probing(&self) -> bool {
+        self.pto_probes > 0
+    }
+
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
@@ -920,17 +927,35 @@ impl Connection {
         let (lost, deadline) = self.spaces[space as usize]
             .sent
             .detect_lost(now, loss_delay);
-        for p in &lost {
-            self.congestion.on_loss(p.time_sent, now);
-            for f in &p.frames {
-                self.on_frame_lost(space, *f);
-            }
-        }
+        self.on_lost_packets(space, &lost, now);
         self.loss_deadline = deadline;
         if !lost.is_empty() {
             self.needs_send = true;
         }
         Ok(())
+    }
+
+    /// Apply a batch of newly lost packets, and notice when the span of them
+    /// says the path stopped carrying anything at all
+    fn on_lost_packets(&mut self, space: Space, lost: &[SentPacket], now: Instant) {
+        for p in lost {
+            self.congestion.on_loss(p.time_sent, now);
+            for f in &p.frames {
+                self.on_frame_lost(space, *f);
+            }
+        }
+        // RFC 9002 Section 7.6.1: two ack-eliciting packets, everything from
+        // one to the other lost, and long enough between them
+        let mut eliciting = lost.iter().filter(|p| p.ack_eliciting);
+        let (Some(first), Some(last)) = (eliciting.next(), eliciting.next_back()) else {
+            return;
+        };
+        let duration = self
+            .rtt
+            .persistent_congestion_duration(Duration::from_millis(self.params.max_ack_delay_ms));
+        if last.time_sent.saturating_duration_since(first.time_sent) > duration {
+            self.congestion.on_persistent_congestion();
+        }
     }
 
     fn on_frame_acked(&mut self, f: SentFrame) {
@@ -1227,12 +1252,7 @@ impl Connection {
                 let (lost, deadline) = self.spaces[space as usize]
                     .sent
                     .detect_lost(now, loss_delay);
-                for p in &lost {
-                    self.congestion.on_loss(p.time_sent, now);
-                    for f in &p.frames {
-                        self.on_frame_lost(space, *f);
-                    }
-                }
+                self.on_lost_packets(space, &lost, now);
                 self.loss_deadline = deadline;
             }
             self.needs_send = true;
@@ -1523,5 +1543,70 @@ mod tests {
             }
         }
         panic!("the handshake did not finish within five seconds");
+    }
+    /// Build a connection with nothing sent, for driving recovery directly
+    #[cfg(test)]
+    fn test_connection() -> Connection {
+        let tls = crate::tls::client_config(b"h3").unwrap();
+        Connection::connect(
+            tls,
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 20,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 5_000,
+            },
+        )
+        .unwrap()
+    }
+
+    fn lost_packet(number: u64, at: Instant) -> crate::quic::recovery::SentPacket {
+        crate::quic::recovery::SentPacket {
+            number,
+            time_sent: at,
+            size: 1200,
+            ack_eliciting: true,
+            frames: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn losing_everything_for_long_enough_collapses_the_window() {
+        let mut conn = test_connection();
+        let now = Instant::now();
+        let span = conn
+            .rtt
+            .persistent_congestion_duration(Duration::from_millis(conn.params.max_ack_delay_ms));
+
+        // Two ack-eliciting packets lost, far enough apart that nothing got
+        // through for the whole stretch between them
+        let lost = [lost_packet(1, now), lost_packet(2, now + span + span)];
+        conn.on_lost_packets(Space::Data, &lost, now + span + span);
+        assert_eq!(
+            conn.congestion.window,
+            crate::quic::recovery::MIN_WINDOW,
+            "the path stopped carrying anything, so halving is not enough"
+        );
+    }
+
+    #[test]
+    fn a_short_burst_of_loss_does_not_collapse_the_window() {
+        // Losses inside one round trip are ordinary congestion: the window
+        // backs off, it does not go to the floor
+        let mut conn = test_connection();
+        let now = Instant::now();
+        let before = conn.congestion.window;
+
+        let lost = [
+            lost_packet(1, now),
+            lost_packet(2, now + Duration::from_millis(1)),
+        ];
+        conn.on_lost_packets(Space::Data, &lost, now + Duration::from_millis(1));
+        assert!(conn.congestion.window < before, "it still backs off");
+        assert!(
+            conn.congestion.window > crate::quic::recovery::MIN_WINDOW,
+            "but not to the floor"
+        );
     }
 }

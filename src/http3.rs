@@ -340,7 +340,16 @@ fn pump_transmits(
         // last may be shorter. Left to themselves they vary by a few bytes -
         // a packet number or a stream offset crossing a varint width - which
         // is enough to make every batch one segment long.
-        let max = if gso { GSO_SEGMENTS } else { 1 };
+        // A probe goes out as at most two datagrams (RFC 9002 Section 7.5).
+        // Batching it defeats the point: the path that lost the packets being
+        // probed for is often losing whole batches, and a probe that is itself
+        // a batch is lost the same way, so the timeout doubles and nothing
+        // ever gets through.
+        let max = match (gso, quic.probing()) {
+            (_, true) => 2,
+            (true, false) => GSO_SEGMENTS,
+            (false, false) => 1,
+        };
         transmit_buf.clear();
         let mut segment_size = 0usize;
         let mut count = 0usize;
@@ -529,6 +538,7 @@ pub fn run_worker(
     connections: usize,
     budget: Budget,
     connect_timeout: Duration,
+    timeout: Option<Duration>,
     parallel: usize,
 ) -> Result<Stats> {
     if connections == 0 || budget.is_empty() {
@@ -700,6 +710,35 @@ pub fn run_worker(
         cq.sync();
 
         let now = Instant::now();
+        // A response that never comes would otherwise hold the run open for
+        // ever: a wedged server is a result to report, not a reason to wait
+        if let Some(limit) = timeout {
+            for (conn_idx, conn) in conns.iter_mut().enumerate() {
+                if !conn
+                    .streams
+                    .iter()
+                    .any(|s| now.duration_since(s.start) >= limit)
+                {
+                    continue;
+                }
+                handle_broken(
+                    &submitter,
+                    &mut sq,
+                    conn_idx,
+                    conn,
+                    &mut stats,
+                    &tls_config,
+                    connect_timeout,
+                    target,
+                    &mut started,
+                    budget,
+                    stop,
+                    &mut transmit_buf,
+                    gso,
+                )?;
+            }
+        }
+
         for cqe in &mut cq {
             let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
             if ud == TIMEOUT_USER_DATA {
