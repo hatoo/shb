@@ -680,17 +680,23 @@ impl Connection {
         }
 
         // Our own unidirectional streams: the control and QPACK streams, which
-        // are written once and never again
+        // are written once and never again. Small as they are - fourteen bytes
+        // for the three of them - they are stream data like any other and
+        // count against the connection's limit (RFC 9000 Section 4.1). Leaving
+        // them out let the total drift below what the peer was counting.
         for i in 0..self.local_uni.len() {
-            let avail = room(out);
+            let cap = self.max_data_peer.saturating_sub(self.data_sent) as usize;
+            let avail = room(out).min(cap + 16);
             if avail < 16 {
                 break;
             }
             let (id, ref mut send) = self.local_uni[i];
+            let mut sent_len = 0;
             if let Some((offset, data, fin)) = send.next_send(avail - 16) {
                 let (len, data) = (data.len(), data.to_vec());
                 frame::put_stream(out, id, offset, fin, &data);
                 send.on_sent(offset, len, fin);
+                sent_len = len;
                 frames.push(SentFrame::Stream {
                     id,
                     offset,
@@ -699,6 +705,7 @@ impl Connection {
                 });
                 ack_eliciting = true;
             }
+            self.data_sent += sent_len as u64;
         }
 
         // Each queued stream gets one turn per packet, and goes to the back if

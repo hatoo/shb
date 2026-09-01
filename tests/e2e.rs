@@ -715,8 +715,16 @@ fn h3_server_addr() -> SocketAddr {
                 let quic_config =
                     quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls))
                         .expect("quic server config");
-                let server_config =
+                let mut server_config =
                     quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_config));
+                // Windows small enough that a large request body cannot go out
+                // in one go: the client has to send what fits, stop, and carry
+                // on as credit arrives. Left at quinn's defaults, which are
+                // megabytes, nothing here would ever block.
+                let mut transport = quinn::TransportConfig::default();
+                transport.receive_window(quinn::VarInt::from_u32(64 * 1024));
+                transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024));
+                server_config.transport_config(std::sync::Arc::new(transport));
                 let endpoint =
                     quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("addr"))
                         .expect("quic endpoint");

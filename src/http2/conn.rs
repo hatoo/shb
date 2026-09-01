@@ -44,6 +44,17 @@ const MAX_FRAME_CEILING: u32 = (1 << 24) - 1;
 
 /// Largest window HTTP/2 allows
 const MAX_WINDOW: u32 = (1 << 31) - 1;
+/// How many streams to assume the peer allows until its SETTINGS says
+///
+/// RFC 9113 Section 6.5.2 makes the initial value unlimited, and taking that
+/// literally means opening every stream the run asks for before the peer has
+/// said what it will take: the first flight goes out with the client preface,
+/// a round trip before its SETTINGS arrives. Servers refuse the excess, and a
+/// run of 800 requests at 400 streams came back with 600 of them reset by
+/// httpd, h2o and nghttpx alike. Their limit is 100, which is the usual one,
+/// and assuming it costs nothing - the real figure arrives a round trip later
+/// and the next fill uses it.
+const ASSUMED_MAX_CONCURRENT: u32 = 100;
 /// Receive-window credit to hand back in one go, once this much has been used
 const WINDOW_REFRESH: u32 = 1 << 30;
 
@@ -112,7 +123,7 @@ impl Connection {
             header_end_stream: false,
             next_id: 1,
             open: Vec::new(),
-            max_concurrent: u32::MAX,
+            max_concurrent: ASSUMED_MAX_CONCURRENT,
             send_window: 65535,
             peer_initial_window: 65535,
             peer_max_frame: DEFAULT_MAX_FRAME,
@@ -873,5 +884,30 @@ mod tests {
             c.take_output().is_none(),
             "the connection window is still empty"
         );
+    }
+    #[test]
+    fn no_more_streams_are_opened_than_a_silent_peer_is_likely_to_take() {
+        // The first flight goes out with the client preface, a round trip
+        // before the peer's SETTINGS arrives, so "unlimited until told
+        // otherwise" means opening every stream the run asks for and having
+        // the excess refused. 800 requests at 400 streams came back with 600
+        // of them reset by httpd, h2o and nghttpx.
+        let mut c = Connection::new();
+        c.initiate();
+        let mut opened = 0;
+        while c.start_stream(&[0x82], b"").is_some() {
+            opened += 1;
+            assert!(opened <= 1000, "start_stream never refuses");
+        }
+        assert_eq!(opened, ASSUMED_MAX_CONCURRENT as usize);
+
+        // And the peer's own figure replaces it as soon as it says
+        let mut events = Vec::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&SETTINGS_MAX_CONCURRENT_STREAMS.to_be_bytes());
+        payload.extend_from_slice(&300u32.to_be_bytes());
+        c.feed(&frame(SETTINGS, 0, 0, &payload), &mut events)
+            .unwrap();
+        assert!(c.can_open(), "the peer allows more than we assumed");
     }
 }
