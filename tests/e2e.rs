@@ -747,6 +747,14 @@ fn h3_server_addr() -> SocketAddr {
                                         chunk.advance(n);
                                     }
                                 }
+                                // Same rule as the axum server: a body too
+                                // large to name in a header says how long it
+                                // should be
+                                let want_len = request
+                                    .headers()
+                                    .get("x-body-len")
+                                    .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+                                    .and_then(|v| v.parse::<usize>().ok());
                                 let echo = request
                                     .headers()
                                     .get("x-echo")
@@ -758,6 +766,12 @@ fn h3_server_addr() -> SocketAddr {
                                     .get("x-expect-method")
                                     .map(|v| v.as_bytes().to_vec());
                                 let (status, body) = match echo {
+                                    _ if want_len == Some(req_body.len()) => {
+                                        (http::StatusCode::OK, "body complete")
+                                    }
+                                    _ if want_len.is_some() => {
+                                        (http::StatusCode::BAD_REQUEST, "body truncated")
+                                    }
                                     Some(ref e) if *e != req_body => {
                                         (http::StatusCode::BAD_REQUEST, "")
                                     }
@@ -870,6 +884,36 @@ fn h2_body_larger_than_the_initial_window() {
     std::fs::write(&path, vec![b'a'; len]).unwrap();
     let report = shb_json(&[
         "--http2",
+        "-m",
+        "POST",
+        "-H",
+        &format!("X-Body-Len: {len}"),
+        "-d",
+        &format!("@{}", path.display()),
+        "-n",
+        "6",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 6, "200");
+}
+
+/// And over HTTP/3, whose flow control is QUIC's rather than the protocol's.
+/// This one cannot go in the container suite: Docker's UDP publishing drops a
+/// GSO batch once a connection has this much to send, so it would measure
+/// Docker rather than shb.
+#[test]
+fn h3_body_larger_than_the_initial_window() {
+    let addr = h3_server_addr();
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let path = std::env::temp_dir().join("shb-e2e-big-body-h3.txt");
+    let len = 200_000;
+    std::fs::write(&path, vec![b'a'; len]).unwrap();
+    let report = shb_json(&[
+        "--http3",
         "-m",
         "POST",
         "-H",

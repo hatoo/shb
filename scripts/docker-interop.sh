@@ -31,6 +31,25 @@
 # is real rather than a single request: 200 requests over 50 connections
 # exercises connection reuse and concurrency, not just the first exchange.
 #
+# A second pass repeats the run with a request body, because every HTTP/2 bug
+# found so far was invisible without one. Every endpoint in the list above
+# sends GET, and the one end-to-end test that posts a body talks to a server
+# that reads it - so nothing exercised a body against a server that answers
+# without reading one, or a body past a frame or a window boundary. Three bugs
+# were hiding there: streams retired by counting, which a RST_STREAM after the
+# response then mis-retired; DATA and HEADERS frames sent whole however large,
+# which every server but nginx and caddy rejects past 16 KiB; and a body over
+# 64 KiB that TLS would not take. The default size crosses both boundaries.
+#
+# The pass asserts the exchange completed, not a particular status: the servers
+# are configured for GET and answer a POST with anything from 200 to 405 to
+# 413, while all three bugs showed up as a hang or an error.
+#
+# HTTP/3 is left out of it. Docker's UDP publishing drops a GSO batch of any
+# size once a connection has a body's worth to send, so a body over HTTP/3
+# would measure that rather than shb - the same servers take one natively at
+# full load, and h2load, which does not use GSO, gets through the container.
+#
 #   scripts/docker-interop.sh          # bring the servers up, test, leave them up
 #   scripts/docker-interop.sh --down   # stop them afterwards
 #   SHB=target/dist/shb scripts/docker-interop.sh
@@ -43,6 +62,11 @@ SHB=${SHB:-./target/release/shb}
 # request; it covers connection reuse, which one request cannot
 CONNECTIONS=${CONNECTIONS:-10}
 REQUESTS=${REQUESTS:-200}
+# Past 16384, the frame size a peer may assume, and past 65535, the window a
+# connection starts with and the plaintext rustls will hold
+BODY_BYTES=${BODY_BYTES:-100000}
+BODY_REQUESTS=${BODY_REQUESTS:-20}
+BODY_CONNECTIONS=${BODY_CONNECTIONS:-4}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
 if [ ! -x "$SHB" ]; then
@@ -174,6 +198,59 @@ while IFS='|' read -r server proto url note; do
             '"ok=\(.requests.ok) err=\(.requests.errors) connErr=\(.requests.connectErrors) \(.statusCodes)"' 2>/dev/null)
         printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"
         failures+=("$server $proto $url  ${detail:-no JSON report; shb itself failed}")
+        fail=$((fail + 1))
+    fi
+done <<< "$ENDPOINTS"
+
+# ---------------------------------------------------------------------------
+# Second pass: the same endpoints, with a request body
+# ---------------------------------------------------------------------------
+
+body_file=$(mktemp)
+trap 'rm -f "$body_file"' EXIT
+head -c "$BODY_BYTES" /dev/zero | tr '\0' 'a' > "$body_file"
+
+echo
+printf '%-8s %-5s %-30s %-9s %s\n' SERVER PROTO "BODY ${BODY_BYTES}B" RESULT NOTE
+printf '%-8s %-5s %-30s %-9s %s\n' -------- ----- ------------------------------ --------- ----
+
+while IFS='|' read -r server proto url note; do
+    [ -z "$server" ] && continue
+    # See the header: HTTP/3 through Docker's UDP publishing measures Docker
+    [ "$proto" = h3 ] && continue
+    skip=""
+    case "$server|$proto" in
+        # Two of these on one connection wedge it, and curl hangs there too
+        openlite\|h1) skip="wedges on a reused connection, curl too" ;;
+        # h2load fails this one as well; its HTTP/1.1 on the same port is fine
+        hypercorn\|h2)
+            [ "${url#https}" != "$url" ] && skip="rejected over TLS, h2load too"
+            ;;
+    esac
+    if [ -n "$skip" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "skipped" "$skip"
+        continue
+    fi
+
+    out=$(timeout 60 "$SHB" $(flag_for "$proto") -m POST -d "@$body_file" \
+        -c "$BODY_CONNECTIONS" -n "$BODY_REQUESTS" --connect-timeout 10s -j "$url" 2>/dev/null)
+
+    if [ -n "$out" ] && [ "${out:0:1}" = "{" ]; then
+        ok=$(printf '%s' "$out" | jq -r '.requests.ok')
+        errs=$(printf '%s' "$out" | jq -r '.requests.errors + .requests.connectErrors')
+        codes=$(printf '%s' "$out" | jq -r '.statusCodes | keys | join(",")')
+    else
+        ok=0; errs=1; codes=""
+    fi
+
+    if [ "$ok" = "$BODY_REQUESTS" ] && [ "$errs" = "0" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "$ok ok" "$codes"
+        pass=$((pass + 1))
+    else
+        detail=$(printf '%s' "$out" | jq -rc \
+            '"ok=\(.requests.ok) err=\(.requests.errors) connErr=\(.requests.connectErrors) \(.statusCodes)"' 2>/dev/null)
+        printf '%-8s %-5s %-30s %-9s %s\n' "$server" "$proto" "$url" "failed" "$note"
+        failures+=("$server $proto $url with a ${BODY_BYTES}-byte body  ${detail:-no JSON report; shb itself failed}")
         fail=$((fail + 1))
     fi
 done <<< "$ENDPOINTS"
