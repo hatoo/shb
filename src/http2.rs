@@ -147,6 +147,9 @@ fn fill_streams(
     let Some(h2) = conn.h2.as_mut() else {
         return;
     };
+    // A body that did not fit the windows when its stream opened leaves as the
+    // peer grants credit, which is what has just arrived
+    h2.pump_bodies(body);
     while conn.streams.len() < parallel && budget.may_start(*started) {
         let Some(stream_id) = h2.start_stream(header_block, body) else {
             break;

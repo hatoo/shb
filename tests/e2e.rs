@@ -22,6 +22,20 @@ use axum::routing::any;
 /// server. A request carrying an `X-Echo` header must send a matching body,
 /// and vice versa, so a single 200/201/... response proves both arrived.
 async fn handler(method: Method, headers: HeaderMap, body: Bytes) -> (StatusCode, &'static str) {
+    // A body too large to name in a header says how long it should be, which
+    // is what proves a body that had to be split across flow-control windows
+    // arrived whole rather than merely started
+    if let Some(want) = headers.get("x-body-len") {
+        let want: usize = std::str::from_utf8(want.as_bytes())
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        return if body.len() == want {
+            (StatusCode::OK, "body complete")
+        } else {
+            (StatusCode::BAD_REQUEST, "body truncated")
+        };
+    }
     // If the client sent our marker header, its value must equal the body
     if let Some(echo) = headers.get("x-echo") {
         if echo.as_bytes() != body.as_ref() {
@@ -841,4 +855,60 @@ fn h3_every_registered_method_arrives() {
     let addr = h3_server_addr();
     let url = format!("https://{addr}/");
     assert_every_method_arrives(&["--http3"], &url);
+}
+
+/// A body larger than the 65535-byte window HTTP/2 starts with has to be cut
+/// into DATA frames and resumed as the peer grants credit. Sending it in one
+/// go, as it used to be, meant the request was never started at all and the
+/// run stopped with no error and no end.
+#[test]
+fn h2_body_larger_than_the_initial_window() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let path = std::env::temp_dir().join("shb-e2e-big-body.txt");
+    let len = 200_000;
+    std::fs::write(&path, vec![b'a'; len]).unwrap();
+    let report = shb_json(&[
+        "--http2",
+        "-m",
+        "POST",
+        "-H",
+        &format!("X-Body-Len: {len}"),
+        "-d",
+        &format!("@{}", path.display()),
+        "-n",
+        "6",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 6, "200");
+}
+
+/// The same body over HTTP/1.1, where there is no flow control to cross
+#[test]
+fn h1_body_larger_than_the_h2_initial_window() {
+    let (v4, _) = server_addrs();
+    let url = format!("http://{v4}/");
+    let path = std::env::temp_dir().join("shb-e2e-big-body-h1.txt");
+    let len = 200_000;
+    std::fs::write(&path, vec![b'a'; len]).unwrap();
+    let report = shb_json(&[
+        "-m",
+        "POST",
+        "-H",
+        &format!("X-Body-Len: {len}"),
+        "-d",
+        &format!("@{}", path.display()),
+        "-n",
+        "6",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 6, "200");
 }

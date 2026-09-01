@@ -60,6 +60,15 @@ pub enum Event {
     Goaway,
 }
 
+/// A stream we have opened and not yet finished
+struct OpenStream {
+    id: u32,
+    /// How much of the request body has gone out
+    sent: usize,
+    /// What this stream's flow-control window still allows
+    window: i64,
+}
+
 pub struct Connection {
     /// Bytes waiting to be written to the socket
     out: Vec<u8>,
@@ -72,13 +81,12 @@ pub struct Connection {
     header_end_stream: bool,
     /// Next client stream id (odd, ascending)
     next_id: u32,
-    /// Ids of the streams opened and not yet finished. A count is not enough:
-    /// a server that answers without reading the request body follows the
-    /// response with RST_STREAM, and that arrives after the stream has already
-    /// ended. Decrementing a counter for it takes the slot of whichever stream
-    /// happens to be open instead, and that stream's own end is then dropped -
-    /// it never completes and the run stops making progress.
-    open: Vec<u32>,
+    /// The streams opened and not yet finished. Identity matters: a server
+    /// that answers without reading the request body follows the response with
+    /// RST_STREAM, and that arrives after the stream has already ended.
+    /// Retiring by count would take the slot of whichever stream happens to be
+    /// open instead, and that stream's own end would then be dropped.
+    open: Vec<OpenStream>,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Our remaining connection-level send credit
@@ -142,10 +150,7 @@ impl Connection {
     ///
     /// `block` is the header block built once by [`super::hpack::encode_request`].
     pub fn start_stream(&mut self, block: &[u8], body: &[u8]) -> Option<u32> {
-        if !self.can_open()
-            || (body.len() as i64) > self.send_window
-            || body.len() as u32 > self.peer_initial_window
-        {
+        if !self.can_open() {
             return None;
         }
         let id = self.next_id;
@@ -169,21 +174,62 @@ impl Connection {
             first = false;
         }
 
+        self.open.push(OpenStream {
+            id,
+            sent: 0,
+            window: self.peer_initial_window as i64,
+        });
         if !body.is_empty() {
-            let mut chunks = body.chunks(max).peekable();
-            while let Some(chunk) = chunks.next() {
-                let flags = if chunks.peek().is_none() {
-                    FLAG_END_STREAM
-                } else {
-                    0
-                };
-                self.frame_header(chunk.len(), DATA, flags, id);
-                self.out.extend_from_slice(chunk);
-            }
-            self.send_window -= body.len() as i64;
+            self.write_body(self.open.len() - 1, body);
         }
-        self.open.push(id);
         Some(id)
+    }
+
+    /// Send more of `body` on every stream a window has unblocked
+    ///
+    /// Called after reading from the socket, since that is where WINDOW_UPDATE
+    /// arrives. A body larger than a window used to mean the request was never
+    /// started at all, and nothing ever started it later: the run stopped with
+    /// no error and no end.
+    pub fn pump_bodies(&mut self, body: &[u8]) {
+        if body.is_empty() {
+            return;
+        }
+        for pos in 0..self.open.len() {
+            self.write_body(pos, body);
+        }
+    }
+
+    /// Write what the connection window, the stream's window and the frame
+    /// size between them allow. END_STREAM rides on the frame that finishes
+    /// the body, so a body that leaves in pieces still ends exactly once.
+    fn write_body(&mut self, pos: usize, body: &[u8]) {
+        let max = self.peer_max_frame as usize;
+        loop {
+            let (id, sent, stream_window) = {
+                let s = &self.open[pos];
+                (s.id, s.sent, s.window)
+            };
+            if sent >= body.len() {
+                return;
+            }
+            let allowed = self.send_window.min(stream_window).max(0) as usize;
+            let n = (body.len() - sent).min(max).min(allowed);
+            if n == 0 {
+                return;
+            }
+            let flags = if sent + n == body.len() {
+                FLAG_END_STREAM
+            } else {
+                0
+            };
+            self.frame_header(n, DATA, flags, id);
+            self.out.extend_from_slice(&body[sent..sent + n]);
+            let s = &mut self.open[pos];
+            s.sent += n;
+            s.window -= n as i64;
+            self.send_window -= n as i64;
+        }
     }
 
     /// Take everything queued for the socket
@@ -387,7 +433,14 @@ impl Connection {
                 // Our only use for this is deciding whether a request body
                 // fits; responses ride on the huge window we advertise
                 SETTINGS_INITIAL_WINDOW_SIZE if value <= MAX_WINDOW => {
-                    self.peer_initial_window = value
+                    // RFC 9113 Section 6.9.2: the change moves every open
+                    // stream's window by the same amount, and may make one
+                    // negative
+                    let delta = value as i64 - self.peer_initial_window as i64;
+                    self.peer_initial_window = value;
+                    for s in &mut self.open {
+                        s.window += delta;
+                    }
                 }
                 SETTINGS_INITIAL_WINDOW_SIZE => bail!("SETTINGS_INITIAL_WINDOW_SIZE out of range"),
                 SETTINGS_MAX_FRAME_SIZE
@@ -411,6 +464,8 @@ impl Connection {
             u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & !0x8000_0000;
         if stream == 0 {
             self.send_window += increment as i64;
+        } else if let Some(s) = self.open.iter_mut().find(|s| s.id == stream) {
+            s.window += increment as i64;
         }
         Ok(())
     }
@@ -428,7 +483,7 @@ impl Connection {
     /// finished, which is ordinary: RST_STREAM routinely follows a response
     /// the peer has already ended.
     fn finish_stream(&mut self, stream: u32) -> bool {
-        match self.open.iter().position(|&id| id == stream) {
+        match self.open.iter().position(|s| s.id == stream) {
             Some(pos) => {
                 self.open.swap_remove(pos);
                 true
@@ -747,6 +802,76 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::End { stream_id } if *stream_id == second)),
             "the second stream has to finish too, got {events:?}"
+        );
+    }
+    /// Walk the DATA frames in `out` for `stream`, returning the bytes they
+    /// carry and whether one of them ended the stream
+    fn data_sent(out: &[u8], stream: u32) -> (usize, bool) {
+        let mut pos = 0;
+        let (mut bytes, mut ended) = (0, false);
+        while pos + FRAME_HEADER_LEN <= out.len() {
+            let len = u32::from_be_bytes([0, out[pos], out[pos + 1], out[pos + 2]]) as usize;
+            let kind = out[pos + 3];
+            let flags = out[pos + 4];
+            let id = u32::from_be_bytes([out[pos + 5], out[pos + 6], out[pos + 7], out[pos + 8]]);
+            if kind == DATA && id == stream {
+                bytes += len;
+                ended |= flags & FLAG_END_STREAM != 0;
+            }
+            pos += FRAME_HEADER_LEN + len;
+        }
+        (bytes, ended)
+    }
+
+    #[test]
+    fn a_body_larger_than_the_window_leaves_as_credit_arrives() {
+        // Both windows start at 65535. A body bigger than that used to mean
+        // the stream was never opened, and nothing opened it later either.
+        let mut c = connected();
+        let body = vec![b'a'; 100_000];
+
+        let id = c
+            .start_stream(&[0x82], &body)
+            .expect("the stream opens even though the body does not fit");
+        let out = c.take_output().unwrap();
+        let (sent, ended) = data_sent(&out, id);
+        assert_eq!(sent, 65535, "only what the window allows goes out");
+        assert!(!ended, "the stream cannot end with the body unfinished");
+
+        // The peer reads the body and returns credit on both windows
+        let mut events = Vec::new();
+        let credit = 100_000u32.to_be_bytes();
+        c.feed(&frame(WINDOW_UPDATE, 0, 0, &credit), &mut events)
+            .unwrap();
+        c.feed(&frame(WINDOW_UPDATE, 0, id, &credit), &mut events)
+            .unwrap();
+        c.pump_bodies(&body);
+
+        let out = c.take_output().unwrap();
+        let (rest, ended) = data_sent(&out, id);
+        assert_eq!(sent + rest, body.len(), "the whole body goes out");
+        assert!(ended, "the last frame ends the stream");
+    }
+
+    #[test]
+    fn a_stream_window_alone_does_not_release_the_body() {
+        // Credit on the stream is not credit on the connection; sending on the
+        // strength of one alone would overrun the other
+        let mut c = connected();
+        let body = vec![b'a'; 100_000];
+        let id = c.start_stream(&[0x82], &body).unwrap();
+        c.take_output();
+
+        let mut events = Vec::new();
+        c.feed(
+            &frame(WINDOW_UPDATE, 0, id, &100_000u32.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        c.pump_bodies(&body);
+        assert!(
+            c.take_output().is_none(),
+            "the connection window is still empty"
         );
     }
 }
