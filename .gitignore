@@ -1,2 +1,4 @@
 /target
 docker/conf/bigbody.txt
+*.profraw
+*.profdata

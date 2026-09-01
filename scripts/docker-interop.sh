@@ -38,6 +38,13 @@
 # reassembling a stream across datagrams. The file is written below rather than
 # kept in the repository.
 #
+# A fourth pass takes half a gigabyte down one connection. Both protocols hand
+# back connection-level flow-control credit only once that much has arrived -
+# a MAX_DATA frame on HTTP/3, a connection WINDOW_UPDATE on HTTP/2 - and short
+# of it neither line is ever reached. A connection that stops being credited
+# stops receiving, which is the shape of most of the bugs found here, so the
+# one path that grants credit is worth running.
+#
 # A third pass sends a large request header block, which nothing else here
 # does: every request otherwise carries about fifty bytes of headers, so the
 # HTTP/2 encoder never had to split one across CONTINUATION frames and HTTP/3
@@ -87,6 +94,10 @@ BIGBODY_BYTES=${BIGBODY_BYTES:-262144}
 # Four of these is about 32 KB encoded, twice the frame size a peer may assume,
 # so the block cannot go in one HEADERS frame
 BIGHEADER_BYTES=${BIGHEADER_BYTES:-8000}
+# Enough 256 KB responses down one connection to pass the point where each
+# protocol returns credit: a gigabyte for HTTP/2, half of one for HTTP/3
+CREDIT_H2_REQUESTS=${CREDIT_H2_REQUESTS:-4600}
+CREDIT_H3_REQUESTS=${CREDIT_H3_REQUESTS:-2300}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
 if [ ! -x "$SHB" ]; then
@@ -369,6 +380,36 @@ while IFS='|' read -r server proto url note; do
         fail=$((fail + 1))
     fi
 done <<< "$ENDPOINTS"
+
+# ---------------------------------------------------------------------------
+# Fourth pass: enough down one connection to make each side return credit
+# ---------------------------------------------------------------------------
+
+echo
+printf '%-8s %-5s %-30s %-9s %s\n' SERVER PROTO "FLOW CONTROL CREDIT" RESULT NOTE
+printf '%-8s %-5s %-30s %-9s %s\n' -------- ----- ------------------------------ --------- ----
+
+while IFS='|' read -r proto url reqs note; do
+    out=$(timeout 300 "$SHB" $(flag_for "$proto") -c 1 -n "$reqs" \
+        --connect-timeout 10s -j "$url" 2>/dev/null)
+    if [ -n "$out" ] && [ "${out:0:1}" = "{" ]; then
+        ok=$(printf '%s' "$out" | jq -r '.requests.ok')
+        mb=$(printf '%s' "$out" | jq -r '(.bytesReceived / 1048576) | floor')
+    else
+        ok=0; mb=0
+    fi
+    if [ "$ok" = "$reqs" ]; then
+        printf '%-8s %-5s %-30s %-9s %s\n' nginx "$proto" "$url" "$ok ok" "$mb MB, $note"
+        pass=$((pass + 1))
+    else
+        printf '%-8s %-5s %-30s %-9s %s\n' nginx "$proto" "$url" "failed" "$note"
+        failures+=("nginx $proto $url over one connection  ok=$ok of $reqs, $mb MB")
+        fail=$((fail + 1))
+    fi
+done <<EOF
+h2|http://127.0.0.1:18080/bigbody|$CREDIT_H2_REQUESTS|a connection WINDOW_UPDATE
+h3|https://127.0.0.1:18443/bigbody|$CREDIT_H3_REQUESTS|a MAX_DATA frame
+EOF
 
 echo
 echo "$pass passed, $fail failed"
