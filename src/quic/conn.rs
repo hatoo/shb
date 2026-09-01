@@ -16,6 +16,31 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys};
 
+/// Which generation of 1-RTT keys a packet was protected with
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Generation {
+    Current,
+    Next,
+    Previous,
+}
+
+/// Pick the generation a 1-RTT packet was protected with
+///
+/// The header carries one bit, which says only "the generation you are on" or
+/// "the other one". The other one is ambiguous: it is the next generation when
+/// the peer has just updated, and the previous one when a packet from before
+/// our own last update is still arriving. The packet number settles it -
+/// anything below where we last changed over belongs to the generation before.
+fn generation_for(phase: bool, key_phase: bool, pn: u64, rotate_at: u64) -> Generation {
+    if phase == key_phase {
+        Generation::Current
+    } else if pn < rotate_at {
+        Generation::Previous
+    } else {
+        Generation::Next
+    }
+}
+
 use super::ack::AckState;
 use super::crypto::initial_keys;
 use super::frame::{self, AckRanges, Frame};
@@ -82,6 +107,18 @@ pub struct Connection {
     /// The 1-RTT keys, which arrive after the handshake spaces are done
     one_rtt_local: Option<DirectionalKeys>,
     one_rtt_remote: Option<DirectionalKeys>,
+    /// Secrets for deriving the generation of 1-RTT keys after the next
+    secrets: Option<rustls::quic::Secrets>,
+    /// The generation after the one in use, ready for when the peer flips
+    next_1rtt: Option<rustls::quic::PacketKeySet>,
+    /// The generation before the one in use, for packets that arrive late
+    prev_1rtt_remote: Option<Box<dyn rustls::quic::PacketKey>>,
+    /// Which generation is in use: the bit the peer flips to update its keys
+    key_phase: bool,
+    /// The first packet number seen under the current generation, which is
+    /// what tells a late packet from the old generation apart from the first
+    /// of a new one - both carry the phase bit we are not using
+    rotate_at: u64,
 
     local_cid: ConnectionId,
     /// Where to address packets: the peer's chosen connection ID
@@ -176,6 +213,11 @@ impl Connection {
             spaces,
             one_rtt_local: None,
             one_rtt_remote: None,
+            secrets: None,
+            next_1rtt: None,
+            prev_1rtt_remote: None,
+            key_phase: false,
+            rotate_at: 0,
             local_cid,
             peer_cid: initial_dcid,
             params: Params::default(),
@@ -298,7 +340,15 @@ impl Connection {
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt_local = Some(keys.local);
                     self.one_rtt_remote = Some(keys.remote);
-                    let _ = next;
+                    // RFC 9001 Section 6: either end may retire its 1-RTT keys
+                    // and carry on with the next generation, saying so by
+                    // flipping one bit in the header. Deriving that generation
+                    // now means the packet announcing it can be read on
+                    // arrival - a peer that updates and is not followed is a
+                    // peer whose every packet from then on is undecryptable.
+                    let mut secrets = next;
+                    self.next_1rtt = Some(secrets.next_packet_keys());
+                    self.secrets = Some(secrets);
                     self.connected = true;
                     self.events.push_back(Event::Connected);
                 }
@@ -306,6 +356,31 @@ impl Connection {
                 None => {}
             }
             self.needs_send = true;
+        }
+    }
+
+    /// Move to the generation of 1-RTT keys the peer has flipped to, keeping
+    /// the one before it for packets still on their way
+    ///
+    /// Our own keys move with them: RFC 9001 Section 6 makes an update
+    /// two-sided, so once the peer's new generation is in use ours is too, and
+    /// the phase bit we send says so.
+    fn rotate_keys(&mut self, at: u64, phase: bool) {
+        let Some(next) = self.next_1rtt.take() else {
+            return;
+        };
+        let old = self
+            .one_rtt_remote
+            .as_mut()
+            .map(|r| std::mem::replace(&mut r.packet, next.remote));
+        self.prev_1rtt_remote = old;
+        if let Some(local) = self.one_rtt_local.as_mut() {
+            local.packet = next.local;
+        }
+        self.key_phase = phase;
+        self.rotate_at = at;
+        if let Some(secrets) = self.secrets.as_mut() {
+            self.next_1rtt = Some(secrets.next_packet_keys());
         }
     }
 
@@ -413,7 +488,7 @@ impl Connection {
         };
         match &long {
             Some(h) => h.put(out, pn_len, 0),
-            None => header::put_short_header(out, &self.peer_cid, pn_len, false),
+            None => header::put_short_header(out, &self.peer_cid, pn_len, self.key_phase),
         }
         let length_field = long.as_ref().map(|_| out.len() - 4);
         let pn_offset = out.len();
@@ -748,12 +823,33 @@ impl Connection {
         );
 
         let payload_start = pn_offset + pn_len;
-        let keys = self.remote_keys(space).expect("checked above");
+        // Which generation of keys the peer used. Trying one and falling back
+        // to another is not open to us: a failed decrypt has already written
+        // over the buffer, so the choice has to be made before it starts.
+        let phase = space == Space::Data && (first & 0x04) != 0;
+        let generation = if space != Space::Data {
+            Generation::Current
+        } else {
+            generation_for(phase, self.key_phase, pn, self.rotate_at)
+        };
+        let key = match generation {
+            Generation::Current => self.remote_keys(space).map(|k| k.packet.as_ref()),
+            Generation::Next => self.next_1rtt.as_ref().map(|k| k.remote.as_ref()),
+            Generation::Previous => self.prev_1rtt_remote.as_deref(),
+        };
+        // A generation we do not have is a packet we cannot read, which is not
+        // worth tearing the connection down for
+        let Some(key) = key else {
+            return Ok(end);
+        };
         let (head, body) = buf[..end].split_at_mut(payload_start);
-        let plain = match keys.packet.decrypt_in_place(pn, head, body) {
+        let plain = match key.decrypt_in_place(pn, head, body) {
             Ok(p) => p.len(),
             Err(_) => return Ok(end),
         };
+        if generation == Generation::Next {
+            self.rotate_keys(pn, phase);
+        }
         // The first byte was unmasked in place, so the AAD the peer used is
         // what we just fed in
         let _ = first;
@@ -1607,6 +1703,33 @@ mod tests {
         assert!(
             conn.congestion.window > crate::quic::recovery::MIN_WINDOW,
             "but not to the floor"
+        );
+    }
+    #[test]
+    fn the_key_phase_bit_and_the_packet_number_together_pick_a_generation() {
+        // Still on generation 0, reading generation 0
+        assert_eq!(
+            generation_for(false, false, 10, 0),
+            Generation::Current,
+            "the bit matches, so nothing has changed"
+        );
+        // The peer flips the bit: this is the update itself
+        assert_eq!(
+            generation_for(true, false, 11, 0),
+            Generation::Next,
+            "the bit differs above the changeover, so the peer has updated"
+        );
+        // Having changed over at 11, a packet from before it still arrives
+        assert_eq!(
+            generation_for(false, true, 9, 11),
+            Generation::Previous,
+            "the same bit below the changeover is a packet that was in flight"
+        );
+        // And the next update after that one
+        assert_eq!(
+            generation_for(false, true, 40, 11),
+            Generation::Next,
+            "above the changeover it is the peer updating again"
         );
     }
 }
