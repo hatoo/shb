@@ -190,8 +190,22 @@ impl SentPackets {
         (lost, next_deadline)
     }
 
+    /// Bytes the congestion window has to cover
+    ///
+    /// Only ack-eliciting packets count (RFC 9002 Section 2). A packet
+    /// carrying nothing but an ACK never draws one back, so counting it would
+    /// mean it never leaves this figure - and a connection answering a large
+    /// response sends a great many of them. Once enough had piled up to fill
+    /// the window, the connection could no longer send anything ack-eliciting,
+    /// so the peer had no reason to acknowledge anything, so nothing ever left
+    /// the count. The request in flight at that moment was never sent, and the
+    /// run waited on it for ever.
     pub fn bytes_in_flight(&self) -> usize {
-        self.packets.iter().map(|p| p.size).sum()
+        self.packets
+            .iter()
+            .filter(|p| p.ack_eliciting)
+            .map(|p| p.size)
+            .sum()
     }
 }
 
@@ -580,6 +594,25 @@ mod tests {
         assert_eq!(
             rtt.persistent_congestion_duration(max_ack_delay),
             rtt.pto(max_ack_delay) * 3
+        );
+    }
+    #[test]
+    fn a_packet_carrying_only_an_ack_is_not_in_flight() {
+        // The peer never acknowledges one, so if it counted it would stay in
+        // the figure for ever. Enough of them fill the congestion window,
+        // nothing ack-eliciting can go out, the peer has no reason to
+        // acknowledge anything, and the connection never sends again.
+        let now = Instant::now();
+        let mut s = SentPackets::default();
+        s.push(sent(0, now, true));
+        assert_eq!(s.bytes_in_flight(), 1200);
+        for n in 1..20 {
+            s.push(sent(n, now, false));
+        }
+        assert_eq!(
+            s.bytes_in_flight(),
+            1200,
+            "nineteen ack-only packets add nothing"
         );
     }
 }

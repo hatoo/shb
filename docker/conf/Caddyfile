@@ -6,10 +6,24 @@
 }
 
 :80 {
-	respond "hello, world!" 200
+	handle /bigbody {
+		root * /conf
+		rewrite * /bigbody.txt
+		file_server
+	}
+	handle {
+		respond "hello, world!" 200
+	}
 }
 
 :443 {
 	tls /conf/cert.pem /conf/key.pem
-	respond "hello, world!" 200
+	handle /bigbody {
+		root * /conf
+		rewrite * /bigbody.txt
+		file_server
+	}
+	handle {
+		respond "hello, world!" 200
+	}
 }

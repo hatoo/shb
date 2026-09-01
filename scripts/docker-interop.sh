@@ -31,6 +31,13 @@
 # is real rather than a single request: 200 requests over 50 connections
 # exercises connection reuse and concurrency, not just the first exchange.
 #
+# The /bigbody endpoints answer with a quarter of a megabyte instead of the
+# usual 13 bytes. Everything else here fits one read, so the receive path was
+# only ever walked with a single one: a response spanning buffers, rustls
+# refusing more ciphertext until the plaintext waiting is drained, QUIC
+# reassembling a stream across datagrams. The file is written below rather than
+# kept in the repository.
+#
 # A second pass repeats the run with a request body, because every HTTP/2 bug
 # found so far was invisible without one. Every endpoint in the list above
 # sends GET, and the one end-to-end test that posts a body talks to a server
@@ -67,6 +74,9 @@ REQUESTS=${REQUESTS:-200}
 BODY_BYTES=${BODY_BYTES:-100000}
 BODY_REQUESTS=${BODY_REQUESTS:-20}
 BODY_CONNECTIONS=${BODY_CONNECTIONS:-4}
+# Past a receive buffer (16 KiB), a TLS record and a QUIC datagram, several
+# times over
+BIGBODY_BYTES=${BIGBODY_BYTES:-262144}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
 if [ ! -x "$SHB" ]; then
@@ -100,6 +110,14 @@ caddy|h2|http://127.0.0.1:18081/|cleartext h2c, prior knowledge
 caddy|h1|https://127.0.0.1:18444/|TLS
 caddy|h2|https://127.0.0.1:18444/|TLS, ALPN h2
 caddy|h3|https://127.0.0.1:18444/|quic-go
+nginx|h1|http://127.0.0.1:18080/bigbody|256 KB body, cleartext
+nginx|h2|http://127.0.0.1:18080/bigbody|256 KB body, h2c
+nginx|h1|https://127.0.0.1:18443/bigbody|256 KB body, TLS
+nginx|h2|https://127.0.0.1:18443/bigbody|256 KB body, TLS
+nginx|h3|https://127.0.0.1:18443/bigbody|256 KB body over QUIC
+caddy|h1|http://127.0.0.1:18081/bigbody|256 KB body, cleartext
+caddy|h2|https://127.0.0.1:18444/bigbody|256 KB body, TLS
+caddy|h3|https://127.0.0.1:18444/bigbody|256 KB body over QUIC
 haproxy|h1|http://127.0.0.1:18082/|cleartext
 haproxy|h2|http://127.0.0.1:18085/|cleartext h2c, on its own bind
 haproxy|h1|https://127.0.0.1:18445/|TLS
@@ -163,6 +181,9 @@ flag_for() {
     esac
 }
 
+# The servers read this from the conf directory they already mount
+head -c "$BIGBODY_BYTES" /dev/zero | tr '\0' 'b' > "$DIR/conf/bigbody.txt"
+
 echo "starting servers..."
 docker compose -f "$DIR/compose.yml" up -d --wait --wait-timeout 120 >/dev/null 2>&1 ||
     docker compose -f "$DIR/compose.yml" up -d >/dev/null 2>&1
@@ -218,6 +239,8 @@ while IFS='|' read -r server proto url note; do
     [ -z "$server" ] && continue
     # See the header: HTTP/3 through Docker's UDP publishing measures Docker
     [ "$proto" = h3 ] && continue
+    # /bigbody is about what the server sends, not what it is sent
+    case "$url" in *"/bigbody") continue ;; esac
     skip=""
     case "$server|$proto" in
         # Two of these on one connection wedge it, and curl hangs there too
