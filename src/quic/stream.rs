@@ -59,18 +59,26 @@ pub struct SendStream {
 }
 
 impl SendStream {
-    /// Make this stream ready for a new one, keeping the buffers it has
-    /// already grown. A stream lives for one request, so allocating its
-    /// buffers afresh each time is an allocation per request on each side.
-    pub fn reuse(&mut self, limit: u64) {
-        self.buf.clear();
-        self.buf.shrink_to(POOLED_CAPACITY);
-        self.lost.clear();
-        self.base_offset = 0;
-        self.sent = 0;
-        self.limit = limit;
-        self.fin = false;
-        self.fin_sent = false;
+    /// Start a stream on a buffer that an earlier one has already grown. A
+    /// stream lives for one request, so a fresh buffer each time is an
+    /// allocation per request on each side.
+    pub fn with_buf(limit: u64, mut buf: Vec<u8>) -> Self {
+        buf.clear();
+        buf.shrink_to(POOLED_CAPACITY);
+        Self {
+            buf,
+            base_offset: 0,
+            sent: 0,
+            lost: Vec::new(),
+            limit,
+            fin: false,
+            fin_sent: false,
+        }
+    }
+
+    /// Give the buffer back for the next stream to use
+    pub fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
     }
 
     pub fn new(limit: u64) -> Self {
@@ -222,14 +230,21 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
-    /// The receiving half of [`SendStream::reuse`]
-    pub fn reuse(&mut self) {
-        self.ready.clear();
-        self.ready.shrink_to(POOLED_CAPACITY);
-        self.pending.clear();
-        self.read_offset = 0;
-        self.final_size = None;
-        self.received = 0;
+    /// The receiving half of [`SendStream::with_buf`]
+    pub fn with_buf(mut ready: Vec<u8>) -> Self {
+        ready.clear();
+        ready.shrink_to(POOLED_CAPACITY);
+        Self {
+            ready,
+            read_offset: 0,
+            pending: Vec::new(),
+            final_size: None,
+            received: 0,
+        }
+    }
+
+    pub fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.ready)
     }
 
     /// Take a STREAM frame. Returns how many new bytes of stream this covered,
