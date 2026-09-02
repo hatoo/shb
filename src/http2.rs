@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use self::conn::{Connection, Event};
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;
+use crate::inflight::Ring;
 use crate::stats::Stats;
 use crate::target::Target;
 use crate::tls::{TlsSession, TlsSetup};
@@ -47,7 +48,6 @@ fn build_header_block(target: &Target) -> Vec<u8> {
 
 /// An in-flight request (one open stream)
 struct InFlight {
-    stream_id: u32,
     start: Instant,
     /// Status code from :status (0 = not received yet)
     status: u16,
@@ -78,9 +78,8 @@ struct Conn {
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
     generation: u64,
-    /// In-flight requests, up to the configured parallelism (linear scan;
-    /// the list is small)
-    streams: Vec<InFlight>,
+    /// In-flight requests, up to the configured parallelism
+    streams: Ring<InFlight>,
 }
 
 impl Conn {
@@ -97,7 +96,7 @@ impl Conn {
             recv_armed: false,
             goaway: false,
             generation: 0,
-            streams: Vec::new(),
+            streams: Ring::new(2, 1),
         }
     }
 
@@ -154,11 +153,13 @@ fn fill_streams(
         let Some(stream_id) = h2.start_stream(header_block, body) else {
             break;
         };
-        conn.streams.push(InFlight {
-            stream_id,
-            start: Instant::now(),
-            status: 0,
-        });
+        conn.streams.push(
+            stream_id as u64,
+            InFlight {
+                start: Instant::now(),
+                status: 0,
+            },
+        );
         *started += 1;
     }
 }
@@ -206,19 +207,17 @@ fn flush(
 
 /// Turn the connection's events into statistics
 ///
-/// Streams are found by scanning a list of at most `parallel` entries, which
-/// keeps the hot path free of hashing.
+/// A request is found by its stream number, which is where its slot is.
 fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
     for event in events {
         match *event {
             Event::Status { stream_id, status } => {
-                if let Some(inflight) = conn.streams.iter_mut().find(|s| s.stream_id == stream_id) {
+                if let Some(inflight) = conn.streams.get_mut(stream_id as u64) {
                     inflight.status = status;
                 }
             }
             Event::End { stream_id } => {
-                if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
-                    let inflight = conn.streams.swap_remove(pos);
+                if let Some(inflight) = conn.streams.take(stream_id as u64) {
                     if inflight.status == 0 {
                         // Every response begins with HEADERS carrying :status
                         // (RFC 9113 Section 8.1). A stream that ends without
@@ -231,8 +230,7 @@ fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
                 }
             }
             Event::Reset { stream_id } => {
-                if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == stream_id) {
-                    conn.streams.swap_remove(pos);
+                if conn.streams.take(stream_id as u64).is_some() {
                     stats.errors += 1;
                 }
             }

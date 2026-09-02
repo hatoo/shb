@@ -12,6 +12,7 @@ mod buf_ring;
 mod http1;
 mod http2;
 mod http3;
+mod inflight;
 mod quic;
 mod report;
 mod shutdown;

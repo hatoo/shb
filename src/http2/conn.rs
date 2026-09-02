@@ -6,6 +6,7 @@
 //! anything to do with the dynamic HPACK table are declined at the SETTINGS
 //! level rather than implemented.
 
+use crate::inflight::Ring;
 use anyhow::{Result, bail};
 
 use super::hpack;
@@ -97,7 +98,7 @@ pub struct Connection {
     /// RST_STREAM, and that arrives after the stream has already ended.
     /// Retiring by count would take the slot of whichever stream happens to be
     /// open instead, and that stream's own end would then be dropped.
-    open: Vec<OpenStream>,
+    open: Ring<OpenStream>,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Our remaining connection-level send credit
@@ -122,7 +123,7 @@ impl Connection {
             header_stream: 0,
             header_end_stream: false,
             next_id: 1,
-            open: Vec::new(),
+            open: Ring::new(2, 1),
             max_concurrent: ASSUMED_MAX_CONCURRENT,
             send_window: 65535,
             peer_initial_window: 65535,
@@ -185,13 +186,16 @@ impl Connection {
             first = false;
         }
 
-        self.open.push(OpenStream {
-            id,
-            sent: 0,
-            window: self.peer_initial_window as i64,
-        });
+        self.open.push(
+            id as u64,
+            OpenStream {
+                id,
+                sent: 0,
+                window: self.peer_initial_window as i64,
+            },
+        );
         if !body.is_empty() {
-            self.write_body(self.open.len() - 1, body);
+            self.write_body(self.open.slot_count() - 1, body);
         }
         Some(id)
     }
@@ -206,7 +210,7 @@ impl Connection {
         if body.is_empty() {
             return;
         }
-        for pos in 0..self.open.len() {
+        for pos in 0..self.open.slot_count() {
             self.write_body(pos, body);
         }
     }
@@ -217,10 +221,11 @@ impl Connection {
     fn write_body(&mut self, pos: usize, body: &[u8]) {
         let max = self.peer_max_frame as usize;
         loop {
-            let (id, sent, stream_window) = {
-                let s = &self.open[pos];
-                (s.id, s.sent, s.window)
+            // A hole: the stream in this slot has already finished
+            let Some(s) = self.open.slot(pos) else {
+                return;
             };
+            let (id, sent, stream_window) = (s.id, s.sent, s.window);
             if sent >= body.len() {
                 return;
             }
@@ -236,7 +241,9 @@ impl Connection {
             };
             self.frame_header(n, DATA, flags, id);
             self.out.extend_from_slice(&body[sent..sent + n]);
-            let s = &mut self.open[pos];
+            let Some(s) = self.open.slot_mut(pos) else {
+                return;
+            };
             s.sent += n;
             s.window -= n as i64;
             self.send_window -= n as i64;
@@ -449,7 +456,7 @@ impl Connection {
                     // negative
                     let delta = value as i64 - self.peer_initial_window as i64;
                     self.peer_initial_window = value;
-                    for s in &mut self.open {
+                    for s in self.open.iter_mut() {
                         s.window += delta;
                     }
                 }
@@ -475,7 +482,7 @@ impl Connection {
             u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & !0x8000_0000;
         if stream == 0 {
             self.send_window += increment as i64;
-        } else if let Some(s) = self.open.iter_mut().find(|s| s.id == stream) {
+        } else if let Some(s) = self.open.get_mut(stream as u64) {
             s.window += increment as i64;
         }
         Ok(())
@@ -494,13 +501,7 @@ impl Connection {
     /// finished, which is ordinary: RST_STREAM routinely follows a response
     /// the peer has already ended.
     fn finish_stream(&mut self, stream: u32) -> bool {
-        match self.open.iter().position(|s| s.id == stream) {
-            Some(pos) => {
-                self.open.swap_remove(pos);
-                true
-            }
-            None => false,
-        }
+        self.open.take(stream as u64).is_some()
     }
 }
 

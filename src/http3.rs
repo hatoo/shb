@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;
+use crate::inflight::Ring;
 use crate::quic::conn::{Connection, Event as QuicEvent, LocalParamsInput};
 use crate::stats::Stats;
 use crate::target::Target;
@@ -122,88 +123,6 @@ fn local_params(connect_timeout: Duration) -> LocalParamsInput {
     }
 }
 
-/// An in-flight request (one open request stream)
-/// The requests in flight on one connection, in a ring indexed by stream
-/// number so an event names its request without a search
-///
-/// A linear scan costs whatever the concurrency is, twice per request: at 128
-/// streams that was five per cent of the whole userspace profile. Client
-/// bidirectional streams are numbered 0, 4, 8..., so the number is the index
-/// once the base is taken off - the same shape the QUIC layer uses for its
-/// own streams, and no hashing.
-#[derive(Default)]
-struct InFlightRing {
-    slots: VecDeque<Option<InFlight>>,
-    /// Stream number of `slots[0]`
-    base: u64,
-    /// How many slots hold a request
-    open: usize,
-}
-
-impl InFlightRing {
-    fn len(&self) -> usize {
-        self.open
-    }
-
-    fn clear(&mut self) {
-        self.slots.clear();
-        self.base = 0;
-        self.open = 0;
-    }
-
-    fn push(&mut self, inflight: InFlight) {
-        if self.slots.is_empty() {
-            self.base = inflight.stream_id / 4;
-        }
-        debug_assert_eq!(
-            inflight.stream_id / 4,
-            self.base + self.slots.len() as u64,
-            "streams are opened in order, so they land in order"
-        );
-        self.slots.push_back(Some(inflight));
-        self.open += 1;
-    }
-
-    /// Only a stream we opened has a slot. The low two bits say who opened a
-    /// stream and in which direction (RFC 9000 Section 2.1), and a peer's
-    /// unidirectional stream divided by four lands on one of our slots, which
-    /// is how a control stream once got a request's response reader.
-    fn index(&self, stream_id: u64) -> Option<usize> {
-        if !stream_id.is_multiple_of(4) {
-            return None;
-        }
-        (stream_id / 4)
-            .checked_sub(self.base)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.slots.len())
-    }
-
-    fn get_mut(&mut self, stream_id: u64) -> Option<&mut InFlight> {
-        let i = self.index(stream_id)?;
-        self.slots[i].as_mut()
-    }
-
-    fn take(&mut self, stream_id: u64) -> Option<InFlight> {
-        let i = self.index(stream_id)?;
-        let taken = self.slots[i].take()?;
-        self.open -= 1;
-        // Keep the ring from growing for the life of the run
-        while matches!(self.slots.front(), Some(None)) {
-            self.slots.pop_front();
-            self.base += 1;
-        }
-        Some(taken)
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut InFlight> {
-        self.slots.iter_mut().flatten()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &InFlight> {
-        self.slots.iter().flatten()
-    }
-}
-
 struct InFlight {
     stream_id: u64,
     start: Instant,
@@ -244,7 +163,7 @@ struct Conn {
     /// generation are identified via user_data and ignored
     generation: u64,
     /// In-flight requests, up to the configured parallelism
-    streams: InFlightRing,
+    streams: Ring<InFlight>,
 }
 
 impl Conn {
@@ -264,7 +183,7 @@ impl Conn {
             sending: false,
             recv_armed: false,
             generation: 0,
-            streams: InFlightRing::default(),
+            streams: Ring::new(4, 0),
         }
     }
 
@@ -288,7 +207,7 @@ impl Conn {
 
     /// Count all in-flight requests as errors (used when the connection dies)
     fn fail_inflight(&mut self, stats: &mut Stats) {
-        if narrate() && self.streams.len() > 0 {
+        if narrate() && !self.streams.is_empty() {
             eprintln!(
                 "[broken] {} requests in flight discarded",
                 self.streams.len()
@@ -304,7 +223,7 @@ impl Conn {
 /// A fresh stream has its whole window free and requests are tiny, so this
 /// normally moves nothing; it exists so a peer with a small
 /// `initial_max_stream_data` cannot lose a request.
-fn flush_unsent(quic: &mut Connection, streams: &mut InFlightRing) -> Result<()> {
+fn flush_unsent(quic: &mut Connection, streams: &mut Ring<InFlight>) -> Result<()> {
     for inflight in streams.iter_mut().filter(|s| !s.unsent.is_empty()) {
         let n = quic.write(inflight.stream_id, &inflight.unsent);
         inflight.unsent.drain(..n);
@@ -338,12 +257,15 @@ fn fill_streams(
         let Some((qsid, sent)) = quic.send_oneshot(request) else {
             break;
         };
-        conn.streams.push(InFlight {
-            stream_id: qsid,
-            start: Instant::now(),
-            reader: ResponseReader::default(),
-            unsent: request[sent..].to_vec(),
-        });
+        conn.streams.push(
+            qsid,
+            InFlight {
+                stream_id: qsid,
+                start: Instant::now(),
+                reader: ResponseReader::default(),
+                unsent: request[sent..].to_vec(),
+            },
+        );
         *started += 1;
     }
     Ok(())
