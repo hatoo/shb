@@ -26,6 +26,11 @@ const INITIAL_RTT: Duration = Duration::from_millis(333);
 
 /// A packet we have sent and not yet heard about
 pub struct SentPacket {
+    /// What the ACK in this packet acknowledged, if it carried one. A field
+    /// rather than a [`SentFrame`], because a packet that is nothing but an
+    /// ACK is the commonest thing a client sends and one in `frames` would
+    /// mean an allocation for each of them.
+    pub ack_largest: Option<u64>,
     pub number: u64,
     pub time_sent: Instant,
     pub size: usize,
@@ -52,12 +57,6 @@ pub enum SentFrame {
     },
     /// A PING sent purely to make the peer acknowledge something
     Ping,
-    /// An ACK, remembered by what it acknowledged. Once the peer has it, the
-    /// ranges it covers need not be carried in every ACK for the rest of the
-    /// connection.
-    Ack {
-        largest: u64,
-    },
 }
 
 #[derive(Default)]
@@ -389,6 +388,7 @@ mod tests {
 
     fn sent(number: u64, at: Instant, ack_eliciting: bool) -> SentPacket {
         SentPacket {
+            ack_largest: None,
             number,
             time_sent: at,
             size: 1200,

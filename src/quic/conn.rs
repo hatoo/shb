@@ -568,7 +568,7 @@ impl Connection {
         let limit = pad_to.unwrap_or(MAX_DATAGRAM);
         let budget = limit.saturating_sub(out.len() - datagram_start + TAG_LEN);
         let mut frames = Vec::new();
-        let ack_eliciting = self.fill_payload(space, now, out, budget, &mut frames, congested)?;
+        let filled = self.fill_payload(space, now, out, budget, &mut frames, congested)?;
 
         if out.len() == payload_start {
             // Nothing to say in this space
@@ -623,14 +623,24 @@ impl Connection {
         let s = &mut self.spaces[space as usize];
         s.next_packet_number += 1;
         s.sent.push(SentPacket {
+            ack_largest: filled.ack_largest,
             number: pn,
             time_sent: now,
             size,
-            ack_eliciting,
+            ack_eliciting: filled.ack_eliciting,
             frames,
         });
         Ok(true)
     }
+}
+
+/// What filling a payload has to tell the packet writer about it
+struct Filled {
+    ack_eliciting: bool,
+    /// What the ACK in it acknowledged, if it carried one. A lost ACK is not
+    /// resent - the next one carries the same ranges - which is why the
+    /// ranges are held until the peer confirms them.
+    ack_largest: Option<u64>,
 }
 
 impl Connection {
@@ -647,9 +657,10 @@ impl Connection {
         budget: usize,
         frames: &mut Vec<SentFrame>,
         congested: bool,
-    ) -> Result<bool> {
+    ) -> Result<Filled> {
         let start = out.len();
         let mut ack_eliciting = false;
+        let mut ack_largest = None;
         let room = |out: &Vec<u8>| budget.saturating_sub(out.len() - start);
 
         // Only when something arrived that the peer wants acknowledged
@@ -665,9 +676,7 @@ impl Connection {
             let largest = ranges.first().map(|&(_, largest)| largest);
             frame::put_ack(out, ranges, delay);
             self.spaces[space as usize].ack.take_pending();
-            if let Some(largest) = largest {
-                frames.push(SentFrame::Ack { largest });
-            }
+            ack_largest = largest;
         }
 
         if let Some(data) = self.path_response.take()
@@ -679,7 +688,10 @@ impl Connection {
 
         if let Some((code, reason)) = self.close_pending.take() {
             frame::put_close(out, code, &reason);
-            return Ok(false);
+            return Ok(Filled {
+                ack_eliciting: false,
+                ack_largest,
+            });
         }
 
         // Handshake bytes that have not been sent yet, or that a probe
@@ -722,7 +734,10 @@ impl Connection {
                 ack_eliciting = true;
             }
         }
-        Ok(ack_eliciting)
+        Ok(Filled {
+            ack_eliciting,
+            ack_largest,
+        })
     }
 
     /// The 1-RTT half: flow control, then stream data
@@ -1132,8 +1147,15 @@ impl Connection {
         let mut bytes = 0;
         for p in &acked {
             bytes += p.size;
+            // The peer has this acknowledgement now, so what it covered can
+            // go. Nothing else drops a range: a lost packet's number is never
+            // reused, so the hole it leaves is permanent, and without this the
+            // list grows one entry per lost packet for the life of the run.
+            if let Some(largest) = p.ack_largest {
+                self.spaces[space as usize].ack.trim_below(largest);
+            }
             for f in &p.frames {
-                self.on_frame_acked(space, *f);
+                self.on_frame_acked(*f);
             }
         }
         // The newest thing acknowledged is what says whether the recovery
@@ -1177,16 +1199,11 @@ impl Connection {
         }
     }
 
-    fn on_frame_acked(&mut self, space: Space, f: SentFrame) {
+    fn on_frame_acked(&mut self, f: SentFrame) {
         match f {
             // A PING is only there to draw an acknowledgement, and CRYPTO is
             // released by the handshake advancing rather than by this
             SentFrame::Ping | SentFrame::Crypto { .. } => {}
-            // The peer has this acknowledgement now, so what it covered can go.
-            // Nothing else drops a range: a lost packet's number is never
-            // reused, so the hole it leaves is permanent, and without this the
-            // list grows one entry per lost packet for the life of the run.
-            SentFrame::Ack { largest } => self.spaces[space as usize].ack.trim_below(largest),
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -1199,9 +1216,7 @@ impl Connection {
 
     fn on_frame_lost(&mut self, space: Space, f: SentFrame) {
         match f {
-            // A lost ACK is not resent: the next one carries the same ranges,
-            // which is why they are kept until the peer confirms them
-            SentFrame::Ping | SentFrame::Ack { .. } => {}
+            SentFrame::Ping => {}
             SentFrame::Crypto { offset, len } => {
                 // Rewind to the lost run. Anything after it goes out again
                 // too, which costs a little bandwidth once and avoids
@@ -1628,13 +1643,13 @@ mod tests {
             .record(5, true, now);
         let mut out = Vec::new();
         let mut frames = Vec::new();
-        conn.fill_payload(Space::Initial, now, &mut out, 1200, &mut frames, false)
+        let filled = conn
+            .fill_payload(Space::Initial, now, &mut out, 1200, &mut frames, false)
             .unwrap();
-        assert!(
-            frames
-                .iter()
-                .any(|f| matches!(f, SentFrame::Ack { largest: 5 })),
-            "the ACK just written is not in the packet's frames: {frames:?}"
+        assert_eq!(
+            filled.ack_largest,
+            Some(5),
+            "the packet carries an ACK but does not say what it acknowledged"
         );
     }
 
@@ -1651,7 +1666,19 @@ mod tests {
             conn.spaces[space].ack.record(pn, true, now);
         }
         assert_eq!(conn.spaces[space].ack.ranges().len(), 2, "a gap, so two");
-        conn.on_frame_acked(Space::Initial, SentFrame::Ack { largest: 3 });
+        // A packet of ours that carried an ACK of everything up to 3, which
+        // the peer now acknowledges in turn
+        conn.spaces[space]
+            .sent
+            .push(crate::quic::recovery::SentPacket {
+                ack_largest: Some(3),
+                number: 7,
+                time_sent: now,
+                size: 40,
+                ack_eliciting: false,
+                frames: Vec::new(),
+            });
+        conn.on_ack(Space::Initial, 7, 0, 0, &[], now).unwrap();
         assert!(
             conn.spaces[space].ack.ranges().is_empty(),
             "the peer has them; repeating them for the rest of the run is what grew"
@@ -1911,6 +1938,7 @@ mod tests {
 
     fn lost_packet(number: u64, at: Instant) -> crate::quic::recovery::SentPacket {
         crate::quic::recovery::SentPacket {
+            ack_largest: None,
             number,
             time_sent: at,
             size: 1200,
