@@ -1322,6 +1322,27 @@ impl Connection {
         Some(id)
     }
 
+    /// Open a bidirectional stream and put a whole request on it at once
+    ///
+    /// Every request a load generator sends is one stream opened, written
+    /// and closed, and doing that in a single call skips four walks from a
+    /// stream id back to the stream it names. The stream is finished only if
+    /// the write took everything: a peer with a tiny
+    /// `initial_max_stream_data` leaves a remainder for `write` later.
+    pub fn send_oneshot(&mut self, data: &[u8]) -> Option<(u64, usize)> {
+        let id = self.open_bi()?;
+        self.needs_send = true;
+        let pair = self.streams.back_mut()?.as_mut()?;
+        let n = pair.send.write(data);
+        if n == data.len() {
+            pair.send.finish();
+        }
+        // A stream this new cannot already be queued
+        pair.queued = true;
+        self.send_queue.push_back(id);
+        Some((id, n))
+    }
+
     pub fn write(&mut self, id: u64, data: &[u8]) -> usize {
         self.needs_send = true;
         let n = self.send_mut(id).map_or(0, |send| send.write(data));

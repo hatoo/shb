@@ -335,13 +335,9 @@ fn fill_streams(
     };
     while conn.streams.len() < parallel && budget.may_start(*started) {
         // None = the server's MAX_STREAMS limit; retry after completions
-        let Some(qsid) = quic.open_bi() else {
+        let Some((qsid, sent)) = quic.send_oneshot(request) else {
             break;
         };
-        let sent = quic.write(qsid, request);
-        if sent == request.len() {
-            quic.finish(qsid);
-        }
         conn.streams.push(InFlight {
             stream_id: qsid,
             start: Instant::now(),
