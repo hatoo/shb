@@ -494,9 +494,6 @@ pub fn run_worker(
                         conn_broken = true;
                     } else {
                         stats.bytes_received += res as u64;
-                        // Keep our ACKs immediate so a Nagle-enabled peer is
-                        // never stuck waiting on our delayed ACK
-                        uring::set_quickack(conn.fd);
                         let bid =
                             cqueue::buffer_select(flags).context("recv CQE without buffer id")?;
                         // In TLS mode decrypt into scratch and feed the
