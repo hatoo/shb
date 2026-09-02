@@ -1,0 +1,11 @@
+# The server the release build trains its profile against
+#
+# Same nginx and same configuration as compose.yml, but on the host network.
+# Publishing a UDP port puts a proxy in front of the socket, which breaks up
+# the GSO batches HTTP/3 sends in; training through that would teach the
+# compiler a send path the real one never takes.
+services:
+  nginx:
+    image: nginx:mainline
+    network_mode: host
+    volumes: ["./conf:/conf:ro", "./conf/nginx.conf:/etc/nginx/nginx.conf:ro"]

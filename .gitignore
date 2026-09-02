@@ -2,3 +2,4 @@
 docker/conf/bigbody.txt
 *.profraw
 *.profdata
+/pgo

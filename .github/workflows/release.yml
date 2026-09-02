@@ -6,18 +6,26 @@ on:
     tags: ["v*.*.*"]
   pull_request:
 
-# Builds on every push and PR so a broken cross-compile shows up long before a
-# tag is cut; the binaries are only attached to a release on a v* tag.
+# Builds on every push and PR so a broken build shows up long before a tag is
+# cut; the binaries are only attached to a release on a v* tag.
 #
 # The targets are musl, statically linked, so one binary runs whatever glibc
 # the machine has - a dynamically linked build made against the runner's glibc
 # refuses to start on anything older. That costs nothing only because shb
 # replaces musl's allocator: left alone it doubles userspace CPU per request
 # and takes 36% off HTTP/3 throughput. See the mimalloc feature in Cargo.toml.
+#
+# Each binary is built twice: once instrumented, then again against the profile
+# a run of the instrumented one leaves behind. shb's hot path does not fit in a
+# 32 KB instruction cache - handling a datagram, building one, driving the
+# worker and parsing frames come to 33 KB - and laying the code out from a real
+# run takes 17% off userspace CPU per request. A profile comes from running the
+# binary, so each target is built on a runner of its own architecture rather
+# than cross-compiled.
 jobs:
   build:
     name: Build ${{ matrix.release_name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     # creating the release and uploading assets needs write access; the
     # repository default for GITHUB_TOKEN is read-only
     permissions:
@@ -28,43 +36,87 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             release_name: shb-linux-amd64
-            use_cross: false
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             release_name: shb-linux-arm64
-            use_cross: true
+            runner: ubuntu-24.04-arm
     env:
-      BUILD_CMD: cargo
+      # ring and mimalloc both compile C. cc looks for a compiler named after
+      # the target and musl-tools installs an unprefixed one, which is the
+      # right compiler here because the runner is already the target's
+      # architecture.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v5
 
+      # llvm-tools carries llvm-profdata, which merges what the instrumented
+      # binary records into the profile the second build reads
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: llvm-tools
 
-      # ring and mimalloc both compile C, so the musl target needs a musl C
-      # compiler. cross carries its own, so this is only for the native build.
       - name: Install the musl C toolchain
-        if: ${{ !matrix.use_cross }}
         run: sudo apt-get install -y --no-install-recommends musl-tools
-
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build with cross instead of cargo
-        if: matrix.use_cross
-        run: echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
+      # Same nginx as the interop suite, on the host network: publishing a UDP
+      # port puts a proxy in front of the socket that breaks up the GSO batches
+      # HTTP/3 sends in, and a profile taken through that would describe a send
+      # path the real one never takes.
+      - name: Start the server to profile against
+        run: |
+          docker compose -f docker/pgo.yml up -d
+          for _ in $(seq 30); do
+            if curl -fsk https://127.0.0.1/ > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "nginx never came up"
+          exit 1
 
-      # shb only needs io_uring at run time, so cross-compiling is fine
+      - name: Build an instrumented binary
+        run: |
+          rm -rf pgo
+          RUSTFLAGS="-Cprofile-generate=$PWD/pgo/raw" \
+            cargo build --profile dist --target ${{ matrix.target }} --locked
+
+      # One pass per protocol, so the layout follows what shb does rather than
+      # whichever protocol happened to run last
+      - name: Record a profile
+        run: |
+          for args in \
+            "-c 64 http://127.0.0.1/" \
+            "-c 16 -p 32 --http2 http://127.0.0.1/" \
+            "-c 16 -p 32 --http2 https://127.0.0.1/" \
+            "-c 16 -p 32 --http3 https://127.0.0.1/"
+          do
+            out=$(target/${{ matrix.target }}/dist/shb -t 4 -z 5s $args)
+            echo "$out"
+            # A profile from a run that reached nothing is worse than none at
+            # all: it would lay the code out around the error paths. Some
+            # errors are ordinary under load - a server closing a keepalive
+            # connection - so this asks for a healthy run, not a perfect one.
+            ok=$(echo "$out" | sed -n 's/.*(\([0-9]*\) ok.*/\1/p')
+            if [ "${ok:-0}" -lt 10000 ]; then
+              echo "only $ok responses from $args"
+              exit 1
+            fi
+          done
+          llvm_profdata="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
+          "$llvm_profdata" merge -o "$PWD/pgo/merged.profdata" "$PWD"/pgo/raw/*.profraw
+          # An absolute path: dependencies are compiled from their own source
+          # directories, so a relative one resolves to nothing for them
+          echo "RUSTFLAGS=-Cprofile-use=$PWD/pgo/merged.profdata" >> "$GITHUB_ENV"
+
       - name: Build
-        run: $BUILD_CMD build --profile dist --target ${{ matrix.target }} --locked
+        run: cargo build --profile dist --target ${{ matrix.target }} --locked
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
