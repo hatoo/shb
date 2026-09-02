@@ -1056,13 +1056,14 @@ impl Connection {
         // only shows up against someone else's.
         let s = &mut self.spaces[space as usize];
         s.crypto_in.push(offset, data, false)?;
-        let mut ordered = Vec::new();
-        if s.crypto_in.read(&mut ordered) == 0 {
+        let tls = &mut self.tls;
+        let n = s.crypto_in.consume(|ordered| {
+            tls.read_hs(ordered)
+                .map_err(|e| anyhow::anyhow!("TLS handshake: {e}"))
+        })?;
+        if n == 0 {
             return Ok(());
         }
-        self.tls
-            .read_hs(&ordered)
-            .map_err(|e| anyhow::anyhow!("TLS handshake: {e}"))?;
         if self.params.initial_max_data == 0
             && let Some(raw) = self.tls.quic_transport_parameters()
         {
@@ -1336,15 +1337,15 @@ impl Connection {
         self.queue_send(id);
     }
 
-    /// Take whatever the stream has ready. Returns how many bytes moved.
-    pub fn read(&mut self, id: u64, out: &mut Vec<u8>) -> usize {
+    /// Show what a stream has ready without copying it out first
+    pub fn consume(&mut self, id: u64, f: impl FnOnce(&[u8]) -> Result<()>) -> Result<usize> {
         if let Some(pair) = self.stream_mut(id) {
-            return pair.recv.read(out);
+            return pair.recv.consume(f);
         }
         if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
-            return recv.read(out);
+            return recv.consume(f);
         }
-        0
+        Ok(0)
     }
 
     /// Forget a stream that the worker is done with, releasing its slot
@@ -1634,7 +1635,6 @@ mod tests {
         let mut opened_uni = false;
         let mut request: Option<u64> = None;
         let mut reader = proto::ResponseReader::default();
-        let mut scratch = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
 
         while Instant::now() < deadline {
@@ -1682,9 +1682,7 @@ mod tests {
                 match ev {
                     Event::Lost(why) => panic!("connection lost: {why}"),
                     Event::Readable(id) if Some(id) == request => {
-                        scratch.clear();
-                        conn.read(id, &mut scratch);
-                        reader.feed(&scratch).unwrap();
+                        conn.consume(id, |data| reader.feed(data)).unwrap();
                     }
                     Event::Finished { id, reset } if Some(id) == request => {
                         assert!(!reset, "the server reset the request stream");

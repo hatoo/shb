@@ -315,23 +315,6 @@ fn flush_unsent(quic: &mut Connection, streams: &mut InFlightRing) -> Result<()>
     Ok(())
 }
 
-/// Read everything currently readable from one QUIC stream
-///
-/// Returns whether the peer reset the stream and whether it finished.
-/// Take everything a stream has ready, handing it to `sink`
-fn read_quic_stream(
-    quic: &mut Connection,
-    id: u64,
-    scratch: &mut Vec<u8>,
-    mut sink: impl FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
-    scratch.clear();
-    if quic.read(id, scratch) > 0 {
-        sink(scratch)?;
-    }
-    Ok(())
-}
-
 /// Open new request streams until the parallelism target or budget is hit
 ///
 /// Each request is one QUIC bidirectional stream carrying a HEADERS frame
@@ -516,10 +499,6 @@ fn pump_transmits(
 /// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
 ///
 /// Returns false if the connection is broken.
-#[allow(clippy::too_many_arguments)]
-/// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
-///
-/// Returns false if the connection is broken.
 fn drive(
     conn: &mut Conn,
     stats: &mut Stats,
@@ -528,7 +507,6 @@ fn drive(
     started: &mut u64,
     budget: Budget,
     stop: bool,
-    scratch: &mut Vec<u8>,
 ) -> bool {
     let result = (|| -> Result<bool> {
         let Some(quic) = conn.quic.as_mut() else {
@@ -581,7 +559,7 @@ fn drive(
         for &id in &readable {
             if let Some(inflight) = conn.streams.get_mut(id) {
                 let reader = &mut inflight.reader;
-                read_quic_stream(quic, id, scratch, |data| reader.feed(data))?;
+                quic.consume(id, |data| reader.feed(data))?;
                 continue;
             }
             // A peer-opened stream: its control stream, or one of its QPACK
@@ -594,7 +572,7 @@ fn drive(
                 }
             };
             let reader = &mut conn.uni[slot].1;
-            read_quic_stream(quic, id, scratch, |data| reader.feed(data))?;
+            quic.consume(id, |data| reader.feed(data))?;
             if conn.uni[slot].1.goaway {
                 conn.goaway = true;
             }
@@ -706,7 +684,6 @@ pub fn run_worker(
     // Decryption happens in place, so the datagram is copied out of the
     // provided buffer ring once and reused
     let mut datagram: Vec<u8> = Vec::with_capacity(2048);
-    let mut scratch: Vec<u8> = Vec::with_capacity(4096);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(2048);
     let now = Instant::now();
     for (i, conn) in conns.iter_mut().enumerate() {
@@ -780,7 +757,6 @@ pub fn run_worker(
                     &mut started,
                     budget,
                     stop,
-                    &mut scratch,
                 );
                 pump_transmits(
                     &submitter,
@@ -980,7 +956,6 @@ pub fn run_worker(
                 &mut started,
                 budget,
                 stop,
-                &mut scratch,
             );
             pump_transmits(
                 &submitter,

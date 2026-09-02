@@ -296,12 +296,19 @@ impl RecvStream {
         }
     }
 
-    /// Hand the application everything contiguous that is ready
-    pub fn read(&mut self, out: &mut Vec<u8>) -> usize {
+    /// Show the application everything contiguous that is ready, in place
+    ///
+    /// Consumed only if `f` succeeds. Handing over a slice rather than filling
+    /// a buffer saves a copy of every response body.
+    pub fn consume(&mut self, f: impl FnOnce(&[u8]) -> Result<()>) -> Result<usize> {
+        if self.ready.is_empty() {
+            return Ok(0);
+        }
+        f(&self.ready)?;
         let n = self.ready.len();
-        out.append(&mut self.ready);
+        self.ready.clear();
         self.read_offset += n as u64;
-        n
+        Ok(n)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -361,7 +368,11 @@ mod tests {
 
     fn read_all(r: &mut RecvStream) -> Vec<u8> {
         let mut out = Vec::new();
-        r.read(&mut out);
+        r.consume(|data| {
+            out.extend_from_slice(data);
+            Ok(())
+        })
+        .unwrap();
         out
     }
 
