@@ -72,10 +72,11 @@ impl Rtt {
     /// RFC 9002 Section 5.3
     pub fn update(&mut self, sample: Duration, ack_delay: Duration, max_ack_delay: Duration) {
         self.latest = sample;
-        self.min = Some(match self.min {
+        let min = match self.min {
             Some(min) => min.min(sample),
             None => sample,
-        });
+        };
+        self.min = Some(min);
         let Some(smoothed) = self.smoothed else {
             // First sample: there is nothing to smooth against
             self.smoothed = Some(sample);
@@ -85,7 +86,6 @@ impl Rtt {
         // Only take the peer's reported delay out if doing so leaves a sample
         // above the minimum we have seen, which is the spec's guard against a
         // peer inflating it
-        let min = self.min.unwrap_or(sample);
         let adjusted = if sample > min {
             sample.saturating_sub(ack_delay.min(max_ack_delay))
         } else {

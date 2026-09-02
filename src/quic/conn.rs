@@ -124,12 +124,12 @@ struct SpaceState {
     largest_received: Option<u64>,
     ack: AckState,
     sent: SentPackets,
-    /// Handshake bytes the peer has not acknowledged, starting at
-    /// `crypto_offset`. Held rather than dropped when sent: until an
-    /// acknowledgement arrives there is no other copy, and a probe timeout
-    /// has to be able to send them again.
+    /// Handshake bytes the peer has not acknowledged. Held rather than
+    /// dropped when sent: until an acknowledgement arrives there is no other
+    /// copy, and a probe timeout has to be able to send them again. Never
+    /// trimmed at the front either, which is what makes a position in it the
+    /// CRYPTO stream offset it goes out at.
     crypto_out: Vec<u8>,
-    crypto_offset: u64,
     /// How much of `crypto_out` has been put in a packet at least once
     crypto_sent: usize,
     /// Incoming handshake bytes, reassembled. rustls needs the handshake in
@@ -694,7 +694,7 @@ impl Connection {
             if len == 0 {
                 break;
             }
-            let offset = s.crypto_offset + s.crypto_sent as u64;
+            let offset = s.crypto_sent as u64;
             let data: Vec<u8> = s.crypto_out[s.crypto_sent..s.crypto_sent + len].to_vec();
             frame::put_crypto(out, offset, &data);
             frames.push(SentFrame::Crypto { offset, len });
@@ -1208,7 +1208,7 @@ impl Connection {
                 // tracking holes in a buffer that is a few kilobytes at most.
                 let s = &mut self.spaces[space as usize];
                 let _ = len;
-                let start = offset.saturating_sub(s.crypto_offset) as usize;
+                let start = offset as usize;
                 s.crypto_sent = s.crypto_sent.min(start);
             }
             SentFrame::Stream {
@@ -1572,21 +1572,15 @@ impl Connection {
             Duration::from_millis(self.params.max_ack_delay_ms),
             self.pto_count,
         );
-        if due.is_some_and(|(space, at)| {
-            if now < at {
-                return false;
-            }
+        if let Some((space, at)) = due
+            && now >= at
+        {
             // RFC 9002 Section 6.2.4: a probe sends new data or sends
             // unacknowledged data again. In a handshake space that means the
             // CRYPTO bytes: a PING would be answered with nothing, because a
             // peer that never received the ClientHello has no connection to
             // answer about, and the connection would wait forever.
-            let _ = space;
-            true
-        }) {
-            if let Some((space, _)) = due {
-                self.spaces[space as usize].crypto_sent = 0;
-            }
+            self.spaces[space as usize].crypto_sent = 0;
             self.pto_count += 1;
             // RFC 9002 Section 6.2.4 allows two, which recovers a lost probe
             // without another timeout
