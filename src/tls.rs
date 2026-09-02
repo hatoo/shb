@@ -61,7 +61,17 @@ impl ServerCertVerifier for TrustAll {
 ///
 /// `alpn` is the single protocol to offer (`b"h3"`, `b"h2"` or `b"http/1.1"`).
 pub fn client_config(alpn: &[u8]) -> Result<Arc<ClientConfig>> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut base = rustls::crypto::ring::default_provider();
+    // The provider offers AES-256-GCM first, which browsers and curl do not:
+    // they put AES-128-GCM ahead of it, ten AES rounds against fourteen. A
+    // server picks from what the client offers, in the client's order, so a
+    // benchmark client that asks for something else is measuring the server
+    // doing something no real client asks it to do. Worth 3% of the
+    // instructions an HTTPS request costs here, though not enough of the
+    // wall clock to measure.
+    base.cipher_suites
+        .sort_by_key(|s| s.suite() != rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    let provider = Arc::new(base);
     let mut config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .context("TLS protocol versions")?
