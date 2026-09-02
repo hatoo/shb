@@ -161,6 +161,9 @@ pub struct Connection {
     /// acknowledged. Reused: one arrives for every batch of requests.
     ack_ranges: Vec<(u64, u64)>,
     acked: Vec<SentPacket>,
+    /// Frame lists from packets that are no longer in flight, kept for the
+    /// next packets to fill. One a packet is what a client sends most of.
+    spare_frames: Vec<Vec<SentFrame>>,
     /// Somewhere to put a packet's plaintext while its frames are read
     ///
     /// The frames borrow the bytes and handling them touches `self`, so the
@@ -280,6 +283,7 @@ impl Connection {
             spare_bufs: Vec::new(),
             ack_ranges: Vec::new(),
             acked: Vec::new(),
+            spare_frames: Vec::new(),
             payload: Vec::with_capacity(MAX_DATAGRAM),
             rotate_at: 0,
             local_cid,
@@ -573,12 +577,14 @@ impl Connection {
         // byte or two, which is enough to break a GSO batch.
         let limit = pad_to.unwrap_or(MAX_DATAGRAM);
         let budget = limit.saturating_sub(out.len() - datagram_start + TAG_LEN);
-        let mut frames = Vec::new();
+        let mut frames = self.spare_frames.pop().unwrap_or_default();
         let filled = self.fill_payload(space, now, out, budget, &mut frames, congested)?;
 
         if out.len() == payload_start {
             // Nothing to say in this space
             out.truncate(header_start);
+            frames.clear();
+            self.spare_frames.push(frames);
             return Ok(false);
         }
 
@@ -1181,7 +1187,7 @@ impl Connection {
         }
 
         let loss_delay = self.rtt.loss_delay();
-        let (lost, deadline) = self.spaces[space as usize]
+        let (mut lost, deadline) = self.spaces[space as usize]
             .sent
             .detect_lost(now, loss_delay);
         self.on_lost_packets(space, &lost, now);
@@ -1189,9 +1195,27 @@ impl Connection {
         if !lost.is_empty() {
             self.needs_send = true;
         }
-        acked.clear();
+        self.recycle(&mut lost);
+        self.recycle(&mut acked);
         self.acked = acked;
         Ok(())
+    }
+
+    /// Take a batch of packets out of use, keeping their frame lists for the
+    /// packets still to be built
+    fn recycle(&mut self, packets: &mut Vec<SentPacket>) {
+        // A packet is in flight for a round trip, so a handful covers a whole
+        // pass; the cap is only there for a peer that acknowledges in bulk
+        const SPARES: usize = 64;
+        for p in packets.iter_mut() {
+            if self.spare_frames.len() >= SPARES {
+                break;
+            }
+            let mut frames = std::mem::take(&mut p.frames);
+            frames.clear();
+            self.spare_frames.push(frames);
+        }
+        packets.clear();
     }
 
     /// Apply a batch of newly lost packets, and notice when the span of them
@@ -1583,11 +1607,12 @@ impl Connection {
         if self.loss_deadline.is_some_and(|d| now >= d) {
             let loss_delay = self.rtt.loss_delay();
             for space in Space::ALL {
-                let (lost, deadline) = self.spaces[space as usize]
+                let (mut lost, deadline) = self.spaces[space as usize]
                     .sent
                     .detect_lost(now, loss_delay);
                 self.on_lost_packets(space, &lost, now);
                 self.loss_deadline = deadline;
+                self.recycle(&mut lost);
             }
             self.needs_send = true;
             return;
