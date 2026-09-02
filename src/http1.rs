@@ -16,8 +16,7 @@ use crate::stats::Stats;
 use crate::target::Target;
 use crate::tls::{TlsSession, TlsSetup};
 use crate::uring::{
-    self, BUF_GROUP, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND,
-    TIMEOUT_USER_DATA,
+    self, CONN_IDX_BITS, OP_CONNECT, OP_CONNECT_TIMEOUT, OP_RECV, OP_SEND, TIMEOUT_USER_DATA,
 };
 
 struct Conn {
@@ -182,30 +181,11 @@ pub fn run_worker(
         conns.push(conn);
     }
 
-    let entries = (connections * 2).next_power_of_two().max(256) as u32;
-    let mut ring = uring::build_ring(entries)?;
-
-    // Keep the Submitter alive so enter can use the registered ring fd
-    // (submitter/sq/cq are disjoint borrows of the ring; the ring itself is
-    // not touched from here on)
+    let mut ring = uring::build_worker_ring(connections)?;
+    // Kept alive so that enter can use the registered ring fd; submitter, sq
+    // and cq are disjoint borrows, and the ring is not touched from here on
     let (mut submitter, mut sq, mut cq) = ring.split();
-
-    // Skip the ring-fd fdget/fput on every enter (5.18+; behavior is identical
-    // if this fails)
-    let _ = submitter.register_ring_fd();
-
-    // Reserve a fixed file slot per connection; SQEs refer to fds as
-    // types::Fixed(conn_idx), skipping per-op fd refcounting
-    submitter
-        .register_files_sparse(connections as u32)
-        .context("register_files_sparse failed")?;
-
-    // Register the provided buffer ring (kernel 5.19+; RecvMulti needs 6.0+)
-    unsafe {
-        submitter
-            .register_buf_ring_with_flags(buf_ring.ring_ptr as u64, buf_ring.entries, BUF_GROUP, 0)
-            .context("register_buf_ring failed")?;
-    }
+    uring::register_worker(&mut submitter, connections, &buf_ring)?;
 
     // The sockaddr / Timespec referenced by Connect SQEs must stay at a stable
     // address until completion
@@ -218,16 +198,8 @@ pub fn run_worker(
     }
     let mut started: u64 = 0;
 
-    // Duration mode: the deadline is detected solely via the io_uring Timeout CQE
-    let timespec = budget
-        .deadline()
-        .map(|d| Box::new(types::Timespec::from(d)));
-    if let Some(ts) = &timespec {
-        let entry = io_uring::opcode::Timeout::new(&**ts as *const types::Timespec)
-            .build()
-            .user_data(TIMEOUT_USER_DATA);
-        uring::push_sqe(&submitter, &mut sq, entry)?;
-    }
+    // Held for its lifetime: the SQE points at it until the run is over
+    let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
 
     // Kick off the initial requests (connection setup is async via io_uring too)
     for (i, conn) in conns.iter_mut().enumerate() {

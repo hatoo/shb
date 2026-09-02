@@ -1,8 +1,11 @@
 use std::net::SocketAddr;
 use std::os::fd::{IntoRawFd, RawFd};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
+
+use crate::buf_ring::BufRing;
 
 /// Buffer group ID of the provided buffer ring (one per worker)
 pub const BUF_GROUP: u16 = 0;
@@ -227,6 +230,63 @@ fn build_ring_inner(entries: u32) -> Result<IoUring> {
             IoUring::new(entries)
         })
         .context("failed to create io_uring")
+}
+
+/// Build the ring a worker runs on
+///
+/// Two entries per connection covers a send and a receive in flight at once,
+/// and the floor keeps a run with few connections from submitting in dribs.
+pub fn build_worker_ring(connections: usize) -> Result<IoUring> {
+    let entries = (connections * 2).next_power_of_two().max(256) as u32;
+    build_ring(entries)
+}
+
+/// Register what a worker's ring needs, once it has been split
+///
+/// The ring fd, so each enter skips an fdget and fput (5.18+; behaviour is
+/// identical if it fails). A fixed file slot per connection, so an SQE names
+/// its fd as `types::Fixed(conn_idx)` and skips per-operation refcounting. And
+/// the provided buffer ring the multishot receives fill from (5.19+, and
+/// RecvMulti itself needs 6.0+).
+pub fn register_worker(
+    submitter: &mut Submitter<'_>,
+    connections: usize,
+    buf_ring: &BufRing,
+) -> Result<()> {
+    let _ = submitter.register_ring_fd();
+    submitter
+        .register_files_sparse(connections as u32)
+        .context("register_files_sparse failed")?;
+    // SAFETY: the caller declares the buffer ring before the io_uring, so
+    // reverse drop order takes the ring down first - and taking it down waits
+    // for the operations that would otherwise write into freed buffers
+    unsafe {
+        submitter
+            .register_buf_ring_with_flags(buf_ring.ring_ptr as u64, buf_ring.entries, BUF_GROUP, 0)
+            .context("register_buf_ring failed")?;
+    }
+    Ok(())
+}
+
+/// Arm the deadline a duration-mode run ends on, which is how the workers
+/// learn the run is over: nothing else watches the clock
+///
+/// The returned Timespec has to stay alive, because the SQE points at it until
+/// then. A run bounded by a request count has no deadline and gets `None`.
+pub fn arm_deadline(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    deadline: Option<Duration>,
+) -> Result<Option<Box<types::Timespec>>> {
+    let Some(after) = deadline else {
+        return Ok(None);
+    };
+    let ts = Box::new(types::Timespec::from(after));
+    let entry = opcode::Timeout::new(&*ts as *const types::Timespec)
+        .build()
+        .user_data(TIMEOUT_USER_DATA);
+    push_sqe(submitter, sq, entry)?;
+    Ok(Some(ts))
 }
 
 pub fn push_sqe(
