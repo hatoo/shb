@@ -152,6 +152,13 @@ pub struct Connection {
     prev_1rtt_remote: Option<Box<dyn rustls::quic::PacketKey>>,
     /// Which generation is in use: the bit the peer flips to update its keys
     key_phase: bool,
+    /// Somewhere to put a packet's plaintext while its frames are read
+    ///
+    /// The frames borrow the bytes and handling them touches `self`, so the
+    /// payload cannot stay in the datagram buffer. Kept here rather than made
+    /// fresh each time: a copy is one memcpy, an allocation is a trip through
+    /// the allocator for every packet that arrives.
+    payload: Vec<u8>,
     /// The Destination Connection ID of our first Initial, which is what a
     /// Retry's integrity tag is computed over
     original_dcid: ConnectionId,
@@ -261,6 +268,7 @@ impl Connection {
             next_1rtt: None,
             prev_1rtt_remote: None,
             key_phase: false,
+            payload: Vec::with_capacity(MAX_DATAGRAM),
             rotate_at: 0,
             local_cid,
             peer_cid: initial_dcid,
@@ -744,8 +752,8 @@ impl Connection {
             let (id, ref mut send) = self.local_uni[i];
             let mut sent_len = 0;
             if let Some((offset, data, fin)) = send.next_send(avail - 16) {
-                let (len, data) = (data.len(), data.to_vec());
-                frame::put_stream(out, id, offset, fin, &data);
+                let len = data.len();
+                frame::put_stream(out, id, offset, fin, data);
                 send.on_sent(offset, len, fin);
                 sent_len = len;
                 frames.push(SentFrame::Stream {
@@ -788,8 +796,8 @@ impl Connection {
             }
             let mut sent_len = 0;
             if let Some((offset, data, fin)) = pair.send.next_send(avail - 16) {
-                let (len, data) = (data.len(), data.to_vec());
-                frame::put_stream(out, id, offset, fin, &data);
+                let len = data.len();
+                frame::put_stream(out, id, offset, fin, data);
                 pair.send.on_sent(offset, len, fin);
                 sent_len = len;
                 frames.push(SentFrame::Stream {
@@ -928,13 +936,27 @@ impl Connection {
 
         let mut ack_eliciting = false;
         let payload_range = payload_start..payload_start + plain;
-        // The borrow of `buf` has to end before the frames touch `self`
-        let payload = buf[payload_range].to_vec();
+        // The borrow of `buf` has to end before the frames touch `self`, so
+        // the plaintext moves into a buffer of our own - taken out and put
+        // back so that handling a frame can still reach the rest of `self`
+        let mut payload = std::mem::take(&mut self.payload);
+        payload.clear();
+        payload.extend_from_slice(&buf[payload_range]);
+        let mut outcome = Ok(());
         for f in frame::Iter::new(&payload) {
-            let f = f?;
-            ack_eliciting |= f.ack_eliciting();
-            self.handle_frame(space, f, now)?;
+            match f.and_then(|f| {
+                ack_eliciting |= f.ack_eliciting();
+                self.handle_frame(space, f, now)
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+            }
         }
+        self.payload = payload;
+        outcome?;
         self.spaces[space as usize]
             .ack
             .record(pn, ack_eliciting, now);

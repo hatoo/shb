@@ -146,6 +146,10 @@ struct Conn {
     goaway: bool,
     /// Outgoing datagrams; the front one is in flight while `sending`
     out_queue: VecDeque<Datagram>,
+    /// Buffers that have been sent and can be filled again. A datagram batch
+    /// is up to 64 segments, so building one from an empty Vec means growing
+    /// it back to seventy kilobytes every time.
+    spare: Vec<Vec<u8>>,
     /// Pinned sendmsg bookkeeping for GSO sends
     msg_state: Box<MsgState>,
     sending: bool,
@@ -168,6 +172,7 @@ impl Conn {
             pending: false,
             goaway: false,
             out_queue: VecDeque::new(),
+            spare: Vec::new(),
             msg_state: Box::new(unsafe { std::mem::zeroed() }),
             sending: false,
             recv_armed: false,
@@ -321,6 +326,17 @@ fn push_front_send(
     Ok(())
 }
 
+/// Retire the datagram at the front of the queue, keeping its buffer to fill
+/// again. A couple of spares is all one connection ever needs at once.
+fn recycle(conn: &mut Conn) {
+    const SPARES: usize = 2;
+    if let Some(sent) = conn.out_queue.pop_front()
+        && conn.spare.len() < SPARES
+    {
+        conn.spare.push(sent.buf);
+    }
+}
+
 /// Move pending QUIC datagrams into the send queue and start sending
 fn pump_transmits(
     submitter: &io_uring::Submitter<'_>,
@@ -391,8 +407,9 @@ fn pump_transmits(
             if narrate() {
                 eprintln!("[gso] {count} segments of {segment_size}");
             }
+            let empty = conn.spare.pop().unwrap_or_default();
             conn.out_queue.push_back(Datagram {
-                buf: std::mem::take(transmit_buf),
+                buf: std::mem::replace(transmit_buf, empty),
                 segment_size: if count > 1 { segment_size } else { 0 },
             });
         }
@@ -762,7 +779,7 @@ pub fn run_worker(
                         // An MTU probe the kernel will not carry. Dropping it
                         // is exactly what the probe timing out expects, so
                         // discard the datagram and keep the connection
-                        conn.out_queue.pop_front();
+                        recycle(conn);
                         push_front_send(&submitter, &mut sq, conn_idx, conn)?;
                     } else if res < 0 {
                         if narrate() {
@@ -771,7 +788,7 @@ pub fn run_worker(
                         conn_broken = true;
                     } else {
                         stats.bytes_sent += res as u64;
-                        conn.out_queue.pop_front();
+                        recycle(conn);
                         push_front_send(&submitter, &mut sq, conn_idx, conn)?;
                     }
                 }
