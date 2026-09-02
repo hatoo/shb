@@ -12,6 +12,11 @@ use anyhow::{Result, bail};
 use super::hpack;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+/// The largest stream id there is: the field is 31 bits with the top one
+/// reserved (RFC 9113 Section 5.1.1). Ours are the odd ones, so a connection
+/// runs out after a billion requests - eleven hours at thirty thousand a
+/// second, which a long run reaches.
+const MAX_STREAM_ID: u32 = 0x7fff_ffff;
 const FRAME_HEADER_LEN: usize = 9;
 
 // Frame types
@@ -155,7 +160,15 @@ impl Connection {
 
     /// Whether another stream may be opened right now
     pub fn can_open(&self) -> bool {
-        !self.goaway && (self.open.len() as u32) < self.max_concurrent
+        !self.goaway
+            && !self.stream_ids_exhausted()
+            && (self.open.len() as u32) < self.max_concurrent
+    }
+
+    /// No id is left to hand out, so this connection cannot carry another
+    /// request. RFC 9113 Section 5.1.1: open a new one.
+    pub fn stream_ids_exhausted(&self) -> bool {
+        self.next_id > MAX_STREAM_ID
     }
 
     /// Open a stream carrying `block` (and `body`), returning its id
@@ -166,7 +179,7 @@ impl Connection {
             return None;
         }
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(2);
+        self.next_id = self.next_id.saturating_add(2);
         let end_stream = if body.is_empty() { FLAG_END_STREAM } else { 0 };
         let max = self.peer_max_frame as usize;
 
@@ -722,6 +735,28 @@ mod tests {
         assert!(c.start_stream(&[0x82], b"").is_some());
         assert!(c.start_stream(&[0x82], b"").is_some());
         assert!(c.start_stream(&[0x82], b"").is_none(), "limit applies");
+    }
+
+    #[test]
+    /// The id field is 31 bits with the top one reserved, so past the last id
+    /// the reserved bit would go on the wire and the peer would see a stream
+    /// it cannot have. A connection that has run out has to be replaced, so it
+    /// refuses new streams the way one that got a GOAWAY does.
+    #[test]
+    fn a_connection_that_runs_out_of_stream_ids_opens_no_more() {
+        let mut c = connected();
+        c.next_id = MAX_STREAM_ID;
+        assert_eq!(
+            c.start_stream(&[0x82], b""),
+            Some(MAX_STREAM_ID),
+            "the last id is usable"
+        );
+        assert!(c.stream_ids_exhausted());
+        assert!(!c.can_open());
+        assert!(
+            c.start_stream(&[0x82], b"").is_none(),
+            "and there is no next"
+        );
     }
 
     #[test]

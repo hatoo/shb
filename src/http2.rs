@@ -162,6 +162,12 @@ fn fill_streams(
         );
         *started += 1;
     }
+    // Out of stream ids: this connection can carry no more requests, which is
+    // the state a GOAWAY leaves it in, so it drains and is replaced the same
+    // way.
+    if h2.stream_ids_exhausted() {
+        conn.goaway = true;
+    }
 }
 
 /// Move pending h2 output into the send buffer and submit it, unless a send
