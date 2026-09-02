@@ -660,9 +660,14 @@ impl Connection {
             let delay = self.spaces[space as usize]
                 .ack
                 .delay(now, self.params.ack_delay_exponent);
-            let ranges = self.spaces[space as usize].ack.ranges().to_vec();
-            frame::put_ack(out, &ranges, delay);
+            let ranges = self.spaces[space as usize].ack.ranges();
+            // Ranges come largest first (RFC 9000 Section 19.3)
+            let largest = ranges.first().map(|&(_, largest)| largest);
+            frame::put_ack(out, ranges, delay);
             self.spaces[space as usize].ack.take_pending();
+            if let Some(largest) = largest {
+                frames.push(SentFrame::Ack { largest });
+            }
         }
 
         if let Some(data) = self.path_response.take()
@@ -1128,11 +1133,10 @@ impl Connection {
         for p in &acked {
             bytes += p.size;
             for f in &p.frames {
-                self.on_frame_acked(*f);
+                self.on_frame_acked(space, *f);
             }
         }
         self.congestion.on_ack(bytes, now);
-        self.spaces[space as usize].ack.trim_below(0);
 
         let loss_delay = self.rtt.loss_delay();
         let (lost, deadline) = self.spaces[space as usize]
@@ -1169,11 +1173,16 @@ impl Connection {
         }
     }
 
-    fn on_frame_acked(&mut self, f: SentFrame) {
+    fn on_frame_acked(&mut self, space: Space, f: SentFrame) {
         match f {
             // A PING is only there to draw an acknowledgement, and CRYPTO is
             // released by the handshake advancing rather than by this
             SentFrame::Ping | SentFrame::Crypto { .. } => {}
+            // The peer has this acknowledgement now, so what it covered can go.
+            // Nothing else drops a range: a lost packet's number is never
+            // reused, so the hole it leaves is permanent, and without this the
+            // list grows one entry per lost packet for the life of the run.
+            SentFrame::Ack { largest } => self.spaces[space as usize].ack.trim_below(largest),
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -1186,7 +1195,9 @@ impl Connection {
 
     fn on_frame_lost(&mut self, space: Space, f: SentFrame) {
         match f {
-            SentFrame::Ping => {}
+            // A lost ACK is not resent: the next one carries the same ranges,
+            // which is why they are kept until the peer confirms them
+            SentFrame::Ping | SentFrame::Ack { .. } => {}
             SentFrame::Crypto { offset, len } => {
                 // Rewind to the lost run. Anything after it goes out again
                 // too, which costs a little bandwidth once and avoids
@@ -1592,6 +1603,62 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client() -> Connection {
+        let tls = crate::tls::client_config(b"h3").unwrap();
+        Connection::connect(
+            tls,
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 20,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 5_000,
+            },
+        )
+        .unwrap()
+    }
+
+    /// An ACK frame has to be remembered by what it acknowledged, or nothing
+    /// ever tells the receive side that the peer has heard it
+    #[test]
+    fn an_ack_we_send_is_recorded_as_sent() {
+        let mut conn = client();
+        let now = Instant::now();
+        conn.spaces[Space::Initial as usize]
+            .ack
+            .record(5, true, now);
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_payload(Space::Initial, now, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, SentFrame::Ack { largest: 5 })),
+            "the ACK just written is not in the packet's frames: {frames:?}"
+        );
+    }
+
+    /// A lost packet's number is never reused, so the hole it leaves in what
+    /// we have received is permanent. Without this the list of ranges grows
+    /// one entry per lost packet for the life of the connection.
+    #[test]
+    fn an_acknowledged_ack_lets_its_ranges_go() {
+        let mut conn = client();
+        let now = Instant::now();
+        let space = Space::Initial as usize;
+        // Packet 1 never arrives
+        for pn in [0, 2, 3] {
+            conn.spaces[space].ack.record(pn, true, now);
+        }
+        assert_eq!(conn.spaces[space].ack.ranges().len(), 2, "a gap, so two");
+        conn.on_frame_acked(Space::Initial, SentFrame::Ack { largest: 3 });
+        assert!(
+            conn.spaces[space].ack.ranges().is_empty(),
+            "the peer has them; repeating them for the rest of the run is what grew"
+        );
+    }
 
     /// Build a client Initial and read it back the way a server would
     ///

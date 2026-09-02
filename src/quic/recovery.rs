@@ -52,6 +52,12 @@ pub enum SentFrame {
     },
     /// A PING sent purely to make the peer acknowledge something
     Ping,
+    /// An ACK, remembered by what it acknowledged. Once the peer has it, the
+    /// ranges it covers need not be carried in every ACK for the rest of the
+    /// connection.
+    Ack {
+        largest: u64,
+    },
 }
 
 #[derive(Default)]
