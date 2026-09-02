@@ -9,6 +9,12 @@
 
 use anyhow::{Result, bail};
 
+/// How much buffer a pooled stream keeps hold of. Requests are tens of bytes
+/// and most responses are small, so this covers the common case; a stream that
+/// carried a large body gives the rest back rather than keeping it for a
+/// connection's lifetime.
+const POOLED_CAPACITY: usize = 4096;
+
 /// Which side opened a stream, and whether it carries data both ways
 /// (RFC 9000 Section 2.1)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +59,20 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    /// Make this stream ready for a new one, keeping the buffers it has
+    /// already grown. A stream lives for one request, so allocating its
+    /// buffers afresh each time is an allocation per request on each side.
+    pub fn reuse(&mut self, limit: u64) {
+        self.buf.clear();
+        self.buf.shrink_to(POOLED_CAPACITY);
+        self.lost.clear();
+        self.base_offset = 0;
+        self.sent = 0;
+        self.limit = limit;
+        self.fin = false;
+        self.fin_sent = false;
+    }
+
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
@@ -202,6 +222,16 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
+    /// The receiving half of [`SendStream::reuse`]
+    pub fn reuse(&mut self) {
+        self.ready.clear();
+        self.ready.shrink_to(POOLED_CAPACITY);
+        self.pending.clear();
+        self.read_offset = 0;
+        self.final_size = None;
+        self.received = 0;
+    }
+
     /// Take a STREAM frame. Returns how many new bytes of stream this covered,
     /// which is what counts against the flow control window.
     pub fn push(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<u64> {

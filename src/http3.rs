@@ -150,6 +150,10 @@ struct Conn {
     /// is up to 64 segments, so building one from an empty Vec means growing
     /// it back to seventy kilobytes every time.
     spare: Vec<Vec<u8>>,
+    /// Scratch for one pass of the event loop, kept so that a pass does not
+    /// begin by allocating the two lists it is about to fill
+    readable: Vec<u64>,
+    finished: Vec<(u64, bool)>,
     /// Pinned sendmsg bookkeeping for GSO sends
     msg_state: Box<MsgState>,
     sending: bool,
@@ -173,6 +177,8 @@ impl Conn {
             goaway: false,
             out_queue: VecDeque::new(),
             spare: Vec::new(),
+            readable: Vec::new(),
+            finished: Vec::new(),
             msg_state: Box::new(unsafe { std::mem::zeroed() }),
             sending: false,
             recv_armed: false,
@@ -448,8 +454,10 @@ fn drive(
             return Ok(true);
         };
         let mut alive = true;
-        let mut readable: Vec<u64> = Vec::new();
-        let mut finished: Vec<(u64, bool)> = Vec::new();
+        let mut readable = std::mem::take(&mut conn.readable);
+        let mut finished = std::mem::take(&mut conn.finished);
+        readable.clear();
+        finished.clear();
 
         while let Some(event) = quic.poll_event() {
             match event {
@@ -489,7 +497,7 @@ fn drive(
 
         readable.sort_unstable();
         readable.dedup();
-        for id in readable {
+        for &id in &readable {
             if let Some(pos) = conn.streams.iter().position(|s| s.stream_id == id) {
                 let reader = &mut conn.streams[pos].reader;
                 read_quic_stream(quic, id, scratch, |data| reader.feed(data))?;
@@ -511,7 +519,7 @@ fn drive(
             }
         }
 
-        for (id, reset) in finished {
+        for &(id, reset) in &finished {
             let Some(pos) = conn.streams.iter().position(|s| s.stream_id == id) else {
                 continue;
             };
@@ -534,6 +542,9 @@ fn drive(
         }
 
         flush_unsent(quic, &mut conn.streams)?;
+        // Back where the next pass will find them, with the capacity they grew
+        conn.readable = readable;
+        conn.finished = finished;
         fill_streams(conn, request, parallel, started, budget, stop)?;
         Ok(alive)
     })();

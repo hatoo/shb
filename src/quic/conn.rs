@@ -152,6 +152,9 @@ pub struct Connection {
     prev_1rtt_remote: Option<Box<dyn rustls::quic::PacketKey>>,
     /// Which generation is in use: the bit the peer flips to update its keys
     key_phase: bool,
+    /// Stream pairs whose request has finished, kept for the next one. Their
+    /// buffers are the two allocations a request otherwise makes.
+    spare_streams: Vec<StreamPair>,
     /// Somewhere to put a packet's plaintext while its frames are read
     ///
     /// The frames borrow the bytes and handling them touches `self`, so the
@@ -268,6 +271,7 @@ impl Connection {
             next_1rtt: None,
             prev_1rtt_remote: None,
             key_phase: false,
+            spare_streams: Vec::new(),
             payload: Vec::with_capacity(MAX_DATAGRAM),
             rotate_at: 0,
             local_cid,
@@ -1292,12 +1296,23 @@ impl Connection {
         }
         let id = client_stream_id(Dir::Bi, self.next_bidi);
         self.next_bidi += 1;
-        self.streams.push_back(Some(StreamPair {
-            send: SendStream::new(self.params.initial_max_stream_data_bidi_remote),
-            recv: RecvStream::default(),
-            finished: false,
-            queued: false,
-        }));
+        let limit = self.params.initial_max_stream_data_bidi_remote;
+        let pair = match self.spare_streams.pop() {
+            Some(mut pair) => {
+                pair.send.reuse(limit);
+                pair.recv.reuse();
+                pair.finished = false;
+                pair.queued = false;
+                pair
+            }
+            None => StreamPair {
+                send: SendStream::new(limit),
+                recv: RecvStream::default(),
+                finished: false,
+                queued: false,
+            },
+        };
+        self.streams.push_back(Some(pair));
         Some(id)
     }
 
@@ -1341,8 +1356,17 @@ impl Connection {
 
     /// Forget a stream that the worker is done with, releasing its slot
     pub fn retire(&mut self, id: u64) {
-        if let Some(i) = self.stream_index(id) {
-            self.streams[i] = None;
+        // One pass of the loop retires everything that finished and then
+        // opens that many again, so the pool has to cover a whole pass to save
+        // anything. It cannot grow past the streams that were open at once,
+        // which is what bounds it: the cap is only there for a peer that
+        // allows an unreasonable number.
+        const SPARES: usize = 256;
+        if let Some(i) = self.stream_index(id)
+            && let Some(pair) = self.streams[i].take()
+            && self.spare_streams.len() < SPARES
+        {
+            self.spare_streams.push(pair);
         }
         // Trim the front so the ring does not grow for the life of the run
         while matches!(self.streams.front(), Some(None)) {
