@@ -1017,3 +1017,136 @@ fn a_silent_server_ends_an_http2_run_too() {
     assert_eq!(report["requests"]["ok"], 0, "report: {report}");
     assert_eq!(report["requests"]["errors"], 2, "report: {report}");
 }
+
+/// A UDP relay in front of the HTTP/3 server that loses, duplicates and
+/// reorders datagrams
+///
+/// Loopback loses nothing, reorders nothing and delivers in microseconds, so
+/// everything QUIC has for a network that misbehaves - loss detection, probe
+/// timeouts, retransmission, reassembly out of order - sits untouched behind
+/// tests that all pass on a perfect path. Most of the QUIC bugs found in this
+/// stack showed up first against servers out on the internet, which is a slow
+/// way to learn.
+///
+/// The impairment is driven by a seeded generator, so a run that fails fails
+/// the same way again.
+fn impaired_h3_addr(loss_pct: u32, dup_pct: u32, reorder_pct: u32, seed: u64) -> SocketAddr {
+    use std::collections::HashMap;
+    use std::net::UdpSocket;
+    use std::sync::{Arc, Mutex};
+
+    let upstream = h3_server_addr();
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("bind relay"));
+    let addr = front.local_addr().expect("relay addr");
+
+    // Deterministic and tiny; the sequence only has to be irregular
+    struct Rng(u64);
+    impl Rng {
+        fn hits(&mut self, percent: u32) -> bool {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            percent > 0 && (self.0 >> 33) as u32 % 100 < percent
+        }
+    }
+
+    // One datagram held back and released after the next one goes: reordering
+    // without a timer to make the test flaky
+    fn relay(
+        send: impl Fn(&[u8]),
+        rng: &mut Rng,
+        held: &mut Option<Vec<u8>>,
+        data: &[u8],
+        loss: u32,
+        dup: u32,
+        reorder: u32,
+    ) {
+        if rng.hits(loss) {
+            return;
+        }
+        if let Some(previous) = held.take() {
+            send(data);
+            send(&previous);
+            return;
+        }
+        if rng.hits(reorder) {
+            *held = Some(data.to_vec());
+            return;
+        }
+        send(data);
+        if rng.hits(dup) {
+            send(data);
+        }
+    }
+
+    let peers: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Default::default();
+    let f = Arc::clone(&front);
+    let p = Arc::clone(&peers);
+    std::thread::spawn(move || {
+        let mut rng = Rng(seed | 1);
+        let mut held = None;
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, from)) = f.recv_from(&mut buf) {
+            let up = {
+                let mut peers = p.lock().expect("peers");
+                Arc::clone(peers.entry(from).or_insert_with(|| {
+                    let s = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("bind upstream"));
+                    s.connect(upstream).expect("connect upstream");
+                    // The other direction gets its own thread and its own
+                    // sequence, so neither waits on the other
+                    let back = Arc::clone(&s);
+                    let out = Arc::clone(&f);
+                    std::thread::spawn(move || {
+                        let mut rng = Rng(seed.rotate_left(32) | 1);
+                        let mut held = None;
+                        let mut buf = vec![0u8; 65535];
+                        while let Ok(m) = back.recv(&mut buf) {
+                            relay(
+                                |d| {
+                                    let _ = out.send_to(d, from);
+                                },
+                                &mut rng,
+                                &mut held,
+                                &buf[..m],
+                                loss_pct,
+                                dup_pct,
+                                reorder_pct,
+                            );
+                        }
+                    });
+                    s
+                }))
+            };
+            relay(
+                |d| {
+                    let _ = up.send(d);
+                },
+                &mut rng,
+                &mut held,
+                &buf[..n],
+                loss_pct,
+                dup_pct,
+                reorder_pct,
+            );
+        }
+    });
+    addr
+}
+
+/// Five per cent of datagrams never arrive, in both directions
+#[test]
+fn h3_gets_through_a_lossy_path() {
+    let addr = impaired_h3_addr(5, 0, 0, 0x5eed);
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 40, "200");
+}
+
+/// Datagrams arrive twice, or out of order, or not at all
+#[test]
+fn h3_gets_through_duplication_and_reordering() {
+    let addr = impaired_h3_addr(2, 10, 10, 0xd0e5);
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
+    assert_all_ok(&report, 40, "200");
+}
