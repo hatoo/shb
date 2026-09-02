@@ -22,7 +22,7 @@ fn protocol_name(args: &Args) -> &'static str {
     }
 }
 
-pub fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duration) {
+pub fn print_report(args: &Args, threads: usize, stats: &mut Stats, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
     let total = stats.completed + stats.errors;
     println!("URL:          {}", args.url);
@@ -56,7 +56,7 @@ pub fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duratio
         }
     }
 
-    if let Some(l) = latency_summary(&stats.latencies_ns) {
+    if let Some(l) = latency_summary(&mut stats.latencies_ns) {
         println!("Latency (ms):");
         println!(
             "  min {:.3}  mean {:.3}  max {:.3}",
@@ -74,7 +74,7 @@ pub fn print_report(args: &Args, threads: usize, stats: &Stats, elapsed: Duratio
 pub fn print_json_report(
     args: &Args,
     threads: usize,
-    stats: &Stats,
+    stats: &mut Stats,
     elapsed: Duration,
 ) -> Result<()> {
     let secs = elapsed.as_secs_f64();
@@ -85,7 +85,7 @@ pub fn print_json_report(
         .filter(|&(_, &n)| n > 0)
         .map(|(code, &n)| (code.to_string(), n.into()))
         .collect();
-    let latency = latency_summary(&stats.latencies_ns).map(|l| {
+    let latency = latency_summary(&mut stats.latencies_ns).map(|l| {
         let mut obj = serde_json::Map::new();
         obj.insert("min".to_string(), l.min.into());
         obj.insert("mean".to_string(), l.mean.into());

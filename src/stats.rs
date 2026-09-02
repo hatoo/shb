@@ -63,11 +63,14 @@ pub struct LatencySummary {
     pub percentiles: [f64; 9],
 }
 
-pub fn latency_summary(latencies_ns: &[u64]) -> Option<LatencySummary> {
+/// Sorts in place rather than on a copy: every latency of the run is held, so
+/// at the point this is called a copy is the largest allocation the process
+/// would ever make, and it is only wanted to be sorted.
+pub fn latency_summary(latencies_ns: &mut [u64]) -> Option<LatencySummary> {
     if latencies_ns.is_empty() {
         return None;
     }
-    let mut lat = latencies_ns.to_vec();
+    let lat = latencies_ns;
     lat.sort_unstable();
     // Same index formula as oha: floor(p/100 * len), clamped to the last element
     let pct = |p: f64| -> f64 {
@@ -94,7 +97,7 @@ mod tests {
 
     #[test]
     fn no_samples_have_no_summary() {
-        assert!(latency_summary(&[]).is_none());
+        assert!(latency_summary(&mut []).is_none());
     }
 
     /// Expected values worked out by hand rather than by re-running the
@@ -102,8 +105,8 @@ mod tests {
     /// the 51st sample rather than the 50th.
     #[test]
     fn percentile_indices_are_the_ones_oha_picks() {
-        let lat = ms(&(1..=100).collect::<Vec<_>>());
-        let s = latency_summary(&lat).unwrap();
+        let mut lat = ms(&(1..=100).collect::<Vec<_>>());
+        let s = latency_summary(&mut lat).unwrap();
         let got: Vec<u64> = s
             .percentiles
             .iter()
@@ -125,8 +128,8 @@ mod tests {
         // shb reports, 0.9999 * len is always below len, so the index is
         // always in range however few samples there are
         for len in [1usize, 2, 3, 7, 100, 10_000] {
-            let lat = ms(&(1..=len as u64).collect::<Vec<_>>());
-            let s = latency_summary(&lat).unwrap();
+            let mut lat = ms(&(1..=len as u64).collect::<Vec<_>>());
+            let s = latency_summary(&mut lat).unwrap();
             for (p, v) in PERCENTILES.iter().zip(s.percentiles) {
                 let idx = (p / 100.0 * len as f64) as usize;
                 assert!(idx < len, "p{p} with {len} samples indexes past the end");
@@ -137,7 +140,7 @@ mod tests {
 
     #[test]
     fn a_single_sample_is_every_percentile() {
-        let s = latency_summary(&ms(&[7])).unwrap();
+        let s = latency_summary(&mut ms(&[7])).unwrap();
         assert_eq!(s.min, 0.007);
         assert_eq!(s.max, 0.007);
         assert_eq!(s.mean, 0.007);
@@ -146,8 +149,8 @@ mod tests {
 
     #[test]
     fn samples_do_not_have_to_arrive_in_order() {
-        let sorted = latency_summary(&ms(&[1, 2, 3, 4, 5])).unwrap();
-        let shuffled = latency_summary(&ms(&[4, 1, 5, 3, 2])).unwrap();
+        let sorted = latency_summary(&mut ms(&[1, 2, 3, 4, 5])).unwrap();
+        let shuffled = latency_summary(&mut ms(&[4, 1, 5, 3, 2])).unwrap();
         assert_eq!(sorted.percentiles, shuffled.percentiles);
         assert_eq!(sorted.min, shuffled.min);
         assert_eq!(sorted.max, shuffled.max);

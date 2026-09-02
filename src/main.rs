@@ -260,9 +260,9 @@ fn main() -> Result<()> {
     }
 
     if args.json {
-        print_json_report(&args, threads, &stats, elapsed)?;
+        print_json_report(&args, threads, &mut stats, elapsed)?;
     } else {
-        print_report(&args, threads, &stats, elapsed);
+        print_report(&args, threads, &mut stats, elapsed);
     }
     Ok(())
 }
