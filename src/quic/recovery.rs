@@ -140,9 +140,9 @@ impl SentPackets {
         self.packets.iter().any(|p| p.ack_eliciting)
     }
 
-    /// Packets the peer has acknowledged, removed from flight
-    pub fn drain_acked(&mut self, ranges: &[(u64, u64)]) -> Vec<SentPacket> {
-        let mut acked = Vec::new();
+    /// Move the packets the peer has acknowledged out of flight and into
+    /// `acked`, which the caller reuses rather than allocating one a time
+    pub fn drain_acked(&mut self, ranges: &[(u64, u64)], acked: &mut Vec<SentPacket>) {
         let mut i = 0;
         while i < self.packets.len() {
             let n = self.packets[i].number;
@@ -158,7 +158,6 @@ impl SentPackets {
                 None => max,
             });
         }
-        acked
     }
 
     /// Packets that count as lost now (RFC 9002 Section 6.1), removed from
@@ -494,7 +493,7 @@ mod tests {
         for n in 0..5 {
             s.push(sent(n, now, true));
         }
-        s.drain_acked(&[(4, 4)]);
+        s.drain_acked(&[(4, 4)], &mut Vec::new());
         let (lost, _) = s.detect_lost(now, Duration::from_secs(10));
         let numbers: Vec<_> = lost.iter().map(|p| p.number).collect();
         assert_eq!(numbers, vec![0, 1], "0 and 1 are three or more behind 4");
@@ -507,7 +506,7 @@ mod tests {
         let mut s = SentPackets::default();
         s.push(sent(0, now, true));
         s.push(sent(1, now, true));
-        s.drain_acked(&[(1, 1)]);
+        s.drain_acked(&[(1, 1)], &mut Vec::new());
         let (lost, deadline) = s.detect_lost(now, Duration::from_millis(50));
         assert!(lost.is_empty(), "not yet");
         assert_eq!(deadline, Some(now + Duration::from_millis(50)));
@@ -534,7 +533,8 @@ mod tests {
             s.push(sent(n, now, true));
         }
         assert_eq!(s.bytes_in_flight(), 4 * 1200);
-        let acked = s.drain_acked(&[(1, 2)]);
+        let mut acked = Vec::new();
+        s.drain_acked(&[(1, 2)], &mut acked);
         assert_eq!(acked.len(), 2);
         assert_eq!(s.bytes_in_flight(), 2 * 1200);
         assert_eq!(s.largest_acked, Some(2));
@@ -548,8 +548,8 @@ mod tests {
         for n in 0..4 {
             s.push(sent(n, now, true));
         }
-        s.drain_acked(&[(3, 3)]);
-        s.drain_acked(&[(0, 0)]);
+        s.drain_acked(&[(3, 3)], &mut Vec::new());
+        s.drain_acked(&[(0, 0)], &mut Vec::new());
         assert_eq!(s.largest_acked, Some(3));
     }
 

@@ -157,6 +157,10 @@ pub struct Connection {
     /// buffers are pooled, not the whole stream - a stream pair is 168 bytes
     /// and moving one in and out cost more than the allocation saved.
     spare_bufs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Somewhere to put the ranges an incoming ACK covers, and the packets it
+    /// acknowledged. Reused: one arrives for every batch of requests.
+    ack_ranges: Vec<(u64, u64)>,
+    acked: Vec<SentPacket>,
     /// Somewhere to put a packet's plaintext while its frames are read
     ///
     /// The frames borrow the bytes and handling them touches `self`, so the
@@ -274,6 +278,8 @@ impl Connection {
             prev_1rtt_remote: None,
             key_phase: false,
             spare_bufs: Vec::new(),
+            ack_ranges: Vec::new(),
+            acked: Vec::new(),
             payload: Vec::with_capacity(MAX_DATAGRAM),
             rotate_at: 0,
             local_cid,
@@ -1131,9 +1137,19 @@ impl Connection {
         ranges: &[u8],
         now: Instant,
     ) -> Result<()> {
-        let ranges: Vec<(u64, u64)> = AckRanges::new(largest, first_range, ranges).collect();
-        let acked = self.spaces[space as usize].sent.drain_acked(&ranges);
+        // Both of these are reused: an acknowledgement arrives for every batch
+        // of requests, and a Vec built for each would be an allocation a batch
+        let mut ack_ranges = std::mem::take(&mut self.ack_ranges);
+        ack_ranges.clear();
+        ack_ranges.extend(AckRanges::new(largest, first_range, ranges));
+        let mut acked = std::mem::take(&mut self.acked);
+        acked.clear();
+        self.spaces[space as usize]
+            .sent
+            .drain_acked(&ack_ranges, &mut acked);
+        self.ack_ranges = ack_ranges;
         if acked.is_empty() {
+            self.acked = acked;
             return Ok(());
         }
         if let Some(newest) = acked.iter().find(|p| p.number == largest)
@@ -1173,6 +1189,8 @@ impl Connection {
         if !lost.is_empty() {
             self.needs_send = true;
         }
+        acked.clear();
+        self.acked = acked;
         Ok(())
     }
 
