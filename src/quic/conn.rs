@@ -1136,7 +1136,11 @@ impl Connection {
                 self.on_frame_acked(space, *f);
             }
         }
-        self.congestion.on_ack(bytes, now);
+        // The newest thing acknowledged is what says whether the recovery
+        // period is over
+        if let Some(sent) = acked.iter().map(|p| p.time_sent).max() {
+            self.congestion.on_ack(bytes, sent);
+        }
 
         let loss_delay = self.rtt.loss_delay();
         let (lost, deadline) = self.spaces[space as usize]

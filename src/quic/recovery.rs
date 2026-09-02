@@ -225,7 +225,16 @@ impl SentPackets {
 pub struct Congestion {
     pub window: usize,
     ssthresh: usize,
-    recovery_until: Option<Instant>,
+    /// When the current recovery period began. Anything sent at or before
+    /// this was already in flight when the loss happened, so what becomes of
+    /// it says nothing new about the path (RFC 9002 Section 7.3.2).
+    recovery_start: Option<Instant>,
+    /// Bytes acknowledged towards the next increase. Congestion avoidance
+    /// adds a packet per window of data, which for a window of megabytes is a
+    /// fraction of a packet per acknowledgement: computed per acknowledgement
+    /// the division rounded it to nothing, and the window never recovered
+    /// from a halving.
+    acked_since_increase: usize,
 }
 
 /// RFC 9002 Section 7.2 puts the initial window at ten packets; shb starts
@@ -239,32 +248,44 @@ impl Default for Congestion {
         Self {
             window: INITIAL_WINDOW,
             ssthresh: usize::MAX,
-            recovery_until: None,
+            recovery_start: None,
+            acked_since_increase: 0,
         }
     }
 }
 
 impl Congestion {
-    pub fn on_ack(&mut self, bytes: usize, now: Instant) {
-        if self.recovery_until.is_some_and(|t| now < t) {
+    /// `sent` is when the newest thing being acknowledged went out
+    pub fn on_ack(&mut self, bytes: usize, sent: Instant) {
+        // Recovery ends when something sent after it began comes back. This
+        // used to compare the time the acknowledgement arrived, which is
+        // always after the recovery began, so it never held and the window
+        // grew straight back through a recovery.
+        if self.recovery_start.is_some_and(|t| sent <= t) {
             return;
         }
         if self.window < self.ssthresh {
             self.window += bytes;
-        } else {
-            // Congestion avoidance: one more packet per window
-            self.window += 1200 * bytes / self.window.max(1);
+            return;
+        }
+        // Congestion avoidance: one more packet per window of data, with the
+        // remainder carried so a wide window still grows
+        self.acked_since_increase += bytes;
+        if self.acked_since_increase >= self.window {
+            self.acked_since_increase -= self.window;
+            self.window += 1200;
         }
     }
 
     pub fn on_loss(&mut self, sent: Instant, now: Instant) {
         // One halving per round trip, not one per lost packet
-        if self.recovery_until.is_some_and(|t| sent < t) {
+        if self.recovery_start.is_some_and(|t| sent <= t) {
             return;
         }
         self.window = (self.window / 2).max(MIN_WINDOW);
         self.ssthresh = self.window;
-        self.recovery_until = Some(now);
+        self.recovery_start = Some(now);
+        self.acked_since_increase = 0;
     }
 
     /// Everything sent across a whole stretch was lost, so the path is not
@@ -279,7 +300,8 @@ impl Congestion {
     pub fn on_persistent_congestion(&mut self) {
         self.window = MIN_WINDOW;
         self.ssthresh = usize::MAX;
-        self.recovery_until = None;
+        self.recovery_start = None;
+        self.acked_since_increase = 0;
     }
 
     pub fn can_send(&self, in_flight: usize) -> bool {
@@ -322,6 +344,48 @@ pub fn pto_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window must not grow again on an acknowledgement for something
+    /// that was already in flight when the loss happened. The guard used to
+    /// compare the time the acknowledgement arrived, which is always after
+    /// the recovery began, so it never held and the halving was undone by the
+    /// next packet to come back.
+    #[test]
+    fn an_ack_from_before_a_loss_does_not_reopen_the_window() {
+        let t0 = Instant::now();
+        let mut c = Congestion::default();
+        let full = c.window;
+        c.on_loss(t0, t0 + Duration::from_millis(1));
+        let halved = c.window;
+        assert!(halved < full, "a loss halves the window");
+
+        // A whole window's worth, which is what congestion avoidance asks
+        // for before it adds a packet
+        c.on_ack(halved, t0);
+        assert_eq!(c.window, halved, "sent before the loss: still in recovery");
+
+        c.on_ack(halved, t0 + Duration::from_millis(2));
+        assert_eq!(c.window, halved + 1200, "sent after it: recovery is over");
+    }
+
+    /// Congestion avoidance adds a packet per window of data. Worked out per
+    /// acknowledgement that is a division by a window of megabytes, which
+    /// rounds one packet's worth to nothing: the window could only grow when
+    /// a single acknowledgement covered a whole window, so after a halving it
+    /// never grew at all.
+    #[test]
+    fn a_wide_window_grows_from_ordinary_acknowledgements() {
+        let t0 = Instant::now();
+        let mut c = Congestion::default();
+        c.on_loss(t0, t0);
+        let halved = c.window;
+        let after = t0 + Duration::from_millis(1);
+        // A window's worth, one ordinary packet at a time
+        for _ in 0..halved.div_ceil(1200) {
+            c.on_ack(1200, after);
+        }
+        assert_eq!(c.window, halved + 1200, "one packet per window of data");
+    }
 
     fn sent(number: u64, at: Instant, ack_eliciting: bool) -> SentPacket {
         SentPacket {
