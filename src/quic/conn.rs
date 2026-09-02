@@ -1369,6 +1369,18 @@ impl Connection {
         Ok(0)
     }
 
+    /// Say a stream has data, unless the last event said the same
+    ///
+    /// A response usually arrives as two STREAM frames back to back, and the
+    /// reader takes everything ready in one go, so the second event would
+    /// only make the caller look at an empty stream.
+    fn push_readable(&mut self, id: u64) {
+        if matches!(self.events.back(), Some(Event::Readable(prev)) if *prev == id) {
+            return;
+        }
+        self.events.push_back(Event::Readable(id));
+    }
+
     /// Forget a stream that the worker is done with, releasing its slot
     pub fn retire(&mut self, id: u64) {
         // One pass of the loop retires everything that finished and then
@@ -1405,7 +1417,7 @@ impl Connection {
                 pair.finished = true;
             }
             if readable {
-                self.events.push_back(Event::Readable(id));
+                self.push_readable(id);
             }
             if done {
                 self.events.push_back(Event::Finished { id, reset: false });
@@ -1434,7 +1446,7 @@ impl Connection {
             };
             let new = self.peer_uni[pos].1.push(offset, data, fin)?;
             if self.peer_uni[pos].1.has_data() {
-                self.events.push_back(Event::Readable(id));
+                self.push_readable(id);
             }
             new
         };

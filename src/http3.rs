@@ -550,8 +550,9 @@ fn drive(
             }
         }
 
-        readable.sort_unstable();
-        readable.dedup();
+        // Not deduplicated: the connection already drops the repeat that
+        // back-to-back frames would cause, and reading a stream that has
+        // nothing ready costs less than sorting the list would.
         for &id in &readable {
             if let Some(inflight) = conn.streams.get_mut(id) {
                 let reader = &mut inflight.reader;
