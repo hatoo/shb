@@ -194,28 +194,6 @@ impl<'a> Iter<'a> {
                     range_count,
                 }
             }
-            RESET_STREAM => Frame::ResetStream {
-                id: self.varint()?,
-                error: self.varint()?,
-                final_size: self.varint()?,
-            },
-            STOP_SENDING => Frame::StopSending {
-                id: self.varint()?,
-                error: self.varint()?,
-            },
-            CRYPTO => {
-                let offset = self.varint()?;
-                let len = self.varint()? as usize;
-                Frame::Crypto {
-                    offset,
-                    data: self.take(len)?,
-                }
-            }
-            NEW_TOKEN => {
-                let len = self.varint()? as usize;
-                self.take(len)?;
-                Frame::NewToken
-            }
             STREAM_BASE..=STREAM_MAX => {
                 let id = self.varint()?;
                 let offset = if kind & STREAM_OFF != 0 {
@@ -238,12 +216,48 @@ impl<'a> Iter<'a> {
                 }
             }
             MAX_DATA => Frame::MaxData(self.varint()?),
-            MAX_STREAM_DATA => Frame::MaxStreamData {
-                id: self.varint()?,
-                limit: self.varint()?,
-            },
             MAX_STREAMS_BIDI | MAX_STREAMS_UNI => Frame::MaxStreams {
                 uni: kind == MAX_STREAMS_UNI,
+                limit: self.varint()?,
+            },
+            _ => self.rare_frame(kind)?,
+        })
+    }
+
+    /// Parse the frames a steady run does not carry
+    ///
+    /// The handshake, path validation, connection ids, teardown and the
+    /// blocked signals all land here. Kept out of line because the parser is
+    /// one of the largest functions on the hot path, and the arms a run never
+    /// takes still push the ones it does out of the instruction cache.
+    #[cold]
+    #[inline(never)]
+    fn rare_frame(&mut self, kind: u64) -> Result<Frame<'a>> {
+        Ok(match kind {
+            RESET_STREAM => Frame::ResetStream {
+                id: self.varint()?,
+                error: self.varint()?,
+                final_size: self.varint()?,
+            },
+            STOP_SENDING => Frame::StopSending {
+                id: self.varint()?,
+                error: self.varint()?,
+            },
+            CRYPTO => {
+                let offset = self.varint()?;
+                let len = self.varint()? as usize;
+                Frame::Crypto {
+                    offset,
+                    data: self.take(len)?,
+                }
+            }
+            NEW_TOKEN => {
+                let len = self.varint()? as usize;
+                self.take(len)?;
+                Frame::NewToken
+            }
+            MAX_STREAM_DATA => Frame::MaxStreamData {
+                id: self.varint()?,
                 limit: self.varint()?,
             },
             DATA_BLOCKED => Frame::DataBlocked(self.varint()?),

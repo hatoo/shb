@@ -985,12 +985,7 @@ impl Connection {
                 ..
             } => self.on_ack(space, largest, delay, first_range, ranges, now)?,
             Frame::Crypto { offset, data } => self.on_crypto(space, offset, data)?,
-            Frame::HandshakeDone => {
-                self.handshake_done = true;
-                // RFC 9001 Section 4.9.2: the handshake keys are no longer
-                // needed and holding them only risks using them
-                self.discard_space(Space::Handshake);
-            }
+            Frame::HandshakeDone => self.on_handshake_done(),
             Frame::Stream {
                 id,
                 offset,
@@ -998,19 +993,9 @@ impl Connection {
                 data,
             } => self.on_stream(id, offset, data, fin)?,
             Frame::ResetStream { id, final_size, .. } => self.on_reset(id, final_size)?,
-            Frame::StopSending { id, .. } => {
-                if let Some(pair) = self.stream_mut(id) {
-                    pair.send.reset();
-                }
-            }
+            Frame::StopSending { id, .. } => self.on_stop_sending(id),
             Frame::MaxData(limit) => self.max_data_peer = self.max_data_peer.max(limit),
-            Frame::MaxStreamData { id, limit } => {
-                if let Some(pair) = self.stream_mut(id) {
-                    pair.send.set_limit(limit);
-                }
-                // A raised limit can unblock bytes that would not fit before
-                self.queue_send(id);
-            }
+            Frame::MaxStreamData { id, limit } => self.on_max_stream_data(id, limit),
             Frame::MaxStreams { uni, limit } => {
                 if !uni {
                     self.max_streams_bidi = self.max_streams_bidi.max(limit);
@@ -1020,34 +1005,76 @@ impl Connection {
             | Frame::StreamDataBlocked { .. }
             | Frame::StreamsBlocked { .. } => {}
             Frame::NewConnectionId { .. } | Frame::RetireConnectionId(_) => {}
-            Frame::PathChallenge(data) => {
-                // Answered on the next packet. A client that never migrates
-                // has one path, so there is nothing to validate beyond
-                // echoing the bytes back.
-                self.path_response = Some(<[u8; 8]>::try_from(data)?);
-                self.needs_send = true;
-            }
+            Frame::PathChallenge(data) => self.on_path_challenge(data)?,
             Frame::PathResponse(_) => {}
-            Frame::Close { error, reason, app } => {
-                let reason = String::from_utf8_lossy(reason).into_owned();
-                self.lose(&format!(
-                    "the peer closed the connection: {}{error:#x}{}",
-                    if app {
-                        "application error "
-                    } else {
-                        "transport error "
-                    },
-                    if reason.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({reason})")
-                    }
-                ));
-            }
+            Frame::Close { error, reason, app } => self.on_close(error, reason, app),
         }
         Ok(())
     }
 
+    // The frames below arrive once per connection at most, or never against a
+    // peer that behaves. Each is kept out of line so that handling a datagram,
+    // the largest function on the hot path, does not carry their code through
+    // the instruction cache on every packet.
+
+    #[cold]
+    #[inline(never)]
+    fn on_handshake_done(&mut self) {
+        self.handshake_done = true;
+        // RFC 9001 Section 4.9.2: the handshake keys are no longer needed and
+        // holding them only risks using them
+        self.discard_space(Space::Handshake);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_stop_sending(&mut self, id: u64) {
+        if let Some(pair) = self.stream_mut(id) {
+            pair.send.reset();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_max_stream_data(&mut self, id: u64, limit: u64) {
+        if let Some(pair) = self.stream_mut(id) {
+            pair.send.set_limit(limit);
+        }
+        // A raised limit can unblock bytes that would not fit before
+        self.queue_send(id);
+    }
+
+    /// Answered on the next packet. A client that never migrates has one path,
+    /// so there is nothing to validate beyond echoing the bytes back.
+    #[cold]
+    #[inline(never)]
+    fn on_path_challenge(&mut self, data: &[u8]) -> Result<()> {
+        self.path_response = Some(<[u8; 8]>::try_from(data)?);
+        self.needs_send = true;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_close(&mut self, error: u64, reason: &[u8], app: bool) {
+        let reason = String::from_utf8_lossy(reason).into_owned();
+        self.lose(&format!(
+            "the peer closed the connection: {}{error:#x}{}",
+            if app {
+                "application error "
+            } else {
+                "transport error "
+            },
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            }
+        ));
+    }
+
+    #[cold]
+    #[inline(never)]
     fn on_crypto(&mut self, space: Space, offset: u64, data: &[u8]) -> Result<()> {
         // rustls needs the handshake in order and rejects anything else as a
         // corrupt message, so the pieces are reassembled first. A certificate
@@ -1458,6 +1485,8 @@ impl Connection {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
     fn on_reset(&mut self, id: u64, final_size: u64) -> Result<()> {
         if let Some(i) = self.stream_index(id) {
             if let Some(pair) = self.streams[i].as_mut() {
