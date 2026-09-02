@@ -17,6 +17,7 @@ mod quic;
 mod report;
 mod shutdown;
 mod stats;
+mod status;
 mod target;
 mod tls;
 mod uring;

@@ -157,70 +157,6 @@ fn read_str<'a>(buf: &'a [u8], pos: &mut usize) -> Result<(&'a [u8], bool)> {
     Ok((s, huffman))
 }
 
-/// Decode a three-digit status value
-///
-/// Only the ten digit symbols can appear here, and all of them are 5 to 7 bits
-/// long, so the Huffman case needs a handful of codes rather than the whole
-/// 256-entry table (RFC 7541 Appendix B).
-fn status_value(s: &[u8], huffman: bool) -> Result<u16> {
-    if !huffman {
-        if s.len() != 3 || !s.iter().all(|c| c.is_ascii_digit()) {
-            bail!("malformed :status");
-        }
-        return Ok((s[0] - b'0') as u16 * 100 + (s[1] - b'0') as u16 * 10 + (s[2] - b'0') as u16);
-    }
-    let mut bits: u32 = 0;
-    let mut nbits: u32 = 0;
-    let mut digits = [0u8; 3];
-    let mut n = 0;
-    for &byte in s {
-        bits = (bits << 8) | byte as u32;
-        nbits += 8;
-        // Decode while the accumulated bits are enough to identify a symbol.
-        // Stopping early is normal: the tail is the all-ones padding, which
-        // matches no digit.
-        while n < 3 {
-            let Some((digit, used)) = huffman_digit(bits, nbits) else {
-                break;
-            };
-            digits[n] = digit;
-            n += 1;
-            nbits -= used;
-            bits &= (1u32 << nbits) - 1;
-        }
-    }
-    if n != 3 {
-        bail!("malformed :status");
-    }
-    Ok(
-        (digits[0] - b'0') as u16 * 100
-            + (digits[1] - b'0') as u16 * 10
-            + (digits[2] - b'0') as u16,
-    )
-}
-
-/// Match the next Huffman code against the ten digit symbols
-///
-/// Returns None when the accumulated bits do not (yet) spell a digit, which
-/// means either more input is needed or the padding has been reached.
-fn huffman_digit(bits: u32, nbits: u32) -> Option<(u8, u32)> {
-    if nbits >= 5 {
-        // '0' 00000, '1' 00001, '2' 00010
-        let top5 = (bits >> (nbits - 5)) & 0x1f;
-        if top5 <= 0b00010 {
-            return Some((b'0' + top5 as u8, 5));
-        }
-    }
-    if nbits >= 6 {
-        // '3' through '9' are 011001 through 011111
-        let top6 = (bits >> (nbits - 6)) & 0x3f;
-        if (0b011001..=0b011111).contains(&top6) {
-            return Some((b'3' + (top6 - 0b011001) as u8, 6));
-        }
-    }
-    None
-}
-
 /// Find `:status` in a response header block
 ///
 /// Every other field is measured and stepped over; none of their names or
@@ -271,7 +207,7 @@ pub fn find_status(block: &[u8]) -> Result<Option<u16>> {
         };
         let (value, huffman) = read_str(block, &mut pos)?;
         if named_status {
-            return status_value(value, huffman).map(Some);
+            return crate::status::status_value(value, huffman).map(Some);
         }
     }
     Ok(None)
