@@ -737,7 +737,6 @@ mod tests {
         assert!(c.start_stream(&[0x82], b"").is_none(), "limit applies");
     }
 
-    #[test]
     /// The id field is 31 bits with the top one reserved, so past the last id
     /// the reserved bit would go on the wire and the peer would see a stream
     /// it cannot have. A connection that has run out has to be replaced, so it
