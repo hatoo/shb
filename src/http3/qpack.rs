@@ -265,6 +265,18 @@ fn is_status_index(index: u64) -> bool {
 /// trailer section looks like (RFC 9114 Section 4.1); it is the caller's job
 /// to tell that apart from a response.
 pub fn find_status(section: &[u8]) -> Result<Option<u16>> {
+    // Nearly every response looks the same: an all-zero prefix, then :status
+    // as an indexed static field line. Reading it straight off skips three
+    // integer decodes on the one header field that gets read every request.
+    if let [0, 0, first, ..] = section
+        && first & 0xc0 == 0xc0
+        // 0x3f in the prefix means the index continues into the next byte
+        && first & 0x3f != 0x3f
+        && let Some(status) = status_for_index((first & 0x3f) as u64)
+    {
+        return Ok(Some(status));
+    }
+
     let mut pos = 0;
     // Field section prefix. The peer was told not to insert, so the required
     // insert count must be zero and the base cannot be anything else.

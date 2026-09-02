@@ -5,6 +5,7 @@
 //! why it lives here rather than beside either of them.
 
 /// Append a variable-length integer
+#[inline]
 pub fn put_varint(out: &mut Vec<u8>, value: u64) {
     match value {
         0..=0x3f => out.push(value as u8),

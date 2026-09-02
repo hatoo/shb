@@ -133,6 +133,14 @@ impl<'a> Iter<'a> {
     }
 
     fn varint(&mut self) -> Result<u64> {
+        // Frame types, small stream ids and ack ranges nearly all fit the
+        // one-byte form, and that one is cheap enough to read here.
+        if let Some(&b) = self.buf.get(self.pos)
+            && b < 0x40
+        {
+            self.pos += 1;
+            return Ok(b as u64);
+        }
         let Some((v, n)) = get_varint(&self.buf[self.pos..]) else {
             bail!("truncated varint in frame");
         };
