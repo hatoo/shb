@@ -265,6 +265,27 @@ before any of the clients did, which flattered every number and reversed some
 of these results. Picking a server with headroom is what made the comparison
 mean anything.
 
+### Where the client is the ceiling
+
+Those numbers are what a run against nginx on this machine looks like, and the
+machine is what runs out rather than any of the clients: the HTTP/1.1 row has
+28 of its 32 hardware threads busy, and on the multiplexed rows nginx takes
+2.8 to 3.9 times the CPU shb does. Three clients contending for what is left
+compress into each other. Give each of them one thread, where a client's own
+CPU is the ceiling and nginx has the rest of the machine spare, and they spread
+back out.
+
+| Protocol | Config | shb | [wrk] | [h2load] |
+| --- | --- | ---: | ---: | ---: |
+| HTTP/1.1 | 64 connections | **42,360** | 31,988 | 30,524 |
+| HTTP/2 (h2c) | 4 conns × 32 streams | **340,990** | — | 236,198 |
+| HTTP/3 | 4 conns × 32 streams | **667,649** | — | 235,885 |
+
+Same nginx, same 10 s runs, median of 5. That is 32 % over wrk and 39 % over
+h2load on HTTP/1.1, 44 % over h2load on HTTP/2 and 183 % on HTTP/3 - about
+twice the margins above. Read the two together: the first table is what a run
+gets you, the second is what the client costs to get it.
+
 <details>
 <summary>Environment and caveats</summary>
 
