@@ -207,7 +207,22 @@ fn build_ring_inner(entries: u32) -> Result<IoUring> {
             // Fallback for older kernels
             IoUring::new(entries)
         })
-        .context("failed to create io_uring")
+        .map_err(|e| {
+            // A container is the usual reason: Docker's default seccomp
+            // profile denies io_uring_setup, and EPERM is the only thing the
+            // kernel gets to say about it. Worth naming, because the fix is
+            // not something anyone guesses.
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                anyhow::anyhow!(
+                    "failed to create io_uring: {e}\n\
+                     In a container this is usually the seccomp profile \
+                     denying io_uring_setup; run with \
+                     --security-opt seccomp=unconfined"
+                )
+            } else {
+                anyhow::Error::new(e).context("failed to create io_uring")
+            }
+        })
 }
 
 /// Build the ring a worker runs on

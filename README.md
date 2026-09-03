@@ -79,6 +79,20 @@ The [releases](https://github.com/hatoo/shb/releases) also carry prebuilt
 one binary runs whatever glibc the machine has rather than refusing to start on
 anything older than the build machine's.
 
+
+Or as a container image, which is that same static binary on `scratch` and
+nothing else:
+
+```console
+$ docker run --rm --security-opt seccomp=unconfined \
+    ghcr.io/hatoo/shb -z 10s -c 100 http://host.docker.internal:8080/
+```
+
+`--security-opt seccomp=unconfined` is not optional. Docker's default seccomp
+profile denies `io_uring_setup`, which is the first thing shb does, and the
+kernel's only way of saying so is `EPERM`; shb prints what to do about it and
+stops.
+
 Every build, released or not, replaces the system allocator with
 [mimalloc](https://github.com/microsoft/mimalloc). That is what makes a musl
 build worth having: musl's own allocator costs HTTP/2 31 % more userspace CPU
