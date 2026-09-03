@@ -6,44 +6,53 @@
 //! HTTP/2 worker's userspace at 128 streams a connection, and grew with the
 //! parallelism the run asked for.
 
-use std::collections::VecDeque;
-
-pub struct Ring<T> {
-    slots: VecDeque<Option<T>>,
-    /// Stream number of `slots[0]`
+/// `SHIFT` is the gap between consecutive ids, as a power of two, and `OFFSET`
+/// is what ours leave in the bits below it. Both belong to the protocol rather
+/// than to the run, so they are constants: the mask and the shift below fold
+/// into immediates, and what is left of a lookup is an `and` and a subtract.
+pub struct Ring<T, const SHIFT: u32, const OFFSET: u64> {
+    /// In stream order, oldest first. A `VecDeque` is the obvious shape for
+    /// this and was what it used to be, but wrapping a logical index onto a
+    /// ring buffer cost more than everything else the lookup does: a plain
+    /// vector with a moving front indexes by adding.
+    slots: Vec<Option<T>>,
+    /// Where the oldest request still in flight sits in `slots`. Everything
+    /// below it has finished, and `slots[head]` is never a hole.
+    head: usize,
+    /// Stream number of `slots[head]`
     base: u64,
     /// How many slots hold a request
     open: usize,
-    /// The gap between the ids we are handed, as a shift: HTTP/3 client
-    /// bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1) and HTTP/2
-    /// client streams are 1, 3, 5 (RFC 9113 Section 5.1.1). Held as a shift
-    /// rather than a divisor because it is read on every event, and a
-    /// division there is worth more than the whole lookup.
-    shift: u32,
-    /// What ours leave in the bits below the shift. An id that does not match
-    /// has no slot: it belongs to the peer or to the connection, and shifting
-    /// it would land it on a request of ours.
-    offset: u64,
+    /// The `head` at which the retired prefix has grown enough to be worth
+    /// moving the rest down over it
+    compact_at: usize,
 }
 
-impl<T> Ring<T> {
-    /// `stride` is the gap between consecutive ids and has to be a power of
-    /// two, which both protocols' numbering gives.
-    pub fn new(stride: u64, offset: u64) -> Self {
-        debug_assert!(stride.is_power_of_two());
-        debug_assert!(offset < stride);
+/// Never move fewer than this many slots at a time, so a connection carrying
+/// one request at a time does not memmove on every one of them.
+const COMPACT_FLOOR: usize = 64;
+
+/// HTTP/2 client streams are 1, 3, 5 (RFC 9113 Section 5.1.1)
+pub type H2Ring<T> = Ring<T, 1, 1>;
+
+/// HTTP/3 client bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1)
+pub type H3Ring<T> = Ring<T, 2, 0>;
+
+impl<T, const SHIFT: u32, const OFFSET: u64> Ring<T, SHIFT, OFFSET> {
+    /// An id that leaves anything but `OFFSET` below the shift has no slot: it
+    /// belongs to the peer or to the connection, and shifting it would land it
+    /// on a request of ours.
+    const MASK: u64 = (1 << SHIFT) - 1;
+
+    pub fn new() -> Self {
+        debug_assert!(OFFSET <= Self::MASK);
         Self {
-            slots: VecDeque::new(),
+            slots: Vec::new(),
+            head: 0,
             base: 0,
             open: 0,
-            shift: stride.trailing_zeros(),
-            offset,
+            compact_at: COMPACT_FLOOR,
         }
-    }
-
-    #[inline]
-    fn mask(&self) -> u64 {
-        (1 << self.shift) - 1
     }
 
     /// How many requests are in flight
@@ -59,33 +68,39 @@ impl<T> Ring<T> {
 
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.head = 0;
         self.base = 0;
         self.open = 0;
+        self.compact_at = COMPACT_FLOOR;
     }
 
     pub fn push(&mut self, stream_id: u64, item: T) {
-        let n = stream_id >> self.shift;
+        let n = stream_id >> SHIFT;
         if self.slots.is_empty() {
             self.base = n;
         }
         debug_assert_eq!(
             n,
-            self.base + self.slots.len() as u64,
+            self.base + self.live() as u64,
             "streams are opened in order, so they land in order"
         );
-        self.slots.push_back(Some(item));
+        self.slots.push(Some(item));
         self.open += 1;
+    }
+
+    /// Slots from the front onwards, holes included
+    #[inline(always)]
+    fn live(&self) -> usize {
+        self.slots.len() - self.head
     }
 
     #[inline(always)]
     fn index(&self, stream_id: u64) -> Option<usize> {
-        if stream_id & self.mask() != self.offset {
+        if stream_id & Self::MASK != OFFSET {
             return None;
         }
-        (stream_id >> self.shift)
-            .checked_sub(self.base)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.slots.len())
+        let i = (stream_id >> SHIFT).checked_sub(self.base)?;
+        (i < self.live() as u64).then(|| self.head + i as usize)
     }
 
     #[inline(always)]
@@ -104,50 +119,82 @@ impl<T> Ring<T> {
         // first to go. Requests finish in order almost always, which makes
         // that one pop the whole of it; the loop is for the times they do
         // not, and stays out of line so the rest of this inlines.
-        if i == 0 {
-            self.slots.pop_front();
+        if i == self.head {
+            self.head += 1;
             self.base += 1;
-            if matches!(self.slots.front(), Some(None)) {
-                self.trim();
+            // `None` here is the ring having drained, `Some(None)` a request
+            // that finished ahead of this one; both are for `settle` to sort
+            // out, and neither is the common case.
+            if matches!(self.slots.get(self.head), None | Some(None)) {
+                self.settle();
+            } else if self.head >= self.compact_at {
+                self.compact();
             }
         }
         Some(taken)
     }
 
-    /// Drop the rest of the holes at the front, so the ring does not grow for
-    /// the life of the run. A request that never ends pins them all; the run's
-    /// timeout is what bounds that.
+    /// Step the front over the holes left by requests that finished early, and
+    /// then decide what to do with the retired prefix.
     #[cold]
-    fn trim(&mut self) {
-        while matches!(self.slots.front(), Some(None)) {
-            self.slots.pop_front();
+    fn settle(&mut self) {
+        while matches!(self.slots.get(self.head), Some(None)) {
+            self.head += 1;
             self.base += 1;
+        }
+        if self.head == self.slots.len() {
+            self.slots.clear();
+            self.head = 0;
+            self.compact_at = COMPACT_FLOOR;
+        } else if self.head >= self.compact_at {
+            self.compact();
         }
     }
 
+    /// Move what is still in flight down over the slots that have finished, so
+    /// the vector does not grow for the life of the run. Waiting until as much
+    /// has retired as is in flight keeps this to one slot moved per request;
+    /// waiting four times as long moves a quarter as much and was slower,
+    /// because what it saved in copying it spent on pages. A request that never
+    /// ends pins the front and nothing here can move it; the run's timeout is
+    /// what bounds that.
+    #[cold]
+    fn compact(&mut self) {
+        self.slots.drain(..self.head);
+        self.head = 0;
+        self.compact_at = self.slots.len().max(COMPACT_FLOOR);
+    }
+
+    /// Slots the vector is holding on to, retired ones included. Only the
+    /// tests care: it is what compacting exists to bound.
+    #[cfg(test)]
+    fn footprint(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.slots.iter().flatten()
+        self.slots[self.head..].iter().flatten()
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.slots.iter_mut().flatten()
+        self.slots[self.head..].iter_mut().flatten()
     }
 
     /// How many slots there are, holes included, for a caller that walks them
     /// by position rather than by id
     #[inline]
     pub fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.live()
     }
 
     #[inline]
     pub fn slot_mut(&mut self, i: usize) -> Option<&mut T> {
-        self.slots.get_mut(i)?.as_mut()
+        self.slots.get_mut(self.head + i)?.as_mut()
     }
 
     #[inline]
     pub fn slot(&self, i: usize) -> Option<&T> {
-        self.slots.get(i)?.as_ref()
+        self.slots.get(self.head + i)?.as_ref()
     }
 }
 
@@ -156,13 +203,13 @@ mod tests {
     use super::*;
 
     /// HTTP/3: client bidirectional streams are 0, 4, 8
-    fn h3() -> Ring<u32> {
-        Ring::new(4, 0)
+    fn h3() -> H3Ring<u32> {
+        H3Ring::new()
     }
 
     /// HTTP/2: client streams are 1, 3, 5
-    fn h2() -> Ring<u32> {
-        Ring::new(2, 1)
+    fn h2() -> H2Ring<u32> {
+        H2Ring::new()
     }
 
     #[test]
@@ -222,6 +269,45 @@ mod tests {
         }
         assert_eq!(r.len(), 1);
         assert_eq!(r.slot_count(), 10);
+    }
+
+    /// One at a time, each finishing before the next starts: the ring empties
+    /// every time, and holding on to what it retired would mean a slot per
+    /// request for the length of the run.
+    #[test]
+    fn a_ring_that_empties_keeps_nothing() {
+        let mut r = h2();
+        for i in 0..10_000u64 {
+            r.push(1 + i * 2, i as u32);
+            assert_eq!(r.take(1 + i * 2), Some(i as u32));
+        }
+        assert!(r.is_empty());
+        assert_eq!(r.footprint(), 0);
+    }
+
+    /// A steady eight in flight: the front chases the back for ever, so the
+    /// retired prefix has to be reclaimed as it grows rather than only when
+    /// the ring happens to empty.
+    #[test]
+    fn a_ring_that_never_empties_still_settles() {
+        let mut r = h2();
+        let (mut next, mut oldest) = (1u64, 1u64);
+        for n in 0..8u32 {
+            r.push(next, n);
+            next += 2;
+        }
+        for n in 8..10_000u32 {
+            r.push(next, n);
+            next += 2;
+            assert!(r.take(oldest).is_some());
+            oldest += 2;
+        }
+        assert_eq!(r.len(), 8);
+        assert!(
+            r.footprint() <= COMPACT_FLOOR + 8,
+            "grew to {}",
+            r.footprint()
+        );
     }
 
     #[test]

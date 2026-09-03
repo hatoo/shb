@@ -23,7 +23,7 @@ use crate::clock::Instant;
 
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;
-use crate::inflight::Ring;
+use crate::inflight::H3Ring;
 use crate::quic::conn::{Connection, Event as QuicEvent, LocalParamsInput};
 use crate::stats::Stats;
 use crate::target::Target;
@@ -168,7 +168,7 @@ struct Conn {
     /// generation are identified via user_data and ignored
     generation: u64,
     /// In-flight requests, up to the configured parallelism
-    streams: Ring<InFlight>,
+    streams: H3Ring<InFlight>,
 }
 
 impl Conn {
@@ -188,7 +188,7 @@ impl Conn {
             sending: false,
             recv_armed: false,
             generation: 0,
-            streams: Ring::new(4, 0),
+            streams: H3Ring::new(),
         }
     }
 
@@ -228,7 +228,7 @@ impl Conn {
 /// A fresh stream has its whole window free and requests are tiny, so this
 /// normally moves nothing; it exists so a peer with a small
 /// `initial_max_stream_data` cannot lose a request.
-fn flush_unsent(quic: &mut Connection, streams: &mut Ring<InFlight>) -> Result<()> {
+fn flush_unsent(quic: &mut Connection, streams: &mut H3Ring<InFlight>) -> Result<()> {
     for inflight in streams.iter_mut().filter(|s| !s.unsent.is_empty()) {
         let n = quic.write(inflight.stream_id, &inflight.unsent);
         inflight.unsent.drain(..n);

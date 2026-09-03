@@ -6,7 +6,7 @@
 //! anything to do with the dynamic HPACK table are declined at the SETTINGS
 //! level rather than implemented.
 
-use crate::inflight::Ring;
+use crate::inflight::H2Ring;
 use anyhow::{Result, bail};
 
 use super::hpack;
@@ -89,6 +89,8 @@ struct OpenStream {
 pub struct Connection {
     /// Bytes waiting to be written to the socket
     out: Vec<u8>,
+    /// The last buffer the sender finished with, waiting to become `out` again
+    spare: Vec<u8>,
     /// A partial frame carried over from an earlier receive
     pending: Vec<u8>,
     /// Header block fragments of a HEADERS still awaiting END_HEADERS
@@ -103,7 +105,7 @@ pub struct Connection {
     /// RST_STREAM, and that arrives after the stream has already ended.
     /// Retiring by count would take the slot of whichever stream happens to be
     /// open instead, and that stream's own end would then be dropped.
-    open: Ring<OpenStream>,
+    open: H2Ring<OpenStream>,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Our remaining connection-level send credit
@@ -123,12 +125,13 @@ impl Connection {
     pub fn new() -> Self {
         Connection {
             out: Vec::with_capacity(4096),
+            spare: Vec::new(),
             pending: Vec::new(),
             header_block: Vec::new(),
             header_stream: 0,
             header_end_stream: false,
             next_id: 1,
-            open: Ring::new(2, 1),
+            open: H2Ring::new(),
             max_concurrent: ASSUMED_MAX_CONCURRENT,
             send_window: 65535,
             peer_initial_window: 65535,
@@ -183,20 +186,29 @@ impl Connection {
         let end_stream = if body.is_empty() { FLAG_END_STREAM } else { 0 };
         let max = self.peer_max_frame as usize;
 
-        // A header block longer than one frame continues in CONTINUATION, and
-        // only the last of them carries END_HEADERS
-        let mut chunks = block.chunks(max).peekable();
-        let mut first = true;
-        while let Some(chunk) = chunks.next() {
-            let last = chunks.peek().is_none();
-            let kind = if first { HEADERS } else { CONTINUATION };
-            let mut flags = if last { FLAG_END_HEADERS } else { 0 };
-            if first {
-                flags |= end_stream;
+        if block.len() <= max {
+            // What every request the run sends looks like: one HEADERS frame
+            // carrying the whole block. Growing the buffer once for the header
+            // and the block together keeps it to a single capacity check.
+            self.out.reserve(FRAME_HEADER_LEN + block.len());
+            self.frame_header(block.len(), HEADERS, FLAG_END_HEADERS | end_stream, id);
+            self.out.extend_from_slice(block);
+        } else {
+            // A header block longer than one frame continues in CONTINUATION,
+            // and only the last of them carries END_HEADERS
+            let mut chunks = block.chunks(max).peekable();
+            let mut first = true;
+            while let Some(chunk) = chunks.next() {
+                let last = chunks.peek().is_none();
+                let kind = if first { HEADERS } else { CONTINUATION };
+                let mut flags = if last { FLAG_END_HEADERS } else { 0 };
+                if first {
+                    flags |= end_stream;
+                }
+                self.frame_header(chunk.len(), kind, flags, id);
+                self.out.extend_from_slice(chunk);
+                first = false;
             }
-            self.frame_header(chunk.len(), kind, flags, id);
-            self.out.extend_from_slice(chunk);
-            first = false;
         }
 
         self.open.push(
@@ -268,7 +280,23 @@ impl Connection {
         if self.out.is_empty() {
             None
         } else {
-            Some(std::mem::take(&mut self.out))
+            // Leave whatever came back from the last send in its place, so the
+            // requests written between now and the next flush go into a buffer
+            // that is already the size they need
+            Some(std::mem::replace(
+                &mut self.out,
+                std::mem::take(&mut self.spare),
+            ))
+        }
+    }
+
+    /// Take back a buffer that has finished sending. Handing it to the sender
+    /// left `out` empty, and allocating that back per flush was the largest
+    /// single allocation the run made.
+    pub fn recycle(&mut self, mut buf: Vec<u8>) {
+        if buf.capacity() > self.spare.capacity() {
+            buf.clear();
+            self.spare = buf;
         }
     }
 
@@ -281,10 +309,13 @@ impl Connection {
     }
 
     fn frame_header(&mut self, len: usize, kind: u8, flags: u8, stream: u32) {
-        let len = len as u32;
-        self.out
-            .extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags]);
-        self.out.extend_from_slice(&stream.to_be_bytes());
+        let len = (len as u32).to_be_bytes();
+        let stream = stream.to_be_bytes();
+        // One append rather than two: the header is nine bytes and splitting it
+        // buys a second capacity check and a second copy for no reason
+        self.out.extend_from_slice(&[
+            len[1], len[2], len[3], kind, flags, stream[0], stream[1], stream[2], stream[3],
+        ]);
     }
 
     fn window_update(&mut self, stream: u32, increment: u32) {
@@ -322,8 +353,11 @@ impl Connection {
         let mut pos = 0;
         while buf.len() - pos >= FRAME_HEADER_LEN {
             let h = &buf[pos..pos + FRAME_HEADER_LEN];
-            let len = ((h[0] as usize) << 16) | ((h[1] as usize) << 8) | h[2] as usize;
-            let kind = h[3];
+            // The length is the top three bytes of the frame header and the
+            // type is the fourth, so one 32-bit load carries both
+            let head = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+            let len = (head >> 8) as usize;
+            let kind = head as u8;
             let flags = h[4];
             let stream = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
             let end = pos + FRAME_HEADER_LEN + len;

@@ -15,7 +15,7 @@ use crate::clock::Instant;
 use self::conn::{Connection, Event};
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;
-use crate::inflight::Ring;
+use crate::inflight::H2Ring;
 use crate::stats::Stats;
 use crate::target::Target;
 use crate::tls::{TlsSession, TlsSetup};
@@ -80,7 +80,7 @@ struct Conn {
     /// user_data and ignored
     generation: u64,
     /// In-flight requests, up to the configured parallelism
-    streams: Ring<InFlight>,
+    streams: H2Ring<InFlight>,
 }
 
 impl Conn {
@@ -97,7 +97,7 @@ impl Conn {
             recv_armed: false,
             goaway: false,
             generation: 0,
-            streams: Ring::new(2, 1),
+            streams: H2Ring::new(),
         }
     }
 
@@ -191,6 +191,7 @@ fn flush(
             // handshake messages even when h2 has nothing to say
             if let Some(buf) = h2.take_output() {
                 tls.write_plaintext(&buf)?;
+                h2.recycle(buf);
             }
             let ciphertext = tls.take_ciphertext()?;
             if !ciphertext.is_empty() {
@@ -455,6 +456,13 @@ pub fn run_worker(
                             )?;
                         } else {
                             conn.sending = false;
+                            // Without TLS the buffer just sent is h2's own, and
+                            // it goes back to be written into again
+                            if conn.tls.is_none()
+                                && let Some(h2) = conn.h2.as_mut()
+                            {
+                                h2.recycle(std::mem::take(&mut conn.out));
+                            }
                             // More output may have accumulated while sending
                             conn.needs_flush = true;
                             if !conn.recv_armed {
