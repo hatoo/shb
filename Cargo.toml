@@ -24,6 +24,7 @@ humantime = "2.4.0"
 io-uring = "0.7.14"
 libc = "0.2"
 memchr = "2.8.3"
+minstant = "0.1.7"
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 num_cpus = "1.17.0"
 # Already linked through rustls; used directly only for the fixed AES-GCM that

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use crate::clock::Instant;
 
 pub struct Stats {
     pub completed: u64,
@@ -159,7 +159,11 @@ mod tests {
     #[test]
     fn recording_a_success_tallies_the_status_and_keeps_the_latency() {
         let mut stats = Stats::default();
-        let start = Instant::now() - Duration::from_millis(5);
+        // Slept rather than backdated: `Instant` cannot name a time before the
+        // run began, and what is under test is that the latency is measured
+        // from the instant handed in.
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
         stats.record_success(200, start);
         stats.record_success(404, start);
         stats.record_success(200, start);

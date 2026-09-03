@@ -17,7 +17,9 @@ use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Instant;
 
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;

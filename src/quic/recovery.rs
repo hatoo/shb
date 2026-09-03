@@ -6,7 +6,9 @@
 //! the specification, while congestion control is deliberately plain: enough
 //! to be well behaved, not enough to be worth tuning.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Instant;
 
 use super::packet::Space;
 
@@ -517,10 +519,11 @@ mod tests {
 
     #[test]
     fn nothing_is_lost_before_the_first_acknowledgement() {
-        let now = Instant::now();
+        let sent_at = Instant::now();
         let mut s = SentPackets::default();
-        s.push(sent(0, now - Duration::from_secs(60), true));
-        let (lost, deadline) = s.detect_lost(now, Duration::from_millis(1));
+        s.push(sent(0, sent_at, true));
+        let (lost, deadline) =
+            s.detect_lost(sent_at + Duration::from_secs(60), Duration::from_millis(1));
         assert!(lost.is_empty(), "loss is only ever inferred from an ACK");
         assert!(deadline.is_none());
     }
@@ -555,7 +558,10 @@ mod tests {
 
     #[test]
     fn the_window_halves_once_per_round_trip_not_once_per_packet() {
-        let now = Instant::now();
+        // Offset so that the packet sent 1ms before `now` is still a moment
+        // this run has reached; a clock cannot be asked about the time before
+        // it started.
+        let now = Instant::now() + Duration::from_millis(1);
         let mut c = Congestion::default();
         let start = c.window;
         c.on_loss(now, now);
@@ -637,7 +643,10 @@ mod tests {
         let empty = SentPackets::default();
         let (_, first) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0).unwrap();
         let (_, second) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 1).unwrap();
-        assert_eq!(second - now, (first - now) * 2);
+        // Exactly double, up to what the clock rounds off either deadline
+        let (one, two) = (first - now, second - now);
+        let drift = two.abs_diff(one * 2);
+        assert!(drift < Duration::from_micros(1), "{one:?} then {two:?}");
     }
     #[test]
     fn persistent_congestion_puts_the_window_on_the_floor() {

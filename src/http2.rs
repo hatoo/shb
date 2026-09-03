@@ -8,7 +8,9 @@ mod hpack;
 
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Instant;
 
 use self::conn::{Connection, Event};
 use crate::budget::Budget;

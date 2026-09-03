@@ -13,6 +13,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod budget;
 mod buf_ring;
+mod clock;
 mod http1;
 mod http2;
 mod http3;
@@ -26,7 +27,9 @@ mod target;
 mod tls;
 mod uring;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

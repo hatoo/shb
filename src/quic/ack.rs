@@ -1,6 +1,6 @@
 //! What to acknowledge, and when (RFC 9000 Section 13.2)
 
-use std::time::Instant;
+use crate::clock::Instant;
 
 /// Received packet numbers, kept as ranges largest first
 ///
@@ -169,7 +169,10 @@ mod tests {
         let mut s = AckState::default();
         s.record(0, true, now);
         let later = now + std::time::Duration::from_micros(8000);
-        assert_eq!(s.delay(later, 0), 8000);
-        assert_eq!(s.delay(later, 3), 1000, "microseconds >> 3");
+        // The clock is free to round the 8000us by a tick either way. What the
+        // exponent does to whatever it reports is the thing under test.
+        let unscaled = s.delay(later, 0);
+        assert!((7999..=8001).contains(&unscaled), "{unscaled}");
+        assert_eq!(s.delay(later, 3), unscaled >> 3, "microseconds >> 3");
     }
 }
