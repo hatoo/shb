@@ -1,8 +1,12 @@
-// musl's allocator costs twice the userspace CPU per request that glibc's does,
-// and on HTTP/3 - where userspace is a large share of the work - that is 36% of
-// the throughput. Replacing it is what lets the released binaries be static
-// musl ones without giving that up. On glibc it measures as no change either
-// way, so it is on by default rather than per-target.
+// musl's allocator costs HTTP/2 31% more userspace CPU per request and 13% of
+// its throughput, and HTTP/3 10% and 2%; HTTP/1.1 does not notice, spending
+// 96% of its time in the kernel. Replacing it is what lets the released
+// binaries be static musl ones without giving that up. On glibc it measures as
+// no change either way, so it is on by default rather than per-target.
+//
+// HTTP/3 used to be the one that suffered - 36% of its throughput - and is now
+// the one that barely does, because it makes a twentieth of the allocations it
+// made then.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

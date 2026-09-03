@@ -2,10 +2,13 @@
 //! and [`qpack`])
 //!
 //! Every layer is Sans I/O: the QUIC connection turns UDP datagrams into
-//! stream data and this module turns stream data into completed requests. UDP datagrams
-//! are moved with the same io_uring machinery as the TCP workers (connected
-//! UDP socket, multishot recv = one CQE per datagram, one Send SQE per
-//! outgoing datagram).
+//! stream data and this module turns stream data into completed requests. The
+//! datagrams are moved with the same io_uring machinery as the TCP workers - a
+//! connected UDP socket and a multishot recv, which is one completion per
+//! datagram since UDP keeps message boundaries. Sending is the one place the
+//! shape differs: where the kernel has UDP GSO, one `SendMsg` carries up to 64
+//! packets of equal size and the kernel cuts them apart, and only without it
+//! does each datagram get its own `Send`.
 
 pub mod proto;
 pub mod qpack;
