@@ -4,17 +4,35 @@
 [![Crates.io](https://img.shields.io/crates/v/shb.svg)](https://crates.io/crates/shb)
 
 An HTTP load generator for Linux built on `io_uring`, speaking HTTP/1.1, HTTP/2
-and HTTP/3.
+and HTTP/3 — and faster than the tools it stands beside on all three.
 
-Protocol handling is Sans-I/O throughout, so the whole client is one
-completion-driven event loop per thread with no async runtime underneath.
-Every protocol stack is written for this one job — HTTP/1.1, HTTP/2, HTTP/3,
-QPACK, HPACK and the QUIC transport itself — see
-[How it works](#how-it-works). The only thing under them is [rustls], for TLS
-and the QUIC key schedule.
+Against nginx on one 16-core machine, sixteen threads to every tool:
+
+| Protocol | Config | shb | [wrk] | [h2load] |
+| --- | --- | ---: | ---: | ---: |
+| HTTP/1.1 | 1000 connections | **1,066,331** | 927,193 | 828,126 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,541,462** | — | 1,265,795 |
+| HTTP/3 | 32 conns × 32 streams | **2,478,132** | — | 1,322,319 |
+
+Requests a second: 15 % over wrk and 29 % over h2load on HTTP/1.1, 22 % over
+h2load on HTTP/2, and 87 % on HTTP/3. There the machine runs out before any of
+the clients do — nginx takes several times the CPU shb does, and three clients
+sharing what is left read closer together than they are. Give each of them one
+thread and the margins roughly double, to 32 %, 44 % and 183 %. Both tables,
+and what the gap between them means, are under
+[Comparison](#comparison-with-wrk-and-h2load).
+
+The speed is in the shape of it. Protocol handling is Sans-I/O throughout, so
+the whole client is one completion-driven event loop per thread with no async
+runtime underneath. Every protocol stack is written for this one
+job — HTTP/1.1, HTTP/2, HTTP/3, QPACK, HPACK and the QUIC transport itself —
+see [How it works](#how-it-works). The only thing under them is [rustls], for
+TLS and the QUIC key schedule.
 
 ## Features
 
+- **Ahead of wrk and h2load on all three protocols** — see
+  [Comparison](#comparison-with-wrk-and-h2load)
 - **HTTP/1.1, HTTP/2 and HTTP/3** from a single binary
 - **TLS** via [rustls] — `https://` for HTTP/1.1 and HTTP/2, and QUIC for HTTP/3
 - **Multiplexing** — `-p` keeps N concurrent streams per connection on HTTP/2 and HTTP/3
