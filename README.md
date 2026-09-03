@@ -81,9 +81,9 @@ anything older than the build machine's.
 
 Every build, released or not, replaces the system allocator with
 [mimalloc](https://github.com/microsoft/mimalloc). That is what makes a musl
-build worth having: musl's own allocator costs twice the userspace CPU per
-request, which is 36 % of HTTP/3 throughput and 4 % of HTTP/2's — HTTP/1.1 does
-not notice, since it spends 98 % of its time in the kernel. On glibc it
+build worth having: musl's own allocator costs HTTP/2 31 % more userspace CPU
+per request and 13 % of its throughput, and HTTP/3 10 % and 2 %. HTTP/1.1 does
+not notice, since it spends 96 % of its time in the kernel. On glibc it
 measures as no change in either direction. `cargo install shb
 --no-default-features` opts out and uses the platform's allocator.
 
@@ -114,6 +114,7 @@ and `--disable-keepalive` only applies to HTTP/1.1.
 | `-H, --header` | — | Extra header, repeatable: `-H 'Name: Value'` |
 | `-d, --data` | — | Request body; `@file` reads a file, `@-` reads stdin |
 | `--connect-timeout` | `5s` | Connection establishment timeout |
+| `--timeout` | off | Give up on a response after this long; the request counts as an error and its connection is replaced |
 | `--disable-keepalive` | off | Reconnect for every request (HTTP/1.1 only) |
 | `--http2` | off | Use HTTP/2 |
 | `--http3` | off | Use HTTP/3 (requires an `https://` URL) |
@@ -149,6 +150,8 @@ Options:
           HTTP request body. @file reads the file, @- reads stdin (like curl; carriage returns and newlines are stripped from file/stdin data)
       --connect-timeout <CONNECT_TIMEOUT>
           Connection establishment timeout (e.g. 5s, 500ms) [default: 5s]
+      --timeout <DURATION>
+          How long to wait for a response before giving up on it (e.g. 30s). The request is counted as an error and its connection is replaced. Off by default, so a run against a server that stops answering waits rather than reporting
   -t, --threads <THREADS>
           Number of worker threads [default: 16]
   -j, --json
@@ -182,22 +185,22 @@ URL:          http://127.0.0.1:3010/
 Protocol:     HTTP/1.1
 Threads:      16
 Connections:  50
-Requests:     1070162 (1070162 ok, 0 errors, of which 0 connect) in 3.047s
-Requests/sec: 351271.9
-Transfer:     recv 53.93 MB/s (172296082 bytes), sent 13.40 MB/s (42807640 bytes)
+Requests:     1210743 (1210743 ok, 0 errors, of which 0 connect) in 3.045s
+Requests/sec: 397670.6
+Transfer:     recv 61.06 MB/s (194929623 bytes), sent 15.17 MB/s (48430760 bytes)
 Status codes:
-  [200] 1070162
+  [200] 1210743
 Latency (ms):
-  min 0.016  mean 0.140  max 5.448
+  min 0.016  mean 0.124  max 4.428
 Latency distribution:
-  10% in 0.070 ms
-  25% in 0.093 ms
-  50% in 0.123 ms
-  75% in 0.162 ms
-  90% in 0.222 ms
-  95% in 0.278 ms
-  99% in 0.453 ms
-  99.9% in 0.845 ms
+  10% in 0.066 ms
+  25% in 0.089 ms
+  50% in 0.113 ms
+  75% in 0.144 ms
+  90% in 0.186 ms
+  95% in 0.223 ms
+  99% in 0.344 ms
+  99.9% in 0.643 ms
   99.99% in 1.452 ms
 ```
 
@@ -319,9 +322,11 @@ gets you, the second is what the client costs to get it.
 
 **Tools**
 
-- shb (this repo), built with `cargo build --profile dist` — the profile the
-  released binaries use (LTO, one codegen unit). It measures within about 2 %
-  of a plain `--release` build.
+- shb (this repo), built with `cargo build --profile dist` (LTO, one codegen
+  unit), which measures within about 2 % of a plain `--release` build. The
+  released binaries add profile-guided optimisation on top of that, worth
+  another 12 % of userspace CPU; the table is measured without it, so what it
+  reports is what `cargo install` gives you.
 - wrk 4.1.0 (Ubuntu package).
 - h2load from nghttp2 1.71.0-DEV, built against ngtcp2 + nghttp3 + BoringSSL —
   the distro build of h2load has no HTTP/3 support.
@@ -391,9 +396,11 @@ cheap:
   neither is looked up per operation.
 - **One `io_uring_enter` covers a batch of completions** rather than one each.
   A completion is what lets its connection issue the next request, so waiting
-  on too many stalls the pipeline; a worker holds out for a quarter of its
-  connections, capped at eight, and `min_wait_usec` caps how long the kernel
-  waits for a batch that cannot be filled.
+  on too many stalls the pipeline; on HTTP/1.1 and HTTP/3 a worker holds out
+  for a quarter of its connections, capped at eight, and on HTTP/2 — where
+  every stream shares one socket and completions arrive together — for half of
+  `-p`, capped at 32. `min_wait_usec` caps how long the kernel waits for a
+  batch that cannot be filled.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and
@@ -455,21 +462,26 @@ $ scripts/interop.sh          # or: scripts/interop.sh h3
 `scripts/docker-interop.sh` starts seventeen HTTP servers in containers —
 nginx, Caddy, HAProxy, httpd, Envoy, Varnish, Traefik, Tomcat, OpenLiteSpeed,
 Hypercorn, Node, Deno, Go, picoquic, H2O, nghttpx and Bun — and loads each
-over every protocol it speaks, 73 combinations in all, including cleartext h2c
+over every protocol it speaks, 84 combinations in all, including cleartext h2c
 and HTTP/3 against eight separate QUIC implementations: nginx's own, quic-go,
-Google's QUICHE, aioquic, picoquic, quicly, ngtcp2 and Bun's. The last three servers are built
-from source, since their projects publish no image to run; nghttpx is there as
-much for HTTP/2, being the reference implementation, as for HTTP/3. The last three servers
-are a few lines each on an official base image, and they are there because the
-suite had drifted towards C proxies sharing the same libraries: Hypercorn, Node
-and Go each implement HTTP/2 themselves. Six of them exist to reach paths a well-behaved page-sized
-response never does: a reply carrying 48 KB of headers, which is three times
-the default HTTP/2 frame size and so has to be split across CONTINUATION
-frames, and an nginx configured to take the connection away on the fifth
-request — GOAWAY on HTTP/2 and HTTP/3, `Connection: close` on HTTP/1.1. Both
-were checked to actually happen: two CONTINUATION frames arrive, and ten
-GOAWAYs for ten connections. Those are servers we start ourselves, so it runs in CI on
-every push, with 200 requests over 10 connections — enough to exercise
+Google's QUICHE, aioquic, picoquic, quicly, ngtcp2 and Bun's. Five of them
+carry an image of their own. H2O and nghttpx are compiled from source, since
+their projects publish none to run, and nghttpx earns its place as much for
+HTTP/2, being the reference implementation, as for HTTP/3. Hypercorn, Node and
+Go are a few lines each on an official base image, and they are there because
+the suite had drifted towards C proxies sharing the same libraries, while
+those three each implement HTTP/2 themselves.
+
+nginx serves three endpoints besides the 13-byte one, to reach paths a
+well-behaved page-sized response never does: a reply behind 48 KB of headers,
+three times the default HTTP/2 frame size and so split across CONTINUATION
+frames; a body larger than one receive buffer, TLS record or QUIC datagram;
+and a location that takes the connection away part way through the run —
+GOAWAY on HTTP/2 and HTTP/3, `Connection: close` on HTTP/1.1. The first and
+last were checked to actually happen rather than assumed: two CONTINUATION
+frames arrive, and ten GOAWAYs for ten connections. Those are servers we start
+ourselves, so it runs in CI on every push, with 200 requests over 10
+connections — enough to exercise
 connection reuse rather than just the first exchange, and low enough that the
 run measures protocol correctness rather than how much load each server can
 take. That distinction has teeth: aioquic is a QUIC implementation written in
@@ -477,9 +489,10 @@ Python, and 50 concurrent handshakes cost it eight seconds where nginx needs
 fifty milliseconds.
 
 Local servers only exercise what they happen to do. `scripts/interop.sh` sends
-one request to each of 82 public endpoints over all three protocols and reports
-whether the exchange completed. It runs weekly rather than on every push: it
-depends on other people's servers, and on the network. Any HTTP status counts
+one request to each of 44 public endpoints over every protocol it speaks, 82
+checks in all, and reports whether the exchange completed. It runs weekly
+rather than on every push: it depends on other people's servers, and on the
+network. Any HTTP status counts
 as a pass, since a 403 from a server that blocks unknown clients still means
 the framing, header coding and TLS all worked — with one exception, a 1xx,
 which means we stopped reading before the real response.
@@ -487,11 +500,12 @@ which means we stopped reading before the real response.
 The endpoints are chosen by implementation, not by name recognition: twenty
 sites behind the same CDN exercise one HTTP stack twenty times, and what finds
 bugs is a different stack. HTTP/3 is where that matters most — quicly, ngtcp2,
-picoquic, aioquic, quic-go, quiche, msquic, mvfst, lsquic, nginx, HAProxy,
-Caddy and Google's QUICHE are thirteen separate QUIC implementations, several
-of them run by the people who wrote the specification. HTTP/2 covers nghttp2,
-H2O, Apache httpd, Traffic Server, Jetty, Hypercorn, Proxygen, Caddy, HAProxy,
-Tengine, OpenResty and the large CDN edges, plus a gRPC endpoint for the
+picoquic, aioquic, quic-go, Cloudflare's quiche, msquic, mvfst, lsquic, XQUIC,
+nginx's own, HAProxy's own and Google's QUICHE are thirteen separate QUIC
+implementations, several of them run by the people who wrote the
+specification. HTTP/2 covers nghttp2, H2O, Apache httpd, Traffic Server,
+Jetty, Hypercorn, Proxygen, Caddy, HAProxy, Tengine, OpenResty and the large
+CDN edges, plus a gRPC endpoint for the
 trailers a plain GET never produces and an `Expect: 100-continue` request for a
 real interim response; HTTP/1.1 adds cleartext, origins whose
 ALPN offers only `http/1.1`, and one that offers no ALPN at all.
