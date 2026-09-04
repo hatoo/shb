@@ -21,15 +21,15 @@ const STATUS_ENTRIES: [(u64, u16); 14] = [
     (26, 304),
     (27, 404),
     (28, 503),
-    (61, 100),
-    (62, 204),
-    (63, 206),
-    (64, 302),
-    (65, 400),
-    (66, 403),
-    (67, 421),
-    (68, 425),
-    (69, 500),
+    (63, 100),
+    (64, 204),
+    (65, 206),
+    (66, 302),
+    (67, 400),
+    (68, 403),
+    (69, 421),
+    (70, 425),
+    (71, 500),
 ];
 
 /// Static index of `:authority` (name only)
@@ -336,8 +336,37 @@ mod tests {
         assert_eq!(find_status(&section(&[0xc0 | 27])).unwrap(), Some(404));
         // Indices above the 6-bit prefix take the continuation form
         let mut body = Vec::new();
-        indexed(&mut body, 69);
+        indexed(&mut body, 71);
         assert_eq!(find_status(&section(&body)).unwrap(), Some(500));
+    }
+
+    /// The second run of :status entries starts at 63, not 61: 61 and 62 are
+    /// x-content-type-options and x-xss-protection (RFC 9204 Appendix A).
+    /// With the run two entries early, a 204 from any server that indexes
+    /// its status read as 302 - Google's generate_204 did, over HTTP/3 only
+    #[test]
+    fn the_second_status_run_starts_at_63() {
+        for (index, status) in [
+            (63, 100),
+            (64, 204),
+            (65, 206),
+            (66, 302),
+            (67, 400),
+            (68, 403),
+        ] {
+            let mut body = Vec::new();
+            indexed(&mut body, index);
+            assert_eq!(
+                find_status(&section(&body)).unwrap(),
+                Some(status),
+                "{index}"
+            );
+        }
+        for index in [61, 62, 72] {
+            let mut body = Vec::new();
+            indexed(&mut body, index);
+            assert_eq!(find_status(&section(&body)).unwrap(), None, "{index}");
+        }
     }
 
     #[test]
