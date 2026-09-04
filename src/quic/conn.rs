@@ -466,6 +466,7 @@ impl Connection {
                     self.spaces[Space::Handshake as usize].keys = Some(keys);
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
+                    self.take_peer_params()?;
                     self.one_rtt_local = Some(keys.local);
                     self.one_rtt_remote = Some(keys.remote);
                     // RFC 9001 Section 6: either end may retire its 1-RTT keys
@@ -1393,21 +1394,36 @@ impl Connection {
         if n == 0 {
             return Ok(());
         }
-        if self.params.initial_max_data == 0
-            && let Some(raw) = self.tls.quic_transport_parameters()
-        {
-            self.params = Params::decode(raw)?;
-            self.validate_server_params()?;
-            self.max_data_peer = self.params.initial_max_data;
-            self.max_streams_bidi = self.params.initial_max_streams_bidi;
-            // The handshake connection ID's reset token travels in the
-            // transport parameters rather than in a frame (RFC 9000
-            // Section 18.2)
-            if let Some(first) = self.peer_cids.iter_mut().find(|c| c.seq == 0) {
-                first.token = self.params.stateless_reset_token;
-            }
-        }
         self.pump_tls()?;
+        Ok(())
+    }
+
+    /// Take the peer's transport parameters, once they are certainly this
+    /// connection's
+    ///
+    /// rustls hands back parameters as soon as it has any, and on a resumed
+    /// session it has the previous connection's from the ticket before the
+    /// server has said a word - they are what 0-RTT would be sent under.
+    /// Read at the first sign of them, a reconnection got the old
+    /// connection's IDs and reset token, which is what made the checks in
+    /// [`Self::validate_server_params`] fail against nginx one time in ten.
+    /// The server's Finished cannot arrive before its EncryptedExtensions,
+    /// so the 1-RTT keys are the point at which what rustls holds is what
+    /// this server sent.
+    fn take_peer_params(&mut self) -> Result<()> {
+        let Some(raw) = self.tls.quic_transport_parameters() else {
+            bail!("the server sent no transport parameters");
+        };
+        self.params = Params::decode(raw)?;
+        self.validate_server_params()?;
+        self.max_data_peer = self.params.initial_max_data;
+        self.max_streams_bidi = self.params.initial_max_streams_bidi;
+        // The handshake connection ID's reset token travels in the
+        // transport parameters rather than in a frame (RFC 9000
+        // Section 18.2)
+        if let Some(first) = self.peer_cids.iter_mut().find(|c| c.seq == 0) {
+            first.token = self.params.stateless_reset_token;
+        }
         Ok(())
     }
 
@@ -1694,23 +1710,22 @@ impl Connection {
         self.lose("the server does not speak QUIC version 1");
     }
 
-    /// Check that the server's transport parameters bear out a Retry the way
-    /// they should (RFC 9000 Section 7.3): retry_source_connection_id is
-    /// present and equal to the Retry's Source Connection ID exactly when a
-    /// Retry was followed, and absent otherwise. A mismatch means a Retry was
-    /// spoofed into or out of the exchange, so the connection is not safe.
-    ///
-    /// The section also has the client check initial_source_connection_id
-    /// against the server's Initial and original_destination_connection_id
-    /// against its own first Initial. Both are left out here: against nginx
-    /// under rapid reconnection they do not hold - the parameters that arrive
-    /// name a connection ID that is not the one this exchange used, which a
-    /// stateless-reset-free reconnect race in the datagram plumbing lets
-    /// through - and enforcing either turns that race into a connect error
-    /// against a server the whole web runs. retry_source_connection_id does
-    /// not have that problem, since no server reached here sends a Retry
-    /// except the one endpoint that is meant to.
+    /// Check that the server's transport parameters name the connection IDs
+    /// this exchange actually used (RFC 9000 Section 7.3): its own Initial's
+    /// source, our first Initial's destination, and the Retry's source
+    /// exactly when a Retry was followed. The IDs went by in cleartext, so
+    /// this is the authenticated word on whether anyone on the path swapped
+    /// one - a mismatch means the connection is not safe.
     fn validate_server_params(&self) -> Result<()> {
+        let handshake_scid = self.peer_cids.iter().find(|c| c.seq == 0).map(|c| c.cid);
+        if self.params.initial_source_connection_id != handshake_scid {
+            bail!("the server's initial_source_connection_id is not the one its Initial carried");
+        }
+        if self.params.original_destination_connection_id != Some(self.original_dcid) {
+            bail!(
+                "the server's original_destination_connection_id is not the one our Initial carried"
+            );
+        }
         if self.params.retry_source_connection_id != self.retry_scid {
             bail!("the server's retry_source_connection_id does not match the Retry");
         }
@@ -2887,10 +2902,47 @@ mod tests {
     /// RFC 9000 Section 7.3: retry_source_connection_id has to bear out the
     /// Retry - present and equal to its SCID when one was followed, absent
     /// when none was
+    /// A client whose server has answered with connection ID `scid`, and
+    /// whose transport parameters bear that and the client's first Initial
+    /// out (RFC 9000 Section 7.3)
+    fn client_with_params(scid: &[u8]) -> Connection {
+        let mut conn = client();
+        let scid = ConnectionId::new(scid).unwrap();
+        conn.peer_cids.push(PeerCid {
+            seq: 0,
+            cid: scid,
+            token: None,
+        });
+        conn.params.initial_source_connection_id = Some(scid);
+        conn.params.original_destination_connection_id = Some(conn.original_dcid);
+        conn
+    }
+
+    /// The three connection IDs the parameters have to echo are what says
+    /// nobody on the path swapped one while they went by in cleartext, so
+    /// each is checked and a missing one is as bad as a wrong one
+    #[test]
+    fn the_transport_parameters_must_name_the_connection_ids_used() {
+        let conn = client_with_params(&[7; 8]);
+        assert!(conn.validate_server_params().is_ok());
+
+        let mut conn = client_with_params(&[7; 8]);
+        conn.params.initial_source_connection_id = Some(ConnectionId::new(&[8; 8]).unwrap());
+        assert!(conn.validate_server_params().is_err(), "ISCID wrong");
+        conn.params.initial_source_connection_id = None;
+        assert!(conn.validate_server_params().is_err(), "ISCID missing");
+
+        let mut conn = client_with_params(&[7; 8]);
+        conn.params.original_destination_connection_id = Some(ConnectionId::new(&[8; 8]).unwrap());
+        assert!(conn.validate_server_params().is_err(), "ODCID wrong");
+        conn.params.original_destination_connection_id = None;
+        assert!(conn.validate_server_params().is_err(), "ODCID missing");
+    }
+
     #[test]
     fn the_retry_source_connection_id_is_checked() {
         // No Retry: the parameter must be absent, and is
-        let mut conn = client();
+        let mut conn = client_with_params(&[7; 8]);
         assert!(conn.validate_server_params().is_ok());
         conn.params.retry_source_connection_id = Some(ConnectionId::new(&[5; 8]).unwrap());
         assert!(
@@ -2899,7 +2951,7 @@ mod tests {
         );
 
         // A Retry was followed: the parameter has to be its SCID
-        let mut conn = client();
+        let mut conn = client_with_params(&[7; 8]);
         conn.retry_scid = Some(ConnectionId::new(&[9; 8]).unwrap());
         assert!(conn.validate_server_params().is_err(), "RSCID missing");
         conn.params.retry_source_connection_id = Some(ConnectionId::new(&[9; 8]).unwrap());
