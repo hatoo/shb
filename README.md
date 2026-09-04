@@ -124,6 +124,8 @@ and `--disable-keepalive` only applies to HTTP/1.1.
 | `-z, --duration` | — | Run for a duration instead (`10s`, `1m30s`) |
 | `-p, --parallel` | `1` | Concurrent streams per connection (HTTP/2 and HTTP/3) |
 | `-t, --threads` | physical cores | Worker threads, capped at `--connections` |
+| `--batch-size` | worked out | How many completions a worker holds out for; see below |
+| `--batch-linger` | `500` | Microseconds the kernel spends filling that batch; see below |
 | `-m, --method` | `GET` (`POST` with `-d`) | HTTP method |
 | `-H, --header` | — | Extra header, repeatable: `-H 'Name: Value'` |
 | `-d, --data` | — | Request body; `@file` reads a file, `@-` reads stdin |
@@ -166,6 +168,10 @@ Options:
           Connection establishment timeout (e.g. 5s, 500ms) [default: 5s]
       --timeout <DURATION>
           How long to wait for a response before giving up on it (e.g. 30s). The request is counted as an error and its connection is replaced. Off by default, so a run against a server that stops answering waits rather than reporting
+      --batch-size <COMPLETIONS>
+          How many completions a worker holds out for, or 0 to work it out [default: 0]
+      --batch-linger <MICROSECONDS>
+          How long a worker may wait collecting completions, in microseconds [default: 500]
   -t, --threads <THREADS>
           Number of worker threads [default: 16]
   -j, --json
@@ -179,7 +185,7 @@ Options:
   -p, --parallel <PARALLEL>
           Number of concurrent streams per connection (HTTP/2 and HTTP/3) [default: 1]
   -h, --help
-          Print help
+          Print help (see more with '--help')
 ```
 
 The default for `-t` is the number of physical cores on the machine running
@@ -190,6 +196,47 @@ The default for `-t` is the number of physical cores on the machine running
 > **TLS certificates are never verified.** shb is a benchmarking tool, so it
 > accepts any certificate — which is what you want against a test server with a
 > self-signed cert, and what you must not rely on anywhere else.
+
+### Batching
+
+A worker waits for several completions at a time rather than one, so that one
+`io_uring_enter` covers them all. Two things decide what that costs:
+`--batch-size` is how many it holds out for, and `--batch-linger` is how long
+the kernel spends trying to gather that many before giving up and returning
+with whatever arrived.
+
+The wait is only ever felt when the batch cannot be filled at once. That is
+what makes it invisible in most runs and decisive in some: against a server
+that is itself the bottleneck, completions trickle in and the wait fits inside
+the server's own latency, saving the wakeups it batched away for nothing.
+Against a server faster than shb can ask, it is the whole limit - a run's
+throughput becomes what it has in flight divided by the wait, and the wait
+shows up in the reported latencies as though the server had spent it.
+
+Measured at `-t 16 -c 32 -p 32` against a server costing 0.05us a request:
+
+| `--batch-linger` | requests/sec | p50 | shb CPU per request |
+| --- | ---: | ---: | ---: |
+| 500 (default) | 1,745,239 | 582us | 0.98us |
+| 50 | 6,950,725 | 141us | 1.01us |
+| 10 | 9,963,818 | 92us | 1.04us |
+
+Against nginx over that same range the throughput barely moves and shb's own
+CPU doubles, which is why the default is 500us. Lower it when the thing being
+measured is faster than the wait.
+
+How much it moves anything depends on the batch. At those settings, going from
+500us to 10us is worth 14% at a batch of 2, 5.8x at 16 and 2.4x at 32. Left to
+itself HTTP/1.1 and HTTP/3 never hold out for more than eight, and eight
+arrive together, so the wait does nothing for them at any value - which is
+what `--batch-size` is for. At 32 workers with one HTTP/3 connection each,
+holding out for 16 completions reaches 6.7M requests a second with a 10us
+wait, against 6.4M for the derived batch of 1.
+
+The same example is the warning. That batch of 16 with the **default** wait
+manages 1.7M: a batch raised without shortening the wait is the slowest thing
+either flag can do, because every pass now waits the full 500us for a batch
+nothing is going to fill. Raise them together or not at all.
 
 ## Output
 
@@ -413,40 +460,8 @@ cheap:
   on too many stalls the pipeline; on HTTP/1.1 and HTTP/3 a worker holds out
   for a quarter of its connections, capped at eight, and on HTTP/2 — where
   every stream shares one socket and completions arrive together — for half of
-  `-p`, capped at 32. `min_wait_usec` sets how long the kernel spends
-  collecting one - which is a floor rather than a deadline, so it is also what
-  bounds a run's throughput: what a run has in flight, divided by the wait.
-
-  The default 500us suits a server that is itself the bottleneck, where the
-  wait fits inside the server's own latency and costs nothing while saving the
-  wakeups it batched away. Against a server that answers faster than shb can
-  ask it is the whole limit. Measured against one costing 0.05us a request, at
-  `-t 16 -c 32 -p 32`:
-
-  | `--batch-linger` | requests/sec | p50 | shb CPU per request |
-  |---|---|---|---|
-  | 500 (default) | 1,745,239 | 582us | 0.98us |
-  | 50 | 6,950,725 | 141us | 1.01us |
-  | 10 | 9,963,818 | 92us | 1.04us |
-
-  Against nginx over the same range the throughput barely moves and shb's own
-  CPU doubles, which is why the default is what it is. Lower it when the thing
-  being measured is faster than a wait: it buys throughput, and it stops the
-  wait from showing up in the latencies as though the server had spent it.
-
-  It is only felt where the batch cannot be filled at once, which is decided
-  by how many completions a worker holds out for - `--batch-size`, worked out
-  from the run unless it is given - rather than by the protocol.
-  At 32 connections over 16 workers against that same server, going from 500us
-  to 10us moves throughput 14% at a batch of 2, 5.8x at 16 and 2.4x at 32.
-  Left to itself, HTTP/1.1 and HTTP/3 never hold out for more than eight, and
-  eight arrive together, so the wait does nothing there - measured across four
-  HTTP/3 configurations it moves nothing, and it still moves nothing with the
-  QUIC timers taken out of the wait. `--batch-size` is what reaches it: at 32
-  workers with one HTTP/3 connection each, holding out for 16 with the default
-  wait leaves 1.7M requests a second, and the same 16 with a 10us wait reaches
-  6.7M. Which is also the warning - a batch raised without shortening the wait
-  is the slowest thing either flag can do.
+  `-p`, capped at 32. Both halves of that are settable; see
+  [Batching](#batching).
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and
