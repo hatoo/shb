@@ -193,9 +193,8 @@ fn flush(
                 tls.write_plaintext(&buf)?;
                 h2.recycle(buf);
             }
-            let ciphertext = tls.take_ciphertext()?;
-            if !ciphertext.is_empty() {
-                conn.out = ciphertext;
+            tls.take_ciphertext_into(&mut conn.out)?;
+            if !conn.out.is_empty() {
                 conn.out_off = 0;
                 conn.sending = true;
                 uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;

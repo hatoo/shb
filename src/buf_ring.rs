@@ -89,6 +89,13 @@ impl BufRing {
         &self.data[off..off + len]
     }
 
+    /// Mutably borrow a completed receive buffer before returning it to the
+    /// kernel. Useful for protocols such as QUIC which decrypt in place.
+    pub fn data_mut(&mut self, bid: u16, len: usize) -> &mut [u8] {
+        let off = bid as usize * RECV_BUF_SIZE;
+        &mut self.data[off..off + len]
+    }
+
     /// Return a processed buffer to the ring
     pub fn recycle(&mut self, bid: u16) {
         self.push_entry(bid);

@@ -61,6 +61,17 @@ impl Conn {
         }
     }
 
+    /// The bytes this connection is sending, wherever they live: ciphertext
+    /// it built for itself, or the request, which every connection on the run
+    /// shares and none of them writes to. `out_off` is how far into it the
+    /// socket has got, and is the only part of that which is per-connection.
+    fn outbound<'a>(&'a self, request: &'a [u8]) -> &'a [u8] {
+        match self.tls {
+            Some(_) => &self.out,
+            None => request,
+        }
+    }
+
     fn close(&mut self) {
         if self.fd >= 0 {
             // Close by turning the fd back into a TcpStream and dropping it
@@ -88,10 +99,8 @@ fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
     match &mut conn.tls {
         Some(tls) => tls.write_plaintext(request),
         None => {
-            // The previous request was fully sent before its response could
-            // complete, so `out` is drained by now
-            conn.out.clear();
-            conn.out.extend_from_slice(request);
+            // Nothing to copy: a plaintext send reads the request where it
+            // already is, so starting one is only rewinding the offset
             conn.out_off = 0;
             Ok(())
         }
@@ -107,26 +116,27 @@ fn flush(
     sq: &mut squeue::SubmissionQueue<'_>,
     conn_idx: usize,
     conn: &mut Conn,
+    request: &[u8],
 ) -> Result<()> {
     if conn.sending {
         return Ok(());
     }
     if let Some(tls) = &mut conn.tls {
-        let ciphertext = tls.take_ciphertext()?;
-        if !ciphertext.is_empty() {
-            conn.out = ciphertext;
+        tls.take_ciphertext_into(&mut conn.out)?;
+        if !conn.out.is_empty() {
             conn.out_off = 0;
             conn.sending = true;
             uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
         }
-    } else if conn.out_off < conn.out.len() {
+    } else if conn.out_off < conn.outbound(request).len() {
         conn.sending = true;
+        let generation = conn.generation;
         uring::push_send_slice(
             submitter,
             sq,
             conn_idx,
-            conn.generation,
-            &conn.out[conn.out_off..],
+            generation,
+            &conn.outbound(request)[conn.out_off..],
         )?;
     }
     Ok(())
@@ -313,7 +323,7 @@ pub fn run_worker(
                         // deadline too, which a reconnect otherwise loses.
                         conn.begin_request(timeout);
                         queue_request(conn, &target.request_bytes)?;
-                        flush(&submitter, &mut sq, conn_idx, conn)?;
+                        flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -331,18 +341,19 @@ pub fn run_worker(
                         stats.bytes_sent += res as u64;
                         let conn = &mut conns[conn_idx];
                         conn.out_off += res as usize;
-                        if conn.out_off < conn.out.len() {
+                        if conn.out_off < conn.outbound(&target.request_bytes).len() {
+                            let generation = conn.generation;
                             uring::push_send_slice(
                                 &submitter,
                                 &mut sq,
                                 conn_idx,
-                                conn.generation,
-                                &conn.out[conn.out_off..],
+                                generation,
+                                &conn.outbound(&target.request_bytes)[conn.out_off..],
                             )?;
                         } else {
                             conn.sending = false;
                             // TLS may have produced more ciphertext meanwhile
-                            flush(&submitter, &mut sq, conn_idx, conn)?;
+                            flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                             if !conn.recv_armed {
                                 // Re-arm if the multishot ended (e.g. due to ENOBUFS)
                                 push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
@@ -415,7 +426,7 @@ pub fn run_worker(
                                 }
                                 // The TLS handshake may need to send its next
                                 // flight even though no request completed
-                                flush(&submitter, &mut sq, conn_idx, conn)?;
+                                flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                             }
                             Ok(_) => {
                                 stats.record_success(conn.parser.status(), conn.request_start);
@@ -447,7 +458,7 @@ pub fn run_worker(
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
                         queue_request(conn, &target.request_bytes)?;
-                        flush(&submitter, &mut sq, conn_idx, conn)?;
+                        flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                     } else {
                         conn.close();
                         conn.parser.reset();

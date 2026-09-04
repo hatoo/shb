@@ -190,14 +190,15 @@ impl TlsSession {
         Ok(())
     }
 
-    /// Drain pending ciphertext (handshake messages included) to send
-    pub fn take_ciphertext(&mut self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+    /// Drain pending ciphertext (handshake messages included) into a reusable
+    /// send buffer.
+    pub fn take_ciphertext_into(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
         loop {
             self.push_plaintext()?;
             let before = out.len();
             while self.conn.wants_write() {
-                self.conn.write_tls(&mut out).context("write_tls failed")?;
+                self.conn.write_tls(&mut *out).context("write_tls failed")?;
             }
             // Encrypting frees room, so a backlog may fit now; stop when a
             // round makes no ciphertext, or there is nothing left to place
@@ -205,6 +206,17 @@ impl TlsSession {
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// Drain pending ciphertext into a newly owned send buffer.
+    ///
+    /// Kept for paths which need to return ownership of the bytes. Hot send
+    /// paths should prefer [`Self::take_ciphertext_into`] so capacity survives
+    /// from one request to the next.
+    pub fn take_ciphertext(&mut self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.take_ciphertext_into(&mut out)?;
         Ok(out)
     }
 }

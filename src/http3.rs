@@ -590,9 +590,6 @@ pub fn run_worker(
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
 
     // Kick off the initial connections
-    // Decryption happens in place, so the datagram is copied out of the
-    // provided buffer ring once and reused
-    let mut datagram: Vec<u8> = Vec::with_capacity(2048);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(2048);
     let now = Instant::now();
     for (i, conn) in conns.iter_mut().enumerate() {
@@ -806,10 +803,9 @@ pub fn run_worker(
                                 // Straight into the connection: there is no
                                 // endpoint to route through, since a client
                                 // socket carries exactly one connection
-                                datagram.clear();
-                                datagram.extend_from_slice(buf_ring.data(bid, res as usize));
                                 if let Some(quic) = conn.quic.as_mut()
-                                    && let Err(e) = quic.handle_datagram(now, &mut datagram)
+                                    && let Err(e) = quic
+                                        .handle_datagram(now, buf_ring.data_mut(bid, res as usize))
                                 {
                                     if narrate() {
                                         eprintln!("[datagram] {e:#}");
