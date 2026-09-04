@@ -37,6 +37,10 @@ const FLAG_END_HEADERS: u8 = 0x4;
 const FLAG_PADDED: u8 = 0x8;
 const FLAG_PRIORITY: u8 = 0x20;
 
+/// The RST_STREAM code for a stream the peer would not take on at all
+/// (RFC 9113 Section 7); every other code is a stream that went wrong
+const REFUSED_STREAM: u32 = 0x7;
+
 // Settings identifiers
 const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
 const SETTINGS_ENABLE_PUSH: u16 = 0x2;
@@ -114,6 +118,9 @@ pub struct Connection {
     open: H2Ring<OpenStream>,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
+    /// Whether `max_concurrent` is still the assumption rather than the
+    /// peer's word: a refusal can lower the one but not the other
+    max_concurrent_assumed: bool,
     /// Our remaining connection-level send credit
     send_window: i64,
     /// The peer's SETTINGS_INITIAL_WINDOW_SIZE, the credit each new stream gets
@@ -147,6 +154,7 @@ impl Connection {
             next_id: 1,
             open: H2Ring::new(),
             max_concurrent: ASSUMED_MAX_CONCURRENT,
+            max_concurrent_assumed: true,
             send_window: 65535,
             peer_initial_window: 65535,
             peer_max_frame: DEFAULT_MAX_FRAME,
@@ -415,11 +423,7 @@ impl Connection {
                 SETTINGS => self.on_settings(flags, payload)?,
                 WINDOW_UPDATE => self.on_window_update(stream, payload)?,
                 PING => self.on_ping(flags, payload),
-                RST_STREAM => {
-                    if self.finish_stream(stream) {
-                        events.push(Event::Reset { stream_id: stream });
-                    }
-                }
+                RST_STREAM => self.on_rst_stream(stream, payload, events)?,
                 GOAWAY => self.on_goaway(payload, events)?,
                 // PRIORITY and anything unknown are ignored, as the spec allows
                 _ => {}
@@ -533,7 +537,10 @@ impl Connection {
                     self.table_size = value;
                     self.table_size_update = Some(value);
                 }
-                SETTINGS_MAX_CONCURRENT_STREAMS => self.max_concurrent = value,
+                SETTINGS_MAX_CONCURRENT_STREAMS => {
+                    self.max_concurrent = value;
+                    self.max_concurrent_assumed = false;
+                }
                 // Our only use for this is deciding whether a request body
                 // fits; responses ride on the huge window we advertise
                 SETTINGS_INITIAL_WINDOW_SIZE if value <= MAX_WINDOW => {
@@ -557,6 +564,39 @@ impl Connection {
             }
         }
         self.frame_header(0, SETTINGS, FLAG_ACK, 0);
+        Ok(())
+    }
+
+    /// REFUSED_STREAM means the peer never acted on the stream (RFC 9113
+    /// Section 8.7), so the request goes back rather than into the error
+    /// count. It also says the peer had all it would take when this stream
+    /// arrived, which matters while its SETTINGS has not said how many that
+    /// is - the first flight leaves before it has - so what is still open
+    /// below the refused stream becomes the figure to assume. Any other code
+    /// is a stream that went wrong, and stays an error.
+    fn on_rst_stream(
+        &mut self,
+        stream: u32,
+        payload: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<()> {
+        if payload.len() != 4 {
+            bail!("malformed RST_STREAM");
+        }
+        let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if code != REFUSED_STREAM {
+            if self.finish_stream(stream) {
+                events.push(Event::Reset { stream_id: stream });
+            }
+            return Ok(());
+        }
+        if self.max_concurrent_assumed {
+            let taken = self.open.iter().filter(|s| s.id < stream).count() as u32;
+            self.max_concurrent = self.max_concurrent.min(taken.max(1));
+        }
+        if self.finish_stream(stream) {
+            events.push(Event::Unprocessed { stream_id: stream });
+        }
         Ok(())
     }
 
@@ -990,6 +1030,68 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, Event::End { .. })),
             "{events:?}"
+        );
+    }
+
+    /// Node with maxConcurrentStreams: 8 refused 92 of the 100 streams in
+    /// the first flight, and every one was an error. A refusal is not an
+    /// answer: the request goes back to be sent again, and until the peer's
+    /// SETTINGS says how many streams it takes, the refusal is the best
+    /// estimate there is.
+    #[test]
+    fn a_refused_stream_is_given_back_and_lowers_the_assumption() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        for _ in 0..12 {
+            c.start_stream(&[0x82], b"").unwrap();
+        }
+        c.take_output();
+        // Streams 1 .. 15 were taken; 17 was one too many
+        c.feed(
+            &frame(RST_STREAM, 0, 17, &REFUSED_STREAM.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        assert!(
+            matches!(events[..], [Event::Unprocessed { stream_id: 17 }]),
+            "{events:?}"
+        );
+        assert_eq!(c.max_concurrent, 8, "what was open below the refusal");
+        assert!(!c.can_open(), "eleven are still open, more than eight");
+
+        // The peer's own figure replaces the estimate
+        let mut payload = SETTINGS_MAX_CONCURRENT_STREAMS.to_be_bytes().to_vec();
+        payload.extend_from_slice(&300u32.to_be_bytes());
+        c.feed(&frame(SETTINGS, 0, 0, &payload), &mut events)
+            .unwrap();
+        assert!(c.can_open());
+        // And a refusal after that leaves it alone
+        events.clear();
+        c.feed(
+            &frame(RST_STREAM, 0, 19, &REFUSED_STREAM.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(events[..], [Event::Unprocessed { stream_id: 19 }]));
+        assert_eq!(c.max_concurrent, 300);
+
+        // Any other code is a stream that went wrong
+        events.clear();
+        c.feed(&frame(RST_STREAM, 0, 21, &[0, 0, 0, 8]), &mut events)
+            .unwrap();
+        assert!(
+            matches!(events[..], [Event::Reset { stream_id: 21 }]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_rst_stream_is_malformed() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        assert!(
+            c.feed(&frame(RST_STREAM, 0, 1, &[0, 0, 7]), &mut events)
+                .is_err()
         );
     }
 

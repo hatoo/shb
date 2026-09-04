@@ -721,6 +721,11 @@ struct H2Script {
     /// above it are never answered, and the connection closes once those
     /// below it have been. That is nginx's keepalive_requests.
     streams_per_connection: Option<u32>,
+    /// Advertise this many concurrent streams and take that many of the
+    /// HEADERS in one read, refusing the rest with RST_STREAM(REFUSED_STREAM)
+    /// as a server does when a client opens more than it said it would take.
+    /// Node with maxConcurrentStreams does this to a first flight.
+    accept_per_read: Option<usize>,
 }
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -747,6 +752,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
     use std::io::{Read, Write};
     const DATA: u8 = 0x0;
     const HEADERS: u8 = 0x1;
+    const RST_STREAM: u8 = 0x3;
     const SETTINGS: u8 = 0x4;
     const PING: u8 = 0x6;
     const GOAWAY: u8 = 0x7;
@@ -755,6 +761,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
     const FLAG_END_STREAM: u8 = 0x1;
     const FLAG_END_HEADERS: u8 = 0x4;
     const NO_ERROR: u32 = 0x0;
+    const REFUSED_STREAM: u32 = 0x7;
     const COMPRESSION_ERROR: u32 = 0x9;
 
     let goaway = |last: u32, code: u32| {
@@ -770,6 +777,10 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
     let mut settings = Vec::new();
     if script.header_table_size_zero {
         settings.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    }
+    if let Some(n) = script.accept_per_read {
+        settings.extend_from_slice(&[0, 3]);
+        settings.extend_from_slice(&(n as u32).to_be_bytes());
     }
     if sock
         .write_all(&h2_frame(SETTINGS, 0, 0, &settings))
@@ -802,6 +813,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
         }
         let mut out = Vec::new();
         let mut pos = 0;
+        let mut accepted_this_read = 0;
         while pending.len() - pos >= 9 {
             let h = &pending[pos..pos + 9];
             let len = u32::from_be_bytes([0, h[0], h[1], h[2]]) as usize;
@@ -845,6 +857,19 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
                         }
                         continue;
                     }
+                    if script
+                        .accept_per_read
+                        .is_some_and(|n| accepted_this_read >= n)
+                    {
+                        out.extend_from_slice(&h2_frame(
+                            RST_STREAM,
+                            0,
+                            stream,
+                            &REFUSED_STREAM.to_be_bytes(),
+                        ));
+                        continue;
+                    }
+                    accepted_this_read += 1;
                     if flags & FLAG_END_STREAM != 0 {
                         respond(&mut out, stream);
                     } else {
@@ -971,6 +996,36 @@ fn h2_finishes_sending_bodies_after_a_goaway() {
     ]);
     let _ = std::fs::remove_file(&path);
     assert_all_ok(&report, 12, "200");
+}
+
+/// A stream refused with REFUSED_STREAM was never acted on, and RFC 9113
+/// Section 8.7 lets it be sent again; it was being counted as an error.
+/// The first flight goes out before the server's SETTINGS can say how many
+/// streams it takes, so a run at 100 streams against a server that takes 8
+/// has 92 of them refused before anything else happens - Node with
+/// maxConcurrentStreams: 8 reported 92 errors of 1000.
+#[test]
+fn h2_resends_the_streams_the_server_refused() {
+    let addr = start_scripted_h2_server(H2Script {
+        accept_per_read: Some(8),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "100",
+        "-n",
+        "1000",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_all_ok(&report, 1000, "200");
 }
 
 /// Sending unprocessed requests again has to stop somewhere, or a server
