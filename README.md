@@ -434,9 +434,14 @@ cheap:
   being measured is faster than a wait: it buys throughput, and it stops the
   wait from showing up in the latencies as though the server had spent it.
 
-  HTTP/1.1 and HTTP/2 only. HTTP/3 cuts each wait short at its nearest QUIC
-  timer, usually the pacer and microseconds away, so the setting never comes
-  into it there - measured across four configurations it moves nothing.
+  It is only felt where the batch cannot be filled at once, which is decided
+  by how many completions a worker holds out for rather than by the protocol.
+  At 32 connections over 16 workers against that same server, going from 500us
+  to 10us moves throughput 14% at a batch of 2, 5.8x at 16 and 2.4x at 32.
+  HTTP/1.1 and HTTP/3 never hold out for more than eight, and eight arrive
+  together, so the setting does nothing there - measured across four HTTP/3
+  configurations it moves nothing, and it still moves nothing with the QUIC
+  timers taken out of the wait.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and

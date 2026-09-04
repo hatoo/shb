@@ -75,9 +75,12 @@ const MAX_BATCH_MULTIPLEXED: usize = 32;
 /// Which of those a run is in is not something a worker can tell, so it is
 /// [`set_batch_linger`] and the default is the one that suits a real server.
 ///
-/// HTTP/1.1 and HTTP/2 only in practice. HTTP/3 passes a `max_wait` cut down to
-/// its nearest QUIC timer - usually the pacer, microseconds away - and that
-/// bounds this as well, so changing it moves nothing there.
+/// It only bites where the batch cannot be filled at once, so what decides
+/// whether it is felt is [`batch_size_multiplexed`] and [`batch_size`] rather
+/// than the protocol. Measured against the same fast server at 32 connections
+/// over 16 workers: at a batch of 2 the range from 500us to 10us moves
+/// throughput 14%, at 16 it moves it 5.8x, at 32 it moves it 2.4x. HTTP/1.1
+/// and HTTP/3 never hold out for more than eight, and eight arrive together.
 pub const DEFAULT_BATCH_LINGER: u32 = 500;
 
 static BATCH_LINGER: std::sync::atomic::AtomicU32 =

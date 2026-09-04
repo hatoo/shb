@@ -105,9 +105,11 @@ pub struct Args {
     /// shb can ask - it buys throughput and truer latencies for a few percent
     /// more CPU per request.
     ///
-    /// HTTP/1.1 and HTTP/2 only. HTTP/3 already cuts each wait short at its
-    /// nearest QUIC timer, which is usually the pacer and microseconds away,
-    /// so this never comes into it.
+    /// Only bites where a worker holds out for more completions than arrive at
+    /// once, which in practice is HTTP/2 at more than a few streams: HTTP/1.1
+    /// and HTTP/3 hold out for a quarter of their connections, capped at
+    /// eight, and that many arrive together, so the wait is over before this
+    /// is reached.
     #[arg(long, value_name = "MICROSECONDS", default_value_t = uring::DEFAULT_BATCH_LINGER, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..=1_000_000))]
     pub batch_linger: u32,
 
