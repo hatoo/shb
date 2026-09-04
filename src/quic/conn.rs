@@ -103,6 +103,9 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 pub const MAX_DATAGRAM: usize = 1200;
 /// The AEAD tag every packet carries
 const TAG_LEN: usize = 16;
+/// How shb scales the delay in the ACK frames it sends: the RFC 9000
+/// Section 18.2 default, since it advertises no ack_delay_exponent
+const ACK_DELAY_EXPONENT: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -732,9 +735,12 @@ impl Connection {
         // pass would fill the link with ACK-only packets and, while the
         // handshake keys are still around, pad each one to 1200 bytes.
         if self.spaces[space as usize].ack.ack_eliciting_pending && room(out) > 32 {
+            // Scaled by the exponent of whoever sends the ACK (RFC 9000
+            // Section 19.3), which here is ours: shb advertises none, so it
+            // is the default. The peer's is for reading its ACKs.
             let delay = self.spaces[space as usize]
                 .ack
-                .delay(now, self.params.ack_delay_exponent);
+                .delay(now, ACK_DELAY_EXPONENT);
             let ranges = self.spaces[space as usize].ack.ranges();
             // Ranges come largest first (RFC 9000 Section 19.3)
             let largest = ranges.first().map(|&(_, largest)| largest);
@@ -1984,6 +1990,28 @@ mod tests {
             Some(5),
             "the packet carries an ACK but does not say what it acknowledged"
         );
+    }
+
+    /// RFC 9000 Section 19.3: the delay is scaled by the exponent of the
+    /// endpoint sending the ACK. The peer's exponent used to be applied,
+    /// so a peer advertising a large one had its round-trip estimate
+    /// told the acknowledgement took a fraction of the time it did.
+    #[test]
+    fn the_ack_delay_is_scaled_by_our_own_exponent_not_the_peers() {
+        let mut conn = client();
+        conn.params.ack_delay_exponent = 10;
+        let now = Instant::now();
+        conn.spaces[Space::Data as usize].ack.record(1, true, now);
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        let later = now + Duration::from_micros(8000);
+        conn.fill_payload(Space::Data, later, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        let Some(Ok(Frame::Ack { delay, .. })) = frame::Iter::new(&out).next() else {
+            panic!("expected an ACK");
+        };
+        // 8000us >> 3, give or take the clock's rounding of the 8000
+        assert!((999..=1001).contains(&delay), "delay {delay}");
     }
 
     /// A lost packet's number is never reused, so the hole it leaves in what

@@ -69,7 +69,8 @@ impl AckState {
     }
 
     /// Microseconds since the largest packet arrived, scaled by the exponent
-    /// the peer asked for (RFC 9000 Section 19.3)
+    /// given - the ACK's sender's, which is to say our own (RFC 9000
+    /// Section 19.3)
     pub fn delay(&self, now: Instant, exponent: u32) -> u64 {
         let Some(at) = self.largest_received_at else {
             return 0;
@@ -164,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_delay_is_scaled_by_the_peers_exponent() {
+    fn the_reported_delay_is_scaled_by_the_exponent_given() {
         let now = Instant::now();
         let mut s = AckState::default();
         s.record(0, true, now);
