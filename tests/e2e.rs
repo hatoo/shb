@@ -703,6 +703,182 @@ fn h2_every_registered_method_arrives() {
     assert_every_method_arrives(&["--http2"], &url);
 }
 
+/// What a scripted HTTP/2 server does, beyond answering every request 200
+///
+/// hyper behind axum is a well-behaved peer, and the things the protocol
+/// lets a server do to a client - shrink the header table, refuse streams,
+/// go away - are the things it does not do on demand. This one does nothing
+/// but those, on a raw socket, one thread per connection.
+#[derive(Clone, Copy, Default)]
+struct H2Script {
+    /// Advertise SETTINGS_HEADER_TABLE_SIZE 0 and, once the client has
+    /// acknowledged it, tear the connection down unless the next header block
+    /// opens with the dynamic table size update RFC 7541 Section 4.2 says it
+    /// must. That is what nghttp2 does.
+    header_table_size_zero: bool,
+}
+
+fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut v = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+    v.extend_from_slice(&stream.to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+fn start_scripted_h2_server(script: H2Script) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || serve_scripted_h2(stream, script));
+        }
+    });
+    addr
+}
+
+fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
+    use std::io::{Read, Write};
+    const DATA: u8 = 0x0;
+    const HEADERS: u8 = 0x1;
+    const SETTINGS: u8 = 0x4;
+    const PING: u8 = 0x6;
+    const GOAWAY: u8 = 0x7;
+    const WINDOW_UPDATE: u8 = 0x8;
+    const FLAG_ACK: u8 = 0x1;
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+    const COMPRESSION_ERROR: u32 = 0x9;
+
+    let mut settings = Vec::new();
+    if script.header_table_size_zero {
+        settings.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    }
+    if sock
+        .write_all(&h2_frame(SETTINGS, 0, 0, &settings))
+        .is_err()
+    {
+        return;
+    }
+
+    let mut pending = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut preface_read = false;
+    // The first header block after the client acknowledges our SETTINGS is
+    // the one that owes the size update
+    let mut size_update_due = false;
+    // Streams whose request body has not finished arriving
+    let mut awaiting_body: Vec<u32> = Vec::new();
+    loop {
+        match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+        }
+        if !preface_read {
+            if pending.len() < 24 {
+                continue;
+            }
+            assert_eq!(&pending[..24], b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            pending.drain(..24);
+            preface_read = true;
+        }
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pending.len() - pos >= 9 {
+            let h = &pending[pos..pos + 9];
+            let len = u32::from_be_bytes([0, h[0], h[1], h[2]]) as usize;
+            let (kind, flags) = (h[3], h[4]);
+            let stream = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
+            if pending.len() < pos + 9 + len {
+                break;
+            }
+            let payload = &pending[pos + 9..pos + 9 + len];
+            pos += 9 + len;
+
+            let respond = |out: &mut Vec<u8>, stream: u32| {
+                out.extend_from_slice(&h2_frame(
+                    HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    stream,
+                    &[0x88],
+                ));
+            };
+            match kind {
+                SETTINGS if flags & FLAG_ACK != 0 => {
+                    size_update_due = script.header_table_size_zero;
+                }
+                SETTINGS => out.extend_from_slice(&h2_frame(SETTINGS, FLAG_ACK, 0, &[])),
+                PING if flags & FLAG_ACK == 0 => {
+                    out.extend_from_slice(&h2_frame(PING, FLAG_ACK, 0, payload));
+                }
+                HEADERS => {
+                    // The client sets neither PADDED nor PRIORITY, so the
+                    // block starts at the payload. The update is 001xxxxx.
+                    if std::mem::take(&mut size_update_due)
+                        && payload.first().map(|b| b & 0xe0) != Some(0x20)
+                    {
+                        let mut goaway = 0u32.to_be_bytes().to_vec();
+                        goaway.extend_from_slice(&COMPRESSION_ERROR.to_be_bytes());
+                        let _ = sock.write_all(&h2_frame(GOAWAY, 0, 0, &goaway));
+                        return;
+                    }
+                    if flags & FLAG_END_STREAM != 0 {
+                        respond(&mut out, stream);
+                    } else {
+                        awaiting_body.push(stream);
+                    }
+                }
+                DATA => {
+                    // Credit goes straight back, on both windows
+                    let credit = (len as u32).to_be_bytes();
+                    out.extend_from_slice(&h2_frame(WINDOW_UPDATE, 0, 0, &credit));
+                    out.extend_from_slice(&h2_frame(WINDOW_UPDATE, 0, stream, &credit));
+                    if flags & FLAG_END_STREAM != 0
+                        && let Some(i) = awaiting_body.iter().position(|s| *s == stream)
+                    {
+                        awaiting_body.swap_remove(i);
+                        respond(&mut out, stream);
+                    }
+                }
+                _ => {}
+            }
+        }
+        pending.drain(..pos);
+        if sock.write_all(&out).is_err() {
+            return;
+        }
+    }
+}
+
+/// Node with `headerTableSize: 0` answered the first flight of a run and
+/// timed out on everything after it: its SETTINGS cut the table below the
+/// 4096 an encoder starts with, and nghttp2 then rejects any header block
+/// that does not open with the size update RFC 7541 Section 4.2 requires.
+/// 50 ok of 100 with `-c 1 -p 10` before the update was sent.
+#[test]
+fn h2_shrinks_its_encoder_table_when_the_server_cuts_it() {
+    let addr = start_scripted_h2_server(H2Script {
+        header_table_size_zero: true,
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "10",
+        "-n",
+        "100",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_all_ok(&report, 100, "200");
+}
+
 // ------------------------------------------------------------------------
 // HTTP/3
 //

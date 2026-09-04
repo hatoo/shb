@@ -4,6 +4,9 @@
 //! is encoded once at start-up ([`encode_request`]) and then memcpy'd per
 //! request. It uses only static-table indices and literals *without* indexing,
 //! so it never mutates a dynamic table and the same bytes stay valid forever.
+//! The peer's decoder does not know that, though: when it lowers the table
+//! size it expects the encoder to say it has shrunk to fit, and
+//! [`size_update`] is that one statement.
 //!
 //! Responses go the other way: the client advertises
 //! `SETTINGS_HEADER_TABLE_SIZE = 0`, which forbids the peer's encoder from
@@ -55,6 +58,16 @@ fn literal_indexed_name(out: &mut Vec<u8>, name_index: u32, value: &[u8]) {
 
 /// Static index of `:authority`
 const IDX_AUTHORITY: u32 = 1;
+
+/// Append a dynamic table size update (RFC 7541 Section 6.3)
+///
+/// Nothing is ever put in the table, but a peer that lowers
+/// `SETTINGS_HEADER_TABLE_SIZE` below what the encoder was entitled to is
+/// owed this at the start of the next header block all the same (Section
+/// 4.2), and nghttp2 refuses the block if it is missing.
+pub fn size_update(out: &mut Vec<u8>, size: u32) {
+    encode_int(out, 5, 0x20, size);
+}
 
 /// A literal field with both parts spelled out, without indexing
 fn literal(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
@@ -397,6 +410,28 @@ mod tests {
     #[test]
     fn size_update_is_skipped() {
         assert_eq!(find_status(&[0x20, 0x88]).unwrap(), Some(200));
+    }
+
+    /// The representation from RFC 7541 Section 6.3: 001 and then the size
+    /// as a 5-bit-prefix integer
+    #[test]
+    fn size_update_matches_the_spec() {
+        for (size, want) in [
+            (0u32, &[0x20u8][..]),
+            (30, &[0x3e]),
+            (31, &[0x3f, 0x00]),
+            (2048, &[0x3f, 0xe1, 0x0f]),
+            (4096, &[0x3f, 0xe1, 0x1f]),
+        ] {
+            let mut out = Vec::new();
+            size_update(&mut out, size);
+            assert_eq!(out, want, "size {size}");
+        }
+        // And the response decoder steps over the same bytes
+        let mut block = Vec::new();
+        size_update(&mut block, 2048);
+        block.push(0x88);
+        assert_eq!(find_status(&block).unwrap(), Some(200));
     }
 
     #[test]

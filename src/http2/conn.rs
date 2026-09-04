@@ -2,9 +2,10 @@
 //!
 //! Only the parts a benchmark client exercises are implemented: open a stream
 //! with a pre-encoded header block, read the response's `:status`, count the
-//! body, and keep the flow-control windows out of the way. Priority, push and
-//! anything to do with the dynamic HPACK table are declined at the SETTINGS
-//! level rather than implemented.
+//! body, and keep the flow-control windows out of the way. Priority and push
+//! are declined at the SETTINGS level rather than implemented, and the dynamic
+//! HPACK table is never written to - though the peer has to be told so when
+//! it shrinks its side of it.
 
 use crate::inflight::H2Ring;
 use anyhow::{Result, bail};
@@ -50,6 +51,8 @@ const MAX_FRAME_CEILING: u32 = (1 << 24) - 1;
 
 /// Largest window HTTP/2 allows
 const MAX_WINDOW: u32 = (1 << 31) - 1;
+/// The dynamic table size a peer starts out allowing (RFC 9113 Section 6.5.2)
+const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
 /// How many streams to assume the peer allows until its SETTINGS says
 ///
 /// RFC 9113 Section 6.5.2 makes the initial value unlimited, and taking that
@@ -117,6 +120,14 @@ pub struct Connection {
     peer_max_frame: u32,
     /// Bytes received against the connection window since the last update
     recv_consumed: u32,
+    /// The dynamic table our encoder is entitled to, as far as the peer
+    /// knows. Nothing is ever put in it, but the peer's decoder cannot know
+    /// that: when its SETTINGS_HEADER_TABLE_SIZE drops below this it expects
+    /// the next header block to open by shrinking the table to fit (RFC 7541
+    /// Section 4.2), and nghttp2 rejects the block if it does not
+    table_size: u32,
+    /// A shrink the peer is owed, to go at the start of the next header block
+    table_size_update: Option<u32>,
     /// A GOAWAY has been received
     goaway: bool,
 }
@@ -137,6 +148,8 @@ impl Connection {
             peer_initial_window: 65535,
             peer_max_frame: DEFAULT_MAX_FRAME,
             recv_consumed: 0,
+            table_size: DEFAULT_HEADER_TABLE_SIZE,
+            table_size_update: None,
             goaway: false,
         }
     }
@@ -185,6 +198,20 @@ impl Connection {
         self.next_id = self.next_id.saturating_add(2);
         let end_stream = if body.is_empty() { FLAG_END_STREAM } else { 0 };
         let max = self.peer_max_frame as usize;
+
+        // A shrink the peer is owed goes in front of this block and no other,
+        // so the join is paid once per SETTINGS change rather than per request
+        let shrunk;
+        let block = match self.table_size_update.take() {
+            Some(size) => {
+                let mut joined = Vec::with_capacity(4 + block.len());
+                hpack::size_update(&mut joined, size);
+                joined.extend_from_slice(block);
+                shrunk = joined;
+                &shrunk[..]
+            }
+            None => block,
+        };
 
         if block.len() <= max {
             // What every request the run sends looks like: one HEADERS frame
@@ -494,6 +521,13 @@ impl Connection {
             let id = u16::from_be_bytes([entry[0], entry[1]]);
             let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
             match id {
+                // The encoder never grows into a raised limit, so only a cut
+                // below what it has is anything to act on; and once it has
+                // been cut, a later cut to the same figure owes nothing
+                SETTINGS_HEADER_TABLE_SIZE if value < self.table_size => {
+                    self.table_size = value;
+                    self.table_size_update = Some(value);
+                }
                 SETTINGS_MAX_CONCURRENT_STREAMS => self.max_concurrent = value,
                 // Our only use for this is deciding whether a request body
                 // fits; responses ride on the huge window we advertise
@@ -769,6 +803,80 @@ mod tests {
         assert!(c.start_stream(&[0x82], b"").is_some());
         assert!(c.start_stream(&[0x82], b"").is_some());
         assert!(c.start_stream(&[0x82], b"").is_none(), "limit applies");
+    }
+
+    /// Node with `headerTableSize: 0` answered the first flight and nothing
+    /// after it: its SETTINGS cut the table below the 4096 an encoder starts
+    /// with, and nghttp2 then demands that the next header block open with a
+    /// size update (RFC 7541 Section 4.2), timing out every request whose
+    /// block does not.
+    #[test]
+    fn a_lower_header_table_size_opens_the_next_block_with_a_size_update() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        let mut settings = |c: &mut Connection, size: u32| {
+            let mut payload = SETTINGS_HEADER_TABLE_SIZE.to_be_bytes().to_vec();
+            payload.extend_from_slice(&size.to_be_bytes());
+            c.feed(&frame(SETTINGS, 0, 0, &payload), &mut events)
+                .unwrap();
+            c.take_output();
+        };
+        let headers_payload = |c: &mut Connection| {
+            let out = c.take_output().unwrap();
+            assert_eq!(out[3], HEADERS);
+            out[FRAME_HEADER_LEN..].to_vec()
+        };
+
+        settings(&mut c, 0);
+        c.start_stream(&[0x82, 0x86], b"").unwrap();
+        assert_eq!(
+            headers_payload(&mut c),
+            [0x20, 0x82, 0x86],
+            "the block opens with a size update to 0"
+        );
+        c.start_stream(&[0x82, 0x86], b"").unwrap();
+        assert_eq!(
+            headers_payload(&mut c),
+            [0x82, 0x86],
+            "said once, it is not said again"
+        );
+
+        // Raising the limit obliges the encoder to nothing, and neither does
+        // lowering it back to where the encoder already is
+        settings(&mut c, 4096);
+        settings(&mut c, 0);
+        c.start_stream(&[0x82], b"").unwrap();
+        assert_eq!(headers_payload(&mut c), [0x82]);
+
+        // A peer that cuts to something above zero is told that figure
+        let mut c = connected();
+        settings(&mut c, 2048);
+        c.start_stream(&[0x82], b"").unwrap();
+        assert_eq!(headers_payload(&mut c), [0x3f, 0xe1, 0x0f, 0x82]);
+        // A cut below that is owed again, since the encoder sat at 2048
+        settings(&mut c, 1024);
+        c.start_stream(&[0x82], b"").unwrap();
+        assert_eq!(headers_payload(&mut c), [0x3f, 0xe1, 0x07, 0x82]);
+    }
+
+    /// The size update counts towards the frame the block is split over
+    #[test]
+    fn a_size_update_is_split_with_the_block_it_opens() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        c.feed(&frame(SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0]), &mut events)
+            .unwrap();
+        c.take_output();
+        c.peer_max_frame = 16;
+        let block = [0x00u8; 20];
+        c.start_stream(&block, b"").unwrap();
+        let out = c.take_output().unwrap();
+        // HEADERS carrying 16 bytes, then CONTINUATION with the last 5
+        assert_eq!(out[..4], [0, 0, 16, HEADERS]);
+        assert_eq!(out[FRAME_HEADER_LEN], 0x20, "the update leads");
+        let rest = &out[FRAME_HEADER_LEN + 16..];
+        assert_eq!(rest[..5], [0, 0, 5, CONTINUATION, FLAG_END_HEADERS]);
+        assert_eq!(rest.len(), FRAME_HEADER_LEN + 5);
     }
 
     /// The id field is 31 bits with the top one reserved, so past the last id
