@@ -74,6 +74,28 @@ struct MsgState {
     cmsg: [u8; 64],
 }
 
+/// A send whose connection was closed from under it
+///
+/// The SQE was pushed, and may not even have been submitted yet, so the
+/// kernel is still going to read the datagram - and the msghdr and iovec
+/// that point at it, when it is a GSO batch. Freeing them with the
+/// connection is what made nginx log "quic fixed bit is not set" once per
+/// reconnect: the old connection's CONNECTION_CLOSE was read from freed
+/// memory and sent through the socket that had since taken its slot. They
+/// stay here until the completion that carries their user_data is reaped,
+/// whatever generation it belongs to.
+struct Retired {
+    user_data: u64,
+    _datagram: Datagram,
+    _msg_state: Box<MsgState>,
+}
+
+/// How long a connection that has decided to close keeps its socket, waiting
+/// for the send of its CONNECTION_CLOSE to complete. A UDP send completes as
+/// soon as the kernel has copied it, so this is only for a socket that has
+/// stopped taking anything at all.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
 /// Whether the kernel supports UDP GSO (UDP_SEGMENT)
 fn probe_gso(addr: &std::net::SocketAddr) -> bool {
     let Ok(fd) = uring::make_udp_socket(addr) else {
@@ -174,6 +196,11 @@ struct Conn {
     generation: u64,
     /// In-flight requests, up to the configured parallelism
     streams: H3Ring<InFlight>,
+    /// The connection is over and its requests are accounted for, but the
+    /// socket stays until the send of its CONNECTION_CLOSE completes, or
+    /// until this deadline. Closing the socket earlier would hand the
+    /// datagram to whichever socket next took the slot.
+    closing: Option<Instant>,
 }
 
 impl Conn {
@@ -194,10 +221,26 @@ impl Conn {
             recv_armed: false,
             generation: 0,
             streams: H3Ring::new(),
+            closing: None,
         }
     }
 
-    fn close(&mut self) {
+    /// Close the socket and forget the connection
+    ///
+    /// A send still in flight keeps what it points at: the datagram and the
+    /// sendmsg bookkeeping move to `retired` until its completion arrives.
+    fn close(&mut self, conn_idx: usize, retired: &mut Vec<Retired>) {
+        if self.sending
+            && let Some(datagram) = self.out_queue.pop_front()
+        {
+            let msg_state =
+                std::mem::replace(&mut self.msg_state, Box::new(unsafe { std::mem::zeroed() }));
+            retired.push(Retired {
+                user_data: uring::user_data(conn_idx, self.generation, OP_SEND),
+                _datagram: datagram,
+                _msg_state: msg_state,
+            });
+        }
         if self.fd >= 0 {
             // Close by turning the fd back into a UdpSocket and dropping it
             drop(unsafe { UdpSocket::from_raw_fd(self.fd) });
@@ -211,6 +254,7 @@ impl Conn {
         self.sending = false;
         self.recv_armed = false;
         self.streams.clear();
+        self.closing = None;
         // Bump the generation so CQEs of operations on the old socket are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
     }
@@ -642,6 +686,8 @@ pub fn run_worker(
     for _ in 0..connections {
         conns.push(Conn::new());
     }
+    // Sends outliving their connection; before the ring for the same reason
+    let mut retired: Vec<Retired> = Vec::new();
 
     let mut ring = uring::build_worker_ring(connections)?;
     // Kept alive so that enter can use the registered ring fd; submitter, sq
@@ -710,6 +756,30 @@ pub fn run_worker(
 
         let mut wait = uring::WAIT_TIMEOUT;
         for (conn_idx, conn) in conns.iter_mut().enumerate() {
+            if let Some(deadline) = conn.closing {
+                // Waiting only for the send of its CONNECTION_CLOSE to come
+                // back; a socket that will not even do that is let go
+                if deadline <= now {
+                    finish_close(
+                        &submitter,
+                        &mut sq,
+                        conn_idx,
+                        conn,
+                        &tls_config,
+                        connect_timeout,
+                        target,
+                        &mut started,
+                        budget,
+                        stop,
+                        &mut transmit_buf,
+                        gso,
+                        &mut retired,
+                    )?;
+                } else {
+                    wait = wait.min(deadline - now);
+                }
+                continue;
+            }
             let mut expired = false;
             if let Some(quic) = conn.quic.as_mut() {
                 while let Some(deadline) = quic.poll_timeout() {
@@ -749,7 +819,7 @@ pub fn run_worker(
                     gso,
                 )?;
                 if !alive {
-                    handle_broken(
+                    begin_close(
                         &submitter,
                         &mut sq,
                         conn_idx,
@@ -763,6 +833,8 @@ pub fn run_worker(
                         stop,
                         &mut transmit_buf,
                         gso,
+                        now,
+                        &mut retired,
                     )?;
                 }
             }
@@ -786,7 +858,7 @@ pub fn run_worker(
                 {
                     continue;
                 }
-                handle_broken(
+                begin_close(
                     &submitter,
                     &mut sq,
                     conn_idx,
@@ -800,6 +872,8 @@ pub fn run_worker(
                     stop,
                     &mut transmit_buf,
                     gso,
+                    now,
+                    &mut retired,
                 )?;
             }
         }
@@ -814,6 +888,10 @@ pub fn run_worker(
             if generation != conns[conn_idx].generation {
                 if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
                     buf_ring.recycle(bid);
+                }
+                // The kernel is done with what the send pointed at
+                if op == OP_SEND {
+                    retired.retain(|r| r.user_data != ud);
                 }
                 continue;
             }
@@ -838,6 +916,10 @@ pub fn run_worker(
                         stats.bytes_sent += res as u64;
                         recycle(conn);
                         push_front_send(&submitter, &mut sq, conn_idx, conn)?;
+                    }
+                    // The CONNECTION_CLOSE has left, so the socket can go
+                    if conn.closing.is_some() && !conn.sending {
+                        conn_broken = true;
                     }
                 }
                 OP_RECV => {
@@ -903,7 +985,7 @@ pub fn run_worker(
 
             if conn_broken {
                 let conn = &mut conns[conn_idx];
-                handle_broken(
+                begin_close(
                     &submitter,
                     &mut sq,
                     conn_idx,
@@ -917,6 +999,8 @@ pub fn run_worker(
                     stop,
                     &mut transmit_buf,
                     gso,
+                    now,
+                    &mut retired,
                 )?;
             }
         }
@@ -924,7 +1008,8 @@ pub fn run_worker(
         // Turn the state machines once for the whole batch of datagrams
         let now = Instant::now();
         for (conn_idx, conn) in conns.iter_mut().enumerate() {
-            if !conn.pending {
+            if !conn.pending || conn.closing.is_some() {
+                conn.pending = false;
                 continue;
             }
             conn.pending = false;
@@ -948,7 +1033,7 @@ pub fn run_worker(
                 gso,
             )?;
             if !alive {
-                handle_broken(
+                begin_close(
                     &submitter,
                     &mut sq,
                     conn_idx,
@@ -962,6 +1047,8 @@ pub fn run_worker(
                     stop,
                     &mut transmit_buf,
                     gso,
+                    now,
+                    &mut retired,
                 )?;
             }
         }
@@ -971,9 +1058,15 @@ pub fn run_worker(
         }
     }
 
+    // What the last pass pushed has not been submitted: for a connection
+    // that was closing, that is its CONNECTION_CLOSE, and the buffer is kept
+    // past the ring for it. A UDP send runs to completion at submission.
+    sq.sync();
+    submitter.submit().context("io_uring submit failed")?;
+
     // Best-effort CONNECTION_CLOSE so servers see a clean shutdown
     let now = Instant::now();
-    for conn in &mut conns {
+    for (conn_idx, conn) in conns.iter_mut().enumerate() {
         if let Some(quic) = conn.quic.as_mut() {
             quic.close(proto::H3_NO_ERROR, b"");
             transmit_buf.clear();
@@ -990,16 +1083,21 @@ pub fn run_worker(
                 }
             }
         }
-        conn.close();
+        conn.close(conn_idx, &mut retired);
     }
 
     Ok(stats)
 }
 
-/// Fail everything in flight on a broken connection and reconnect if the
-/// request budget allows
+/// Give up on a connection
+///
+/// Its requests are accounted for now. The socket is not closed yet: the
+/// send in flight - the CONNECTION_CLOSE, on the paths that send one - has
+/// to complete on this socket first, and until it does its buffer is in
+/// use. The close and the reconnect happen when its completion arrives, or
+/// at the deadline set here.
 #[allow(clippy::too_many_arguments)]
-fn handle_broken(
+fn begin_close(
     submitter: &io_uring::Submitter<'_>,
     sq: &mut io_uring::squeue::SubmissionQueue<'_>,
     conn_idx: usize,
@@ -1013,17 +1111,61 @@ fn handle_broken(
     stop: bool,
     transmit_buf: &mut Vec<u8>,
     gso: bool,
+    now: Instant,
+    retired: &mut Vec<Retired>,
 ) -> Result<()> {
-    if conn.h3_ready {
-        conn.fail_inflight(stats);
-    } else {
-        // Never got as far as a working HTTP/3 connection: count it like the
-        // TCP workers count a failed connect, consuming one unit of budget
-        stats.errors += 1;
-        stats.connect_errors += 1;
-        *started += 1;
+    if conn.closing.is_none() {
+        if conn.h3_ready {
+            conn.fail_inflight(stats);
+        } else {
+            // Never got as far as a working HTTP/3 connection: count it like
+            // the TCP workers count a failed connect, consuming one unit of
+            // budget
+            stats.errors += 1;
+            stats.connect_errors += 1;
+            *started += 1;
+        }
+        conn.closing = Some(now + CLOSE_GRACE);
     }
-    conn.close();
+    if conn.sending {
+        return Ok(());
+    }
+    finish_close(
+        submitter,
+        sq,
+        conn_idx,
+        conn,
+        tls_config,
+        connect_timeout,
+        target,
+        started,
+        budget,
+        stop,
+        transmit_buf,
+        gso,
+        retired,
+    )
+}
+
+/// Close the socket of a connection that is over, and open the next one if
+/// the request budget allows
+#[allow(clippy::too_many_arguments)]
+fn finish_close(
+    submitter: &io_uring::Submitter<'_>,
+    sq: &mut io_uring::squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+    tls_config: &Arc<rustls::ClientConfig>,
+    connect_timeout: Duration,
+    target: &Target,
+    started: &mut u64,
+    budget: Budget,
+    stop: bool,
+    transmit_buf: &mut Vec<u8>,
+    gso: bool,
+    retired: &mut Vec<Retired>,
+) -> Result<()> {
+    conn.close(conn_idx, retired);
     if stop || !budget.may_start(*started) {
         return Ok(());
     }
