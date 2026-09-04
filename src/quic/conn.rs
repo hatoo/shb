@@ -114,6 +114,9 @@ pub enum Event {
     Opened(u64),
     /// A stream ended: by FIN, or by a RESET_STREAM with this error code
     Finished { id: u64, reset: Option<u64> },
+    /// The peer wants nothing more written to a stream we opened; what it
+    /// sends back on it is still read
+    Stopped(u64),
     /// The connection is over
     Lost(String),
 }
@@ -198,6 +201,8 @@ pub struct Connection {
     retire_prior_to: u64,
     /// RETIRE_CONNECTION_ID frames still to send
     retire_pending: Vec<u64>,
+    /// RESET_STREAM frames still to send, as (stream, error, final size)
+    reset_pending: Vec<(u64, u64, u64)>,
 
     params: Params,
     /// The max_idle_timeout shb advertised, which binds it as much as the
@@ -315,6 +320,7 @@ impl Connection {
             peer_cids: Vec::new(),
             retire_prior_to: 0,
             retire_pending: Vec::new(),
+            reset_pending: Vec::new(),
             original_dcid: initial_dcid,
             retry_token: Vec::new(),
             retried: false,
@@ -844,6 +850,20 @@ impl Connection {
             ack_eliciting = true;
         }
 
+        while let Some(&(id, error, final_size)) = self.reset_pending.last() {
+            if room(out) < 32 {
+                break;
+            }
+            frame::put_reset_stream(out, id, error, final_size);
+            frames.push(SentFrame::ResetStream {
+                id,
+                error,
+                final_size,
+            });
+            self.reset_pending.pop();
+            ack_eliciting = true;
+        }
+
         if congested {
             return Ok(ack_eliciting);
         }
@@ -1143,7 +1163,7 @@ impl Connection {
                 error,
                 final_size,
             } => self.on_reset(id, error, final_size)?,
-            Frame::StopSending { id, .. } => self.on_stop_sending(id),
+            Frame::StopSending { id, error } => self.on_stop_sending(id, error),
             Frame::MaxData(limit) => self.max_data_peer = self.max_data_peer.max(limit),
             Frame::MaxStreamData { id, limit } => self.on_max_stream_data(id, limit),
             Frame::MaxStreams { uni, limit } => {
@@ -1249,12 +1269,24 @@ impl Connection {
         Ok(())
     }
 
+    /// The peer wants nothing more on a stream: RFC 9000 Section 3.5 has
+    /// it answered with a RESET_STREAM, carrying its error code back and
+    /// the size the stream ended at, and nothing more goes on the stream
+    /// after that. A peer that never hears the RESET_STREAM keeps waiting
+    /// for the rest of a request it said it did not want.
     #[cold]
     #[inline(never)]
-    fn on_stop_sending(&mut self, id: u64) {
-        if let Some(pair) = self.stream_mut(id) {
-            pair.send.reset();
+    fn on_stop_sending(&mut self, id: u64, error: u64) {
+        let Some(send) = self.send_mut(id) else {
+            return;
+        };
+        if send.is_reset() {
+            return;
         }
+        let final_size = send.reset();
+        self.reset_pending.push((id, error, final_size));
+        self.events.push_back(Event::Stopped(id));
+        self.needs_send = true;
     }
 
     #[cold]
@@ -1442,7 +1474,10 @@ impl Connection {
         match f {
             // A PING is only there to draw an acknowledgement, and CRYPTO is
             // released by the handshake advancing rather than by this
-            SentFrame::Ping | SentFrame::Crypto { .. } | SentFrame::RetireConnectionId(_) => {}
+            SentFrame::Ping
+            | SentFrame::Crypto { .. }
+            | SentFrame::RetireConnectionId(_)
+            | SentFrame::ResetStream { .. } => {}
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -1457,6 +1492,13 @@ impl Connection {
         match f {
             SentFrame::Ping => {}
             SentFrame::RetireConnectionId(seq) => self.retire_pending.push(seq),
+            // Sent again even if the stream has been retired since: the
+            // frame is about the peer's receive side, not our send side
+            SentFrame::ResetStream {
+                id,
+                error,
+                final_size,
+            } => self.reset_pending.push((id, error, final_size)),
             SentFrame::Crypto { offset, len } => {
                 // Rewind to the lost run. Anything after it goes out again
                 // too, which costs a little bandwidth once and avoids
@@ -2494,6 +2536,49 @@ mod tests {
             .saturating_duration_since(expected)
             .max(expected.saturating_duration_since(got));
         assert!(drift < Duration::from_micros(1), "{got:?} vs {expected:?}");
+    }
+
+    /// RFC 9000 Section 3.5: STOP_SENDING on a stream still being written
+    /// is answered with RESET_STREAM, the stream goes quiet, and the answer
+    /// is sent again if lost
+    #[test]
+    fn stop_sending_is_answered_with_a_reset_stream() {
+        let mut conn = client();
+        let now = Instant::now();
+        conn.max_streams_bidi = 1;
+        conn.params.initial_max_stream_data_bidi_remote = 1000;
+        conn.max_data_peer = 1000;
+        let (id, n) = conn.send_oneshot(&[b'r'; 40]).unwrap();
+        assert_eq!(n, 40);
+        conn.handle_frame(Space::Data, Frame::StopSending { id, error: 0x10c }, now)
+            .unwrap();
+        assert_eq!(conn.poll_event(), Some(Event::Stopped(id)));
+        assert_eq!(conn.write(id, b"more"), 0, "nothing more is taken");
+
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let sent: Vec<_> = frame::Iter::new(&out).map(|f| f.unwrap()).collect();
+        assert_eq!(
+            sent,
+            vec![Frame::ResetStream {
+                id,
+                error: 0x10c,
+                final_size: 0,
+            }],
+            "the reset and no STREAM frame"
+        );
+        assert!(conn.reset_pending.is_empty());
+        conn.on_frame_lost(
+            Space::Data,
+            SentFrame::ResetStream {
+                id,
+                error: 0x10c,
+                final_size: 0,
+            },
+        );
+        assert_eq!(conn.reset_pending, vec![(id, 0x10c, 0)]);
     }
 
     #[test]

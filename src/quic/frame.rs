@@ -441,6 +441,13 @@ pub fn put_max_streams(out: &mut Vec<u8>, uni: bool, limit: u64) {
     put_varint(out, limit);
 }
 
+pub fn put_reset_stream(out: &mut Vec<u8>, id: u64, error: u64, final_size: u64) {
+    put_varint(out, RESET_STREAM);
+    put_varint(out, id);
+    put_varint(out, error);
+    put_varint(out, final_size);
+}
+
 pub fn put_retire_connection_id(out: &mut Vec<u8>, seq: u64) {
     put_varint(out, RETIRE_CONNECTION_ID);
     put_varint(out, seq);
@@ -685,6 +692,20 @@ mod tests {
             }
         );
         assert_eq!(f[1], Frame::Ping, "the frame after it must still parse");
+    }
+
+    #[test]
+    fn reset_stream_round_trips() {
+        let mut out = Vec::new();
+        put_reset_stream(&mut out, 8, 0x10c, 1234);
+        assert_eq!(
+            frames(&out),
+            vec![Frame::ResetStream {
+                id: 8,
+                error: 0x10c,
+                final_size: 1234,
+            }]
+        );
     }
 
     #[test]

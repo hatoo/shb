@@ -56,6 +56,9 @@ pub struct SendStream {
     fin: bool,
     /// The FIN has been put into a packet
     fin_sent: bool,
+    /// The peer asked for no more (STOP_SENDING), and nothing more goes:
+    /// not the rest of the data, not a resend, not the FIN
+    reset: bool,
 }
 
 impl SendStream {
@@ -73,6 +76,7 @@ impl SendStream {
             limit,
             fin: false,
             fin_sent: false,
+            reset: false,
         }
     }
 
@@ -90,6 +94,9 @@ impl SendStream {
 
     /// How many bytes flow control still allows
     pub fn writable(&self) -> u64 {
+        if self.reset {
+            return 0;
+        }
         self.limit
             .saturating_sub(self.base_offset + self.buf.len() as u64)
     }
@@ -112,10 +119,14 @@ impl SendStream {
     /// the peer is already waiting on them
     /// Whether `next_send` would produce anything, without borrowing the data
     pub fn has_pending(&self) -> bool {
-        !self.lost.is_empty() || self.buf.len() > self.sent || (self.fin && !self.fin_sent)
+        !self.reset
+            && (!self.lost.is_empty() || self.buf.len() > self.sent || (self.fin && !self.fin_sent))
     }
 
     pub fn next_send(&self, max: usize) -> Option<(u64, &[u8], bool)> {
+        if self.reset {
+            return None;
+        }
         if let Some(&(start, end)) = self.lost.first() {
             let end = end.min(start + max);
             return Some((
@@ -205,10 +216,18 @@ impl SendStream {
         }
     }
 
-    /// STOP_SENDING: the peer does not want the rest, so drop it
-    pub fn reset(&mut self) {
+    /// STOP_SENDING: the peer does not want the rest, so drop it and say
+    /// where the stream ends - the final size RESET_STREAM has to carry,
+    /// which is everything put on the wire so far (RFC 9000 Section 4.5)
+    pub fn reset(&mut self) -> u64 {
+        self.reset = true;
         self.buf.clear();
         self.lost.clear();
+        self.base_offset + self.sent as u64
+    }
+
+    pub fn is_reset(&self) -> bool {
+        self.reset
     }
 }
 
@@ -539,6 +558,26 @@ mod tests {
         s.on_lost(0, 0, true);
         let (_, _, fin) = s.next_send(10).unwrap();
         assert!(fin);
+    }
+
+    /// After STOP_SENDING nothing more may go on the stream: not the rest
+    /// of the data, not a lost run sent again, and not a FIN - which, with
+    /// the buffer cleared, would have gone out at an offset below data the
+    /// peer already had
+    #[test]
+    fn a_reset_stream_sends_nothing_more() {
+        let mut s = SendStream::new(1000);
+        s.write(&[b'x'; 40]);
+        s.finish();
+        let (off, data, fin) = s.next_send(10).unwrap();
+        s.on_sent(off, data.len(), fin);
+        assert_eq!(s.reset(), 10, "the final size is what went out");
+        assert!(!s.has_pending());
+        assert!(s.next_send(1000).is_none());
+        assert_eq!(s.write(b"more"), 0, "nothing more is taken");
+        s.on_lost(0, 10, false);
+        assert!(s.next_send(1000).is_none(), "and nothing is sent again");
+        assert!(s.is_reset());
     }
 
     #[test]

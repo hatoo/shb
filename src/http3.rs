@@ -475,6 +475,13 @@ fn drive(
                     alive = false;
                 }
                 QuicEvent::Readable(id) | QuicEvent::Opened(id) => readable.push(id),
+                // The rest of the request stays unsent; whether the server
+                // still answers is for the stream's end to say
+                QuicEvent::Stopped(id) => {
+                    if let Some(inflight) = conn.streams.get_mut(id) {
+                        inflight.unsent.clear();
+                    }
+                }
                 // Collected rather than acted on: the same datagram that ends
                 // a stream usually carries the response, and completing it
                 // here would retire the stream before its body is read

@@ -62,6 +62,13 @@ pub enum SentFrame {
     /// A connection ID of the peer's we have stopped using; it has to hear
     /// so, or it keeps the ID reserved for us (RFC 9000 Section 19.16)
     RetireConnectionId(u64),
+    /// A stream given up on at the peer's request; until it hears so it
+    /// keeps waiting for the rest (RFC 9000 Section 3.5)
+    ResetStream {
+        id: u64,
+        error: u64,
+        final_size: u64,
+    },
 }
 
 #[derive(Default)]
