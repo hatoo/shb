@@ -44,13 +44,10 @@ pub struct Parser {
     /// out of the receive buffer with no copy at all.
     pending: Vec<u8>,
     state: State,
-    /// Status code of the most recently completed response
+    /// Status code of the response being read, which is the last completed
+    /// one for as long as the caller only asks after one completes
     status: u16,
-    /// Status code of the response currently being read
-    current_status: u16,
-    /// Whether the connection can be reused after the response being read
-    current_keep_alive: bool,
-    /// Whether the connection can be reused after the last completed response
+    /// Whether the connection can be reused after that response
     keep_alive: bool,
     /// Whether the request was a HEAD, whose response never has a body
     /// however it is framed (RFC 9112 Section 6.3)
@@ -69,8 +66,6 @@ impl Parser {
             pending: Vec::new(),
             state: State::Head,
             status: 0,
-            current_status: 0,
-            current_keep_alive: true,
             keep_alive: true,
             head_request: false,
         }
@@ -81,8 +76,6 @@ impl Parser {
         self.pending.clear();
         self.state = State::Head;
         self.status = 0;
-        self.current_status = 0;
-        self.current_keep_alive = true;
         self.keep_alive = true;
     }
 
@@ -92,12 +85,19 @@ impl Parser {
     }
 
     /// Status code of the most recently completed response
+    ///
+    /// Only meaningful once one has: it is filled in from the status line, so
+    /// between a response's head arriving and its body finishing it is that
+    /// response's rather than the one before it. [`Parser::feed`] returning
+    /// non-zero, or [`Parser::mark_eof`] returning true, is what says one has
+    /// completed - which is the only place either caller reads this.
     pub fn status(&self) -> u16 {
         self.status
     }
 
     /// Whether the connection may carry another request after the most
-    /// recently completed response
+    /// recently completed response. Read under the same rule as
+    /// [`Parser::status`].
     pub fn keep_alive(&self) -> bool {
         self.keep_alive
     }
@@ -135,7 +135,6 @@ impl Parser {
     pub fn mark_eof(&mut self) -> bool {
         if self.state == State::Body(Body::Eof) {
             self.state = State::Head;
-            self.status = self.current_status;
             self.keep_alive = false;
             true
         } else {
@@ -165,9 +164,9 @@ impl Parser {
                         // (RFC 9110 Section 15.2)
                         continue;
                     }
-                    self.current_status = status;
+                    self.status = status;
                     // A close-delimited body ends with the connection itself
-                    self.current_keep_alive = keep_alive && body != Body::Eof;
+                    self.keep_alive = keep_alive && body != Body::Eof;
                     let body = if self.head_request || no_body_status(status) {
                         Body::Exact(0)
                     } else {
@@ -177,8 +176,6 @@ impl Parser {
                 }
                 State::Body(Body::Exact(0)) => {
                     self.state = State::Head;
-                    self.status = self.current_status;
-                    self.keep_alive = self.current_keep_alive;
                     done += 1;
                 }
                 State::Body(Body::Exact(n)) => {
@@ -223,8 +220,6 @@ impl Parser {
                     pos += nl + 1;
                     if line.is_empty() {
                         self.state = State::Head;
-                        self.status = self.current_status;
-                        self.keep_alive = self.current_keep_alive;
                         done += 1;
                     }
                 }
