@@ -29,6 +29,9 @@ pub const H3_NO_ERROR: u64 = 0x100;
 /// The server never started on the request, so it can be sent again
 /// without anything happening twice
 pub const H3_REQUEST_REJECTED: u64 = 0x10b;
+/// The request is cancelled: what shb resets a request stream with when
+/// the server has answered before the request had all been sent
+pub const H3_REQUEST_CANCELLED: u64 = 0x10c;
 
 // Settings identifiers
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;

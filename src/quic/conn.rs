@@ -301,6 +301,9 @@ struct StreamPair {
     recv: RecvStream,
     /// Reported to the worker already
     finished: bool,
+    /// The worker is done with it; it stays only until the send side has
+    /// settled, and nothing more is reported about it
+    retired: bool,
     /// Already in `send_queue`, so it is not queued twice
     queued: bool,
 }
@@ -997,8 +1000,7 @@ impl Connection {
             if let Some((offset, data, fin)) = send.next_send(avail - 16) {
                 let len = data.len();
                 frame::put_stream(out, id, offset, fin, data);
-                send.on_sent(offset, len, fin);
-                sent_len = len;
+                sent_len = send.on_sent(offset, len, fin);
                 frames.push(SentFrame::Stream {
                     id,
                     offset,
@@ -1041,8 +1043,8 @@ impl Connection {
             if let Some((offset, data, fin)) = pair.send.next_send(avail - 16) {
                 let len = data.len();
                 frame::put_stream(out, id, offset, fin, data);
-                pair.send.on_sent(offset, len, fin);
-                sent_len = len;
+                // What counts against the window is what is new
+                sent_len = pair.send.on_sent(offset, len, fin);
                 frames.push(SentFrame::Stream {
                     id,
                     offset,
@@ -1620,15 +1622,24 @@ impl Connection {
             SentFrame::Ping
             | SentFrame::Crypto { .. }
             | SentFrame::RetireConnectionId(_)
-            | SentFrame::ResetStream { .. }
             | SentFrame::MaxData(_)
             | SentFrame::MaxStreamData { .. } => {}
             SentFrame::Stream {
-                id, offset, len, ..
+                id,
+                offset,
+                len,
+                fin,
             } => {
                 if let Some(send) = self.send_mut(id) {
-                    send.on_acked(offset, len);
+                    send.on_acked(offset, len, fin);
                 }
+                self.settle(id);
+            }
+            SentFrame::ResetStream { id, .. } => {
+                if let Some(send) = self.send_mut(id) {
+                    send.on_reset_acked();
+                }
+                self.settle(id);
             }
         }
     }
@@ -1935,6 +1946,7 @@ impl Connection {
             send: SendStream::with_buf(limit, send_buf),
             recv: RecvStream::with_buf(self.stream_window, recv_buf),
             finished: false,
+            retired: false,
             queued: false,
         }));
         Some(id)
@@ -2036,25 +2048,63 @@ impl Connection {
         self.events.push_back(Event::Readable(id));
     }
 
-    /// Forget a stream that the worker is done with, releasing its slot
-    pub fn retire(&mut self, id: u64) {
+    /// The worker is done with a stream: its response is complete, or it
+    /// has been given up on
+    ///
+    /// The send side may not be: a request body the server answered before
+    /// it had all arrived, or a request whose acknowledgement has not come
+    /// back yet. Dropping the stream then left a STOP_SENDING in the next
+    /// datagram, or the loss of a body packet, with no stream to act on -
+    /// no RESET_STREAM, no resend - so the server never saw the stream end
+    /// and its stream credit leaked. Against Caddy, POST -d @1MiB -p 100
+    /// -n 1000 ended with 500 errors in 45 seconds. The rest of a body the
+    /// server answered without is not wanted: the stream is reset with
+    /// `cancel`, as curl does. Either way the stream stays until the peer
+    /// has acknowledged everything, and nothing more is reported about it.
+    pub fn retire(&mut self, id: u64, cancel: u64) {
+        let Some(i) = self.stream_index(id) else {
+            return;
+        };
+        let Some(pair) = self.streams[i].as_mut() else {
+            return;
+        };
+        // Given up on before it was answered, as after a GOAWAY
+        if !pair.finished {
+            pair.finished = true;
+            self.unanswered -= 1;
+        }
+        pair.retired = true;
+        if !pair.send.is_reset() && !pair.send.fully_sent() {
+            let final_size = pair.send.reset();
+            self.reset_pending.push((id, cancel, final_size));
+            self.needs_send = true;
+        }
+        self.settle(id);
+    }
+
+    /// Drop a retired stream once its send side has settled, releasing
+    /// its slot
+    fn settle(&mut self, id: u64) {
         // One pass of the loop retires everything that finished and then
         // opens that many again, so the pool has to cover a whole pass to save
         // anything. It cannot grow past the streams that were open at once,
         // which is what bounds it: the cap is only there for a peer that
         // allows an unreasonable number.
         const SPARES: usize = 256;
-        if let Some(i) = self.stream_index(id)
-            && let Some(mut pair) = self.streams[i].take()
+        let Some(i) = self.stream_index(id) else {
+            return;
+        };
+        if !self.streams[i]
+            .as_ref()
+            .is_some_and(|pair| pair.retired && pair.send.is_settled())
         {
-            // Given up on before it was answered, as after a GOAWAY
-            if !pair.finished {
-                self.unanswered -= 1;
-            }
-            if self.spare_bufs.len() < SPARES {
-                self.spare_bufs
-                    .push((pair.send.take_buf(), pair.recv.take_buf()));
-            }
+            return;
+        }
+        if let Some(mut pair) = self.streams[i].take()
+            && self.spare_bufs.len() < SPARES
+        {
+            self.spare_bufs
+                .push((pair.send.take_buf(), pair.recv.take_buf()));
         }
         // Trim the front so the ring does not grow for the life of the run
         while matches!(self.streams.front(), Some(None)) {
@@ -2065,7 +2115,7 @@ impl Connection {
 
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
         let new = if let Some(i) = self.stream_index(id) {
-            let Some(pair) = self.streams[i].as_mut() else {
+            let Some(pair) = self.streams[i].as_mut().filter(|p| !p.retired) else {
                 // Already retired; the peer is answering a stream we stopped
                 // caring about, which is not an error
                 return Ok(());
@@ -3305,6 +3355,124 @@ mod tests {
         conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
             .unwrap();
         assert_eq!(frames, vec![SentFrame::MaxData(limit)], "the current value");
+    }
+
+    /// A response can arrive before the request has all been sent. The
+    /// worker is done with the stream then, but the send side is not: the
+    /// rest is cancelled with a RESET_STREAM, and the stream stays until
+    /// the peer has acknowledged it, so a STOP_SENDING or a lost packet
+    /// still finds it. Against Caddy, POST -d @1MiB -p 100 -n 1000 -c 1
+    /// ended with 500 errors in 45 seconds.
+    #[test]
+    fn a_stream_retired_before_its_body_was_sent_is_cancelled_and_kept_until_acked() {
+        let mut conn = client();
+        conn.max_streams_bidi = 1;
+        conn.params.initial_max_stream_data_bidi_remote = 1 << 20;
+        conn.max_data_peer = 1 << 20;
+        let body = vec![b'x'; 4000];
+        let (id, n) = conn.send_oneshot(&body).unwrap();
+        assert_eq!(n, 4000);
+        // Only the first packet's worth has left when the answer arrives
+        conn.stream_mut(id).unwrap().send.on_sent(0, 1000, false);
+        conn.on_stream(id, 0, b"answered", true).unwrap();
+        assert_eq!(conn.unanswered, 0);
+        while conn.poll_event().is_some() {}
+
+        conn.retire(id, 0x10c);
+        assert!(
+            conn.stream_mut(id).is_some(),
+            "kept until the peer has heard"
+        );
+        assert_eq!(conn.reset_pending, vec![(id, 0x10c, 1000)]);
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let reset = SentFrame::ResetStream {
+            id,
+            error: 0x10c,
+            final_size: 1000,
+        };
+        assert_eq!(
+            frames,
+            vec![reset],
+            "the reset, and none of the rest of the body"
+        );
+
+        // Data arriving for it now is not reported
+        conn.on_stream(id, 8, b"more", false).unwrap();
+        assert_eq!(conn.poll_event(), None);
+
+        conn.on_frame_lost(Space::Data, reset);
+        assert_eq!(conn.reset_pending, vec![(id, 0x10c, 1000)], "sent again");
+        conn.on_frame_acked(reset);
+        assert!(conn.stream_mut(id).is_none(), "settled, so gone");
+        assert_eq!(conn.streams.len(), 0, "and the ring trimmed");
+    }
+
+    /// A request that was fully sent when its answer arrives is not reset;
+    /// it stays until acknowledged so that a lost packet of it is still
+    /// sent again, and goes the moment it is
+    #[test]
+    fn a_stream_retired_after_its_request_was_sent_stays_until_acknowledged() {
+        let mut conn = client();
+        conn.max_streams_bidi = 1;
+        conn.params.initial_max_stream_data_bidi_remote = 1 << 20;
+        conn.max_data_peer = 1 << 20;
+        let (id, _) = conn.send_oneshot(b"request").unwrap();
+        conn.stream_mut(id).unwrap().send.on_sent(0, 7, true);
+        conn.on_stream(id, 0, b"answered", true).unwrap();
+
+        conn.retire(id, 0x10c);
+        assert!(conn.reset_pending.is_empty(), "nothing to cancel");
+        assert!(conn.stream_mut(id).is_some());
+        let sent = SentFrame::Stream {
+            id,
+            offset: 0,
+            len: 7,
+            fin: true,
+        };
+        conn.on_frame_lost(Space::Data, sent);
+        // The lost run goes again, and the FIN behind it in the next packet
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let data = SentFrame::Stream {
+            id,
+            offset: 0,
+            len: 7,
+            fin: false,
+        };
+        assert_eq!(frames, vec![data], "the request goes again");
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let fin = SentFrame::Stream {
+            id,
+            offset: 7,
+            len: 0,
+            fin: true,
+        };
+        assert_eq!(frames, vec![fin]);
+        conn.on_frame_acked(data);
+        assert!(conn.stream_mut(id).is_some(), "the FIN is still owed");
+        conn.on_frame_acked(fin);
+        assert!(conn.stream_mut(id).is_none());
+
+        // The common case: acknowledged before the answer, gone at once
+        conn.max_streams_bidi = 2;
+        let (id, _) = conn.send_oneshot(b"request").unwrap();
+        conn.stream_mut(id).unwrap().send.on_sent(0, 7, true);
+        conn.on_frame_acked(SentFrame::Stream {
+            id,
+            offset: 0,
+            len: 7,
+            fin: true,
+        });
+        conn.on_stream(id, 0, b"answered", true).unwrap();
+        conn.retire(id, 0x10c);
+        assert!(conn.stream_mut(id).is_none());
     }
 
     /// RFC 9000 Section 10.1.2: a PING before the effective idle timeout

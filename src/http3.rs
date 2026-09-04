@@ -662,7 +662,7 @@ fn drive(
                 stats.record_success(status, inflight.start);
                 conn.give_backs.completed += 1;
             }
-            quic.retire(id);
+            quic.retire(id, proto::H3_REQUEST_CANCELLED);
         }
 
         if let Some(goaway) = conn.goaway {
@@ -686,7 +686,7 @@ fn drive(
             }
             for id in unprocessed {
                 conn.streams.take(id);
-                quic.retire(id);
+                quic.retire(id, proto::H3_REQUEST_CANCELLED);
                 conn.give_backs.give_back(parallel, stats, started);
             }
             if conn.streams.is_empty() {

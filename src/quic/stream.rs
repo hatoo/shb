@@ -56,9 +56,15 @@ pub struct SendStream {
     fin: bool,
     /// The FIN has been put into a packet
     fin_sent: bool,
+    /// And acknowledged, which with the data before it is what ends the
+    /// stream (RFC 9000 Section 3.1)
+    fin_acked: bool,
     /// The peer asked for no more (STOP_SENDING), and nothing more goes:
     /// not the rest of the data, not a resend, not the FIN
     reset: bool,
+    /// The RESET_STREAM has been acknowledged, which is the other way a
+    /// stream ends
+    reset_acked: bool,
 }
 
 impl SendStream {
@@ -76,7 +82,9 @@ impl SendStream {
             limit,
             fin: false,
             fin_sent: false,
+            fin_acked: false,
             reset: false,
+            reset_acked: false,
         }
     }
 
@@ -155,8 +163,17 @@ impl SendStream {
     }
 
     /// Record that `len` bytes from `offset` went into a packet
-    pub fn on_sent(&mut self, offset: u64, len: usize, fin: bool) {
+    ///
+    /// Returns how many of them were sent for the first time. That, not
+    /// the length of the frame, is what counts against the connection's
+    /// flow control window (RFC 9000 Section 4.1): a lost run sent again
+    /// covers offsets the peer already accounted for. Counting it a second
+    /// time is what made shb believe Caddy's window was spent at a third
+    /// of it, on a path that dropped datagrams, and wait for a MAX_DATA
+    /// the server had no reason to send.
+    pub fn on_sent(&mut self, offset: u64, len: usize, fin: bool) -> usize {
         let start = (offset - self.base_offset) as usize;
+        let mut new = 0;
         if let Some(pos) = self.lost.iter().position(|&(s, e)| s == start && e > start) {
             let (s, e) = self.lost[pos];
             if s + len >= e {
@@ -168,15 +185,43 @@ impl SendStream {
             // A frame carrying no data must not move the mark: the FIN's
             // offset is the end of the buffer, and treating that as sent
             // would strand every byte before it
-            self.sent = self.sent.max(start + len);
+            let end = start + len;
+            new = end.saturating_sub(self.sent);
+            self.sent = self.sent.max(end);
         }
         if fin {
             self.fin_sent = true;
         }
+        new
+    }
+
+    /// Everything has been put in a packet at least once, the FIN included.
+    /// A peer that has answered has seen all of it, so a stream in this
+    /// state has nothing left that is worth a RESET_STREAM.
+    pub fn fully_sent(&self) -> bool {
+        self.fin && self.fin_sent && self.sent >= self.buf.len()
+    }
+
+    /// The peer has acknowledged everything, the FIN or the RESET_STREAM
+    /// included, so there is nothing left to send again and nothing the
+    /// peer can still ask about
+    pub fn is_settled(&self) -> bool {
+        if self.reset {
+            self.reset_acked
+        } else {
+            self.fin && self.fin_acked && self.buf.is_empty()
+        }
+    }
+
+    pub fn on_reset_acked(&mut self) {
+        self.reset_acked = true;
     }
 
     /// The peer acknowledged everything below `offset`, so it can be dropped
-    pub fn on_acked(&mut self, offset: u64, len: usize) {
+    pub fn on_acked(&mut self, offset: u64, len: usize, fin: bool) {
+        if fin {
+            self.fin_acked = true;
+        }
         let end = offset + len as u64;
         if end <= self.base_offset {
             return;
@@ -542,7 +587,7 @@ mod tests {
         assert_eq!((off, data, fin), (4, &b"ef"[..], true));
         s.on_sent(off, data.len(), fin);
         assert!(s.next_send(4).is_none(), "nothing left to send");
-        s.on_acked(0, 6);
+        s.on_acked(0, 6, true);
         assert!(
             s.next_send(4).is_none(),
             "and nothing comes back after the ack"
@@ -575,6 +620,26 @@ mod tests {
         s.on_lost(0, 4, false);
         let (off, data, _) = s.next_send(4).unwrap();
         assert_eq!((off, data), (0, &b"aaaa"[..]), "the lost run, not new data");
+        assert_eq!(
+            s.on_sent(off, data.len(), false),
+            0,
+            "offsets the peer has accounted for already"
+        );
+    }
+
+    /// Only bytes at offsets never sent before count against the
+    /// connection's window
+    #[test]
+    fn only_new_offsets_count_as_sent() {
+        let mut s = SendStream::new(100);
+        s.write(b"aaaabbbbcc");
+        s.finish();
+        let (off, data, fin) = s.next_send(4).unwrap();
+        assert_eq!(s.on_sent(off, data.len(), fin), 4);
+        let (off, data, fin) = s.next_send(100).unwrap();
+        assert_eq!((off, data.len(), fin), (4, 6, true));
+        assert_eq!(s.on_sent(off, data.len(), fin), 6);
+        assert_eq!(s.on_sent(10, 0, true), 0, "a bare FIN carries nothing");
     }
 
     /// A lost FIN has to be sent again too, or the peer waits forever
@@ -616,7 +681,7 @@ mod tests {
         s.write(&[b'x'; 500]);
         let (off, data, fin) = s.next_send(500).unwrap();
         s.on_sent(off, data.len(), fin);
-        s.on_acked(0, 200);
+        s.on_acked(0, 200, false);
         // The released prefix must not be resent, and the rest still can be
         s.on_lost(200, 300, false);
         let (off, data, _) = s.next_send(1000).unwrap();
@@ -629,8 +694,8 @@ mod tests {
     fn a_late_acknowledgement_of_released_data_is_ignored() {
         let mut s = SendStream::new(1000);
         s.write(b"abcdef");
-        s.on_acked(0, 3);
-        s.on_acked(0, 3);
+        s.on_acked(0, 3, false);
+        s.on_acked(0, 3, false);
         let (off, data, _) = s.next_send(100).unwrap();
         assert_eq!((off, data), (3, &b"def"[..]));
     }
