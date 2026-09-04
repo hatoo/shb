@@ -96,6 +96,18 @@ pub struct Args {
     #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
     pub timeout: Option<Duration>,
 
+    /// How many completions a worker holds out for, or 0 to work it out
+    ///
+    /// The other half of --batch-linger: the wait is when the kernel gives up
+    /// filling this, so a batch that fills at once never reaches it. Worked out
+    /// from the run otherwise - half of -p for HTTP/2, capped at 32, and a
+    /// quarter of the connections a worker has for HTTP/1.1 and HTTP/3, capped
+    /// at 8. Raising it is how HTTP/3 reaches --batch-linger at all, and is
+    /// also how to make it much slower: at one connection a worker, holding out
+    /// for 16 instead of 1 cost three quarters of the throughput.
+    #[arg(long, value_name = "COMPLETIONS", default_value_t = 0, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=4096))]
+    pub batch_size: usize,
+
     /// How long a worker may wait collecting completions, in microseconds
     ///
     /// A floor on one pass of the event loop, so a run's throughput is at most
@@ -106,10 +118,9 @@ pub struct Args {
     /// more CPU per request.
     ///
     /// Only bites where a worker holds out for more completions than arrive at
-    /// once, which in practice is HTTP/2 at more than a few streams: HTTP/1.1
-    /// and HTTP/3 hold out for a quarter of their connections, capped at
-    /// eight, and that many arrive together, so the wait is over before this
-    /// is reached.
+    /// once, which is --batch-size: left to itself that is HTTP/2 at more than
+    /// a few streams, and nothing else. Setting the two together is what
+    /// reaches the rest.
     #[arg(long, value_name = "MICROSECONDS", default_value_t = uring::DEFAULT_BATCH_LINGER, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..=1_000_000))]
     pub batch_linger: u32,
 
@@ -177,6 +188,7 @@ fn resolve_body(arg: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
 fn main() -> Result<()> {
     let args = Args::parse();
     uring::set_batch_linger(args.batch_linger);
+    uring::set_batch_size(args.batch_size);
     // curl semantics: -d implies POST unless a method was given explicitly
     let method = args
         .method

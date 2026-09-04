@@ -435,13 +435,18 @@ cheap:
   wait from showing up in the latencies as though the server had spent it.
 
   It is only felt where the batch cannot be filled at once, which is decided
-  by how many completions a worker holds out for rather than by the protocol.
+  by how many completions a worker holds out for - `--batch-size`, worked out
+  from the run unless it is given - rather than by the protocol.
   At 32 connections over 16 workers against that same server, going from 500us
   to 10us moves throughput 14% at a batch of 2, 5.8x at 16 and 2.4x at 32.
-  HTTP/1.1 and HTTP/3 never hold out for more than eight, and eight arrive
-  together, so the setting does nothing there - measured across four HTTP/3
-  configurations it moves nothing, and it still moves nothing with the QUIC
-  timers taken out of the wait.
+  Left to itself, HTTP/1.1 and HTTP/3 never hold out for more than eight, and
+  eight arrive together, so the wait does nothing there - measured across four
+  HTTP/3 configurations it moves nothing, and it still moves nothing with the
+  QUIC timers taken out of the wait. `--batch-size` is what reaches it: at 32
+  workers with one HTTP/3 connection each, holding out for 16 with the default
+  wait leaves 1.7M requests a second, and the same 16 with a 10us wait reaches
+  6.7M. Which is also the warning - a batch raised without shortening the wait
+  is the slowest thing either flag can do.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and

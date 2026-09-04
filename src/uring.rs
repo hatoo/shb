@@ -91,6 +91,29 @@ pub fn set_batch_linger(microseconds: u32) {
     BATCH_LINGER.store(microseconds, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How many completions a worker holds out for, when a run has said rather
+/// than left it to be worked out. Zero means the rules below.
+static BATCH_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set before any worker starts. Zero restores the derived size.
+pub fn set_batch_size(completions: usize) {
+    BATCH_OVERRIDE.store(completions, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a run asked for, if it asked, and if the kernel can hold out at all
+///
+/// Without `min_wait_usec` a batch it cannot fill blocks until the 100ms
+/// [`WAIT_TIMEOUT`], so asking for one there is worse than not asking.
+fn batch_override() -> Option<usize> {
+    if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match BATCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 /// Whether the kernel supports `min_wait_usec` (IORING_FEAT_MIN_TIMEOUT, 6.12+)
 static MIN_TIMEOUT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -111,6 +134,9 @@ const BATCH_SHARE: usize = 4;
 /// WAIT_TIMEOUT whenever it cannot be filled, which costs far more than the
 /// syscalls it saves, so fall back to waking on the first completion.
 pub fn batch_size(connections: usize) -> usize {
+    if let Some(n) = batch_override() {
+        return n;
+    }
     if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
         return 1;
     }
@@ -137,6 +163,9 @@ pub fn batch_size(connections: usize) -> usize {
 /// quarter-of-the-connections rule is safe: it only reaches for more where
 /// there is more to reach for.
 pub fn batch_size_multiplexed(parallel: usize) -> usize {
+    if let Some(n) = batch_override() {
+        return n;
+    }
     if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
         return 1;
     }
