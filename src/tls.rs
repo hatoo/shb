@@ -200,6 +200,12 @@ impl TlsSession {
         Ok(())
     }
 
+    /// Whether the handshake is still in progress, which is when plaintext
+    /// handed in is only buffered rather than encrypted and sent
+    pub fn is_handshaking(&self) -> bool {
+        self.conn.is_handshaking()
+    }
+
     /// Queue the close_notify alert, which is how a TLS connection says it
     /// has finished rather than failed (RFC 8446 Section 6.1)
     ///

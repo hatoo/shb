@@ -44,9 +44,21 @@ struct Conn {
     /// generation (e.g. a cancelled multishot recv) are identified via
     /// user_data and ignored
     generation: u64,
+    /// When the request in flight left for the socket, which is where its
+    /// latency counts from. Meaningless while `unsent` is set.
     request_start: Instant,
+    /// Whether the request in flight has yet to reach the socket. The clock
+    /// starts when it does: a latency is how long the server took to answer
+    /// the request, not how long the connection took to be ready for it, so
+    /// the TCP connect and the TLS handshake ahead of a first request are
+    /// not counted - which is also where wrk starts its timer. Leaving them
+    /// in put a handshake on every fiftieth sample of a `-c 50 -n 200` run
+    /// over TLS, and p90 at ten times p50.
+    unsent: bool,
     /// When the request in flight stops being worth waiting for, if --timeout
-    /// was given. None means nothing is outstanding.
+    /// was given. None means nothing is outstanding. Unlike the latency it
+    /// counts from when the request was decided on, so a connect that never
+    /// answers is given up on too.
     deadline: Option<Instant>,
 }
 
@@ -63,6 +75,7 @@ impl Conn {
             recv_armed: false,
             generation: 0,
             request_start: Instant::now(),
+            unsent: true,
             deadline: None,
         }
     }
@@ -126,8 +139,16 @@ impl Conn {
 
     /// Reset per-request state for the next request
     fn begin_request(&mut self, timeout: Option<Duration>) {
-        self.request_start = Instant::now();
-        self.deadline = timeout.map(|t| self.request_start + t);
+        self.unsent = true;
+        self.deadline = timeout.map(|t| Instant::now() + t);
+    }
+
+    /// The request's bytes are going to the socket: start its clock
+    fn mark_sent(&mut self) {
+        if self.unsent {
+            self.unsent = false;
+            self.request_start = Instant::now();
+        }
     }
 }
 
@@ -170,11 +191,18 @@ fn flush(
     if let Some(tls) = &mut conn.tls {
         tls.take_ciphertext_into(&mut conn.out)?;
         if !conn.out.is_empty() {
+            // Until the handshake is done the ciphertext is the handshake,
+            // and the request is only buffered behind it; the first flush
+            // after it finishes is the one that carries the request
+            if !tls.is_handshaking() {
+                conn.mark_sent();
+            }
             conn.out_off = 0;
             conn.sending = true;
             uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
         }
     } else if conn.out_off < conn.outbound(request).len() {
+        conn.mark_sent();
         conn.sending = true;
         let generation = conn.generation;
         uring::push_send_slice(
@@ -363,10 +391,9 @@ pub fn run_worker(
                         if let Some(setup) = tls_setup {
                             conn.tls = Some(TlsSession::new(setup)?);
                         }
-                        // Latency is measured from send start (excludes TCP
-                        // connect; the first request on a TLS connection does
-                        // include the handshake). This re-arms the response
-                        // deadline too, which a reconnect otherwise loses.
+                        // Re-arms the response deadline, which a reconnect
+                        // otherwise loses; the latency clock waits for the
+                        // request itself to leave
                         conn.begin_request(timeout);
                         queue_request(conn, &target.request_bytes)?;
                         flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
