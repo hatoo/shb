@@ -197,6 +197,10 @@ The default for `-t` is the number of physical cores on the machine running
 > accepts any certificate — which is what you want against a test server with a
 > self-signed cert, and what you must not rely on anywhere else.
 
+Every connection does a full TLS handshake: session resumption is off, so a
+`--disable-keepalive` run, or one that reconnects after a GOAWAY, costs the
+server what a fresh client would — the same thing wrk and h2load measure.
+
 ### Batching
 
 A worker waits for several completions at a time rather than one, so that one

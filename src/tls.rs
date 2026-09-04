@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -79,6 +80,15 @@ pub fn client_config(alpn: &[u8]) -> Result<Arc<ClientConfig>> {
         .with_custom_certificate_verifier(Arc::new(TrustAll(provider)))
         .with_no_client_auth();
     config.alpn_protocols = vec![alpn.to_vec()];
+    // Every connection does the full handshake. rustls resumes by default:
+    // it keeps the tickets a server issues in a cache shared by every
+    // connection built from this config, and the next one offers one as a
+    // PSK. With --disable-keepalive that made 17 of 20 handshakes against
+    // nginx resumed ones, so the server was measured doing something cheaper
+    // than it does for wrk or h2load, which start every connection from
+    // nothing. The cache was also a mutex taken twice per connection across
+    // all the worker threads.
+    config.resumption = Resumption::disabled();
     Ok(Arc::new(config))
 }
 
