@@ -1500,10 +1500,53 @@ fn a_silent_server_ends_an_http2_run_too() {
 ///
 /// The impairment is driven by a seeded generator, so a run that fails fails
 /// the same way again.
-fn impaired_h3_addr(loss_pct: u32, dup_pct: u32, reorder_pct: u32, seed: u64) -> SocketAddr {
+///
+/// With `gate_handshake` the server's Handshake packets are dropped - the
+/// ones coalesced behind its Initial by cutting the datagram there - until
+/// the client has sent a Handshake packet of its own. That is the shape of a
+/// server held to the amplification limit (RFC 9000 Section 8.1): it cannot
+/// get its Handshake flight through until the client's address is validated,
+/// and the client validates it by sending a Handshake packet.
+fn impaired_h3_addr(
+    loss_pct: u32,
+    dup_pct: u32,
+    reorder_pct: u32,
+    seed: u64,
+    gate_handshake: bool,
+) -> SocketAddr {
     use std::collections::HashMap;
     use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A QUIC variable-length integer (RFC 9000 Section 16)
+    fn varint(b: &[u8]) -> Option<(usize, usize)> {
+        let first = *b.first()?;
+        let n = 1 << (first >> 6);
+        let mut v = (first & 0x3f) as usize;
+        for i in 1..n {
+            v = (v << 8) | *b.get(i)? as usize;
+        }
+        Some((v, n))
+    }
+
+    /// Where the first packet of a datagram ends, if it has a long header:
+    /// the Length field is what makes coalescing possible, and what makes
+    /// cutting a datagram at a packet boundary possible too
+    fn long_packet_end(d: &[u8]) -> Option<usize> {
+        let mut pos = 5;
+        pos += 1 + *d.get(pos)? as usize;
+        pos += 1 + *d.get(pos)? as usize;
+        if d[0] & 0x30 == 0 {
+            let (token_len, n) = varint(d.get(pos..)?)?;
+            pos += n + token_len;
+        }
+        let (len, n) = varint(d.get(pos..)?)?;
+        pos += n + len;
+        (pos <= d.len()).then_some(pos)
+    }
+
+    let gate_open = Arc::new(AtomicBool::new(!gate_handshake));
 
     let upstream = h3_server_addr();
     let front = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("bind relay"));
@@ -1566,18 +1609,33 @@ fn impaired_h3_addr(loss_pct: u32, dup_pct: u32, reorder_pct: u32, seed: u64) ->
                     // sequence, so neither waits on the other
                     let back = Arc::clone(&s);
                     let out = Arc::clone(&f);
+                    let gate_open = Arc::clone(&gate_open);
                     std::thread::spawn(move || {
                         let mut rng = Rng(seed.rotate_left(32) | 1);
                         let mut held = None;
                         let mut buf = vec![0u8; 65535];
                         while let Ok(m) = back.recv(&mut buf) {
+                            let mut data = &buf[..m];
+                            // The top four bits of a long header are not
+                            // protected: 0xc is an Initial, 0xe a Handshake
+                            if !gate_open.load(Ordering::Relaxed) {
+                                match data[0] & 0xf0 {
+                                    0xe0 => continue,
+                                    0xc0 => {
+                                        if let Some(end) = long_packet_end(data) {
+                                            data = &data[..end];
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             relay(
                                 |d| {
                                     let _ = out.send_to(d, from);
                                 },
                                 &mut rng,
                                 &mut held,
-                                &buf[..m],
+                                data,
                                 loss_pct,
                                 dup_pct,
                                 reorder_pct,
@@ -1587,6 +1645,9 @@ fn impaired_h3_addr(loss_pct: u32, dup_pct: u32, reorder_pct: u32, seed: u64) ->
                     s
                 }))
             };
+            if buf[0] & 0xf0 == 0xe0 {
+                gate_open.store(true, Ordering::Relaxed);
+            }
             relay(
                 |d| {
                     let _ = up.send(d);
@@ -1606,7 +1667,7 @@ fn impaired_h3_addr(loss_pct: u32, dup_pct: u32, reorder_pct: u32, seed: u64) ->
 /// Five per cent of datagrams never arrive, in both directions
 #[test]
 fn h3_gets_through_a_lossy_path() {
-    let addr = impaired_h3_addr(5, 0, 0, 0x5eed);
+    let addr = impaired_h3_addr(5, 0, 0, 0x5eed, false);
     let url = format!("https://127.0.0.1:{}/", addr.port());
     let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
     assert_all_ok(&report, 40, "200");
@@ -1615,8 +1676,36 @@ fn h3_gets_through_a_lossy_path() {
 /// Datagrams arrive twice, or out of order, or not at all
 #[test]
 fn h3_gets_through_duplication_and_reordering() {
-    let addr = impaired_h3_addr(2, 10, 10, 0xd0e5);
+    let addr = impaired_h3_addr(2, 10, 10, 0xd0e5, false);
     let url = format!("https://127.0.0.1:{}/", addr.port());
     let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
     assert_all_ok(&report, 40, "200");
+}
+
+/// The server's Handshake flight does not get through until the client
+/// sends a Handshake packet of its own
+///
+/// After the server's Initial the client has Handshake keys, nothing in
+/// flight - its own Initial was just acknowledged - and nothing to send until
+/// the rest of the handshake arrives. RFC 9002 Section 6.2.2.1 has it arm a
+/// probe timer anyway and send a Handshake packet when it fires, because a
+/// server held to the amplification limit is waiting on exactly that. A
+/// client that only probes for packets in flight waits here for ever.
+#[test]
+fn h3_probes_for_a_handshake_flight_that_does_not_arrive() {
+    let addr = impaired_h3_addr(0, 0, 0, 0x9a7e, true);
+    let url = format!("https://127.0.0.1:{}/", addr.port());
+    let report = shb_json(&[
+        "--http3",
+        "--connect-timeout",
+        "3s",
+        "-n",
+        "4",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_all_ok(&report, 4, "200");
 }

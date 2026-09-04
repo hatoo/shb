@@ -320,11 +320,20 @@ impl Congestion {
 }
 
 /// Which space needs a probe next, and when (RFC 9002 Section 6.2)
+///
+/// `unacked_handshake` is the space to probe in when nothing is in flight.
+/// Until the peer has acknowledged a Handshake packet, a client keeps the
+/// timer armed regardless (Section 6.2.2.1): a server held to the
+/// amplification limit may be unable to send another byte until the client
+/// sends something, and with nothing in flight the client would otherwise
+/// never do so. That timer runs from the last ack-eliciting packet sent in
+/// any space.
 pub fn pto_deadline(
     spaces: &[&SentPackets; 3],
     rtt: &Rtt,
     max_ack_delay: Duration,
     pto_count: u32,
+    unacked_handshake: Option<Space>,
 ) -> Option<(Space, Instant)> {
     let mut best: Option<(Space, Instant)> = None;
     for (i, space) in Space::ALL.iter().enumerate() {
@@ -347,6 +356,15 @@ pub fn pto_deadline(
         if best.is_none_or(|(_, t)| at < t) {
             best = Some((*space, at));
         }
+    }
+    if best.is_none()
+        && let Some(space) = unacked_handshake
+        && let Some(last) = spaces.iter().filter_map(|s| s.last_ack_eliciting).max()
+    {
+        best = Some((
+            space,
+            last + rtt.pto(Duration::ZERO) * 2u32.saturating_pow(pto_count),
+        ));
     }
     best
 }
@@ -614,6 +632,7 @@ mod tests {
             &rtt,
             Duration::from_millis(25),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(space, Space::Initial, "the older one fires first");
@@ -625,10 +644,36 @@ mod tests {
                 &[&empty, &empty, &empty],
                 &rtt,
                 Duration::from_millis(25),
-                0
+                0,
+                None,
             )
             .is_none()
         );
+    }
+
+    /// RFC 9002 Section 6.2.2.1: with nothing in flight the timer still
+    /// runs while no Handshake packet has been acknowledged, from the last
+    /// ack-eliciting packet sent, in the space the caller names
+    #[test]
+    fn a_probe_is_armed_before_the_handshake_even_with_nothing_in_flight() {
+        let now = Instant::now();
+        let rtt = Rtt::default();
+        let mut initial = SentPackets::default();
+        initial.push(sent(0, now, true));
+        // Acknowledged: nothing in flight, but the time it was sent remains
+        initial.drain_acked(&[(0, 0)], &mut Vec::new());
+        let empty = SentPackets::default();
+        let spaces = [&initial, &empty, &empty];
+        assert!(pto_deadline(&spaces, &rtt, Duration::ZERO, 0, None).is_none());
+        let (space, at) = pto_deadline(&spaces, &rtt, Duration::ZERO, 1, Some(Space::Handshake))
+            .expect("armed for the handshake");
+        assert_eq!(space, Space::Handshake);
+        assert_eq!(at, now + rtt.pto(Duration::ZERO) * 2, "and backs off");
+
+        // Nothing ever sent: nothing to time from, and nothing to wait for
+        // either, since the next transmit sends
+        let nothing = [&empty, &empty, &empty];
+        assert!(pto_deadline(&nothing, &rtt, Duration::ZERO, 0, Some(Space::Initial)).is_none());
     }
 
     /// A packet carrying only an ACK does not arm the probe timer: there is
@@ -641,7 +686,7 @@ mod tests {
         assert!(!s.any_ack_eliciting());
         let rtt = Rtt::default();
         let empty = SentPackets::default();
-        assert!(pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0).is_none());
+        assert!(pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0, None).is_none());
     }
 
     #[test]
@@ -651,8 +696,10 @@ mod tests {
         s.push(sent(0, now, true));
         let rtt = Rtt::default();
         let empty = SentPackets::default();
-        let (_, first) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0).unwrap();
-        let (_, second) = pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 1).unwrap();
+        let (_, first) =
+            pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 0, None).unwrap();
+        let (_, second) =
+            pto_deadline(&[&s, &empty, &empty], &rtt, Duration::ZERO, 1, None).unwrap();
         // Exactly double, up to what the clock rounds off either deadline
         let (one, two) = (first - now, second - now);
         let drift = two.abs_diff(one * 2);

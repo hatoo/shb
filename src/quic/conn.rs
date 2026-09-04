@@ -212,6 +212,10 @@ pub struct Connection {
     /// peer's binds the peer
     local_idle_ms: u64,
     handshake_done: bool,
+    /// The peer has acknowledged a Handshake packet of ours, which is
+    /// what ends the probing RFC 9002 Section 6.2.2.1 asks for while
+    /// nothing is in flight
+    handshake_acked: bool,
     connected: bool,
     closed: Option<String>,
     /// A CONNECTION_CLOSE we still owe the peer
@@ -246,6 +250,10 @@ pub struct Connection {
     /// Probe packets owed to the current timeout, counted down as they are
     /// sent. Without this a probe goes out on every pass rather than once.
     pto_probes: u32,
+    /// The space they are owed in: RFC 9002 Section 6.2.4 wants the probe
+    /// in the space that timed out, and a PING in another space draws an
+    /// acknowledgement that says nothing about the packets waited on
+    pto_space: Space,
     loss_deadline: Option<Instant>,
     idle_deadline: Option<Instant>,
     events: VecDeque<Event>,
@@ -330,6 +338,7 @@ impl Connection {
             params: Params::default(),
             local_idle_ms: local_params.max_idle_timeout_ms,
             handshake_done: false,
+            handshake_acked: false,
             connected: false,
             closed: None,
             close_pending: None,
@@ -349,6 +358,7 @@ impl Connection {
             congestion: Congestion::default(),
             pto_count: 0,
             pto_probes: 0,
+            pto_space: Space::Initial,
             loss_deadline: None,
             idle_deadline: None,
             events: VecDeque::new(),
@@ -438,12 +448,13 @@ impl Connection {
             let produced = self.spaces[space as usize].crypto_out.len() != before;
             match change {
                 Some(KeyChange::Handshake { keys }) => {
+                    // The Initial keys stay until the first Handshake packet
+                    // goes out (RFC 9001 Section 4.9.1). Dropping them here
+                    // dropped the acknowledgement owed for the server's
+                    // Initial with them, and left a second server Initial -
+                    // the rest of a ServerHello too big for one packet, as
+                    // an ML-KEM key share makes it - unreadable.
                     self.spaces[Space::Handshake as usize].keys = Some(keys);
-                    // RFC 9001 Section 4.9.1: a client drops its Initial keys
-                    // as soon as it has Handshake ones. Keeping them means
-                    // every datagram carrying an Initial is padded to 1200
-                    // bytes, which leaves no room for anything else.
-                    self.discard_space(Space::Initial);
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt_local = Some(keys.local);
@@ -564,6 +575,16 @@ impl Connection {
                 pad_to
             };
             let wrote = self.write_packet(space, now, out, start, congested, pad)?;
+            if wrote
+                && space == Space::Handshake
+                && self.spaces[Space::Initial as usize].keys.is_some()
+            {
+                // RFC 9001 Section 4.9.1: a client discards its Initial keys
+                // when it first sends a Handshake packet. Every datagram
+                // carrying an Initial has to be padded to 1200 bytes, so
+                // holding them any longer would pad every datagram.
+                self.discard_space(Space::Initial);
+            }
             if wrote && pad.is_some() {
                 // The datagram is full of padding now, so nothing can be
                 // coalesced behind it; the next space goes in its own
@@ -812,7 +833,7 @@ impl Connection {
         // per pass instead of one per timeout floods the peer, and a server
         // that cannot keep up with the flood never answers, which keeps the
         // timeout raised.
-        if self.pto_probes > 0 && room(out) > 1 {
+        if self.pto_probes > 0 && space == self.pto_space && room(out) > 1 {
             self.pto_probes -= 1;
             if !ack_eliciting {
                 frame::put_ping(out);
@@ -1393,6 +1414,9 @@ impl Connection {
             self.acked = acked;
             return Ok(());
         }
+        if space == Space::Handshake {
+            self.handshake_acked = true;
+        }
         if let Some(newest) = acked.iter().find(|p| p.number == largest)
             && newest.ack_eliciting
         {
@@ -1882,12 +1906,28 @@ impl Connection {
             &self.rtt,
             Duration::from_millis(self.params.max_ack_delay_ms),
             self.pto_count,
+            self.pto_fallback(),
         )
         .map(|(_, at)| at);
         [self.loss_deadline, pto, self.idle_deadline]
             .into_iter()
             .flatten()
             .min()
+    }
+
+    /// Where to probe when nothing is in flight, while that still has to be
+    /// done: RFC 9002 Section 6.2.2.1 wants a Handshake packet if there are
+    /// keys for one and a padded Initial otherwise, until a Handshake packet
+    /// has been acknowledged or the handshake is confirmed
+    fn pto_fallback(&self) -> Option<Space> {
+        if self.handshake_done || self.handshake_acked {
+            return None;
+        }
+        Some(if self.spaces[Space::Handshake as usize].keys.is_some() {
+            Space::Handshake
+        } else {
+            Space::Initial
+        })
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
@@ -1925,6 +1965,7 @@ impl Connection {
             &self.rtt,
             Duration::from_millis(self.params.max_ack_delay_ms),
             self.pto_count,
+            self.pto_fallback(),
         );
         if let Some((space, at)) = due
             && now >= at
@@ -1933,12 +1974,16 @@ impl Connection {
             // unacknowledged data again. In a handshake space that means the
             // CRYPTO bytes: a PING would be answered with nothing, because a
             // peer that never received the ClientHello has no connection to
-            // answer about, and the connection would wait forever.
+            // answer about, and the connection would wait forever. With no
+            // CRYPTO bytes to send - Handshake keys but nothing yet to say
+            // with them - the probe is a PING, which is what validates our
+            // address to a server stuck at the amplification limit.
             self.spaces[space as usize].crypto_sent = 0;
             self.pto_count += 1;
             // RFC 9002 Section 6.2.4 allows two, which recovers a lost probe
             // without another timeout
             self.pto_probes = 2;
+            self.pto_space = space;
             self.needs_send = true;
         }
     }
@@ -2446,6 +2491,85 @@ mod tests {
         new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
         assert_eq!(conn.retire_pending, vec![1], "below the retirement point");
         assert!(!conn.peer_cids.iter().any(|c| c.seq == 1));
+    }
+
+    /// Stand in for the server's Initial having been read: Handshake keys,
+    /// derived from anything at all, since the peer here is the test
+    fn with_handshake_keys(conn: &mut Connection) {
+        conn.spaces[Space::Handshake as usize].keys =
+            Some(initial_keys(&[9; 8], rustls::Side::Client).unwrap());
+    }
+
+    /// RFC 9001 Section 4.9.1: the Initial keys go with the first Handshake
+    /// packet sent, not before. Until then the server's Initial still gets
+    /// acknowledged, and a second one can still be read.
+    #[test]
+    fn initial_keys_go_when_the_first_handshake_packet_is_sent() {
+        let mut conn = client();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // The ClientHello
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        // The server's Initial arrives: Handshake keys, an acknowledgement
+        // owed for it, and something to say with the new keys
+        with_handshake_keys(&mut conn);
+        conn.spaces[Space::Initial as usize]
+            .ack
+            .record(0, true, now);
+        conn.spaces[Space::Handshake as usize]
+            .crypto_out
+            .extend_from_slice(b"Finished");
+        out.clear();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        assert_eq!(out[0] & 0xf0, 0xc0, "the acknowledgement, in an Initial");
+        assert!(conn.spaces[Space::Initial as usize].keys.is_some());
+        out.clear();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        assert_eq!(out[0] & 0xf0, 0xe0, "a Handshake packet");
+        assert!(conn.spaces[Space::Initial as usize].keys.is_none());
+    }
+
+    /// RFC 9002 Section 6.2.2.1: with the Initial acknowledged and nothing
+    /// in flight the probe timer still runs until a Handshake packet has
+    /// been acknowledged, and the probe goes in the space it was armed for
+    #[test]
+    fn the_probe_timer_runs_before_the_handshake_with_nothing_in_flight() {
+        let mut conn = client();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        conn.on_ack(Space::Initial, 0, 0, 0, &[], now).unwrap();
+        assert_eq!(
+            conn.spaces[Space::Initial as usize].sent.bytes_in_flight(),
+            0
+        );
+        with_handshake_keys(&mut conn);
+
+        let at = conn.poll_timeout().expect("armed with nothing in flight");
+        assert!(
+            at < conn.idle_deadline.unwrap(),
+            "sooner than the connect timeout"
+        );
+        conn.handle_timeout(at);
+        assert_eq!(conn.pto_space, Space::Handshake, "a Handshake packet");
+        assert_eq!(conn.pto_probes, 2);
+
+        // The probe is a PING in that space, and nothing goes in another
+        let mut frames = Vec::new();
+        out.clear();
+        conn.fill_payload(Space::Initial, at, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        assert!(out.is_empty(), "nothing owed in the Initial space");
+        conn.fill_payload(Space::Handshake, at, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        assert_eq!(frames, vec![SentFrame::Ping]);
+
+        conn.handshake_acked = true;
+        assert_eq!(
+            conn.poll_timeout(),
+            conn.idle_deadline,
+            "once a Handshake packet is acknowledged only the idle timer is left"
+        );
     }
 
     /// RFC 9000 Section 10.2.3: a run ending while a connection is still
