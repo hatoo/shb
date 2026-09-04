@@ -534,11 +534,15 @@ fn start_stubborn_server() -> StubbornServer {
                         // is necessarily observed here
                         m.fetch_max(served, Ordering::Relaxed);
                         // No Connection header: HTTP/1.1 defaults to
-                        // keep-alive, whatever the request asked for
-                        if stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                            .is_err()
-                        {
+                        // keep-alive, whatever the request asked for. A
+                        // DELETE gets a 204 with no framing header at all,
+                        // which is how nginx sends one
+                        let response: &[u8] = if head.starts_with("delete ") {
+                            b"HTTP/1.1 204 No Content\r\n\r\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                        };
+                        if stream.write_all(response).is_err() {
                             break;
                         }
                     }
@@ -604,6 +608,25 @@ fn h1_keepalive_reuses_the_connection_by_default() {
         !server.saw_close_header.load(Ordering::Relaxed),
         "Connection: close should not be sent without --disable-keepalive"
     );
+    assert_eq!(
+        server.max_reqs_per_conn.load(Ordering::Relaxed),
+        20,
+        "all 20 requests should share one connection"
+    );
+}
+
+/// A 204 has neither Content-Length nor Transfer-Encoding, and used to be
+/// read as close-delimited for it, which put every request on a connection
+/// of its own: 50 connections for `-c 1 -n 50` against nginx
+#[test]
+fn h1_a_204_without_content_length_keeps_its_connection() {
+    use std::sync::atomic::Ordering;
+
+    let server = start_stubborn_server();
+    let url = format!("http://{}/", server.addr);
+    let report = shb_json(&["-m", "DELETE", "-n", "20", "-c", "1", "-t", "1", &url]);
+    assert_all_ok(&report, 20, "204");
+
     assert_eq!(
         server.max_reqs_per_conn.load(Ordering::Relaxed),
         20,

@@ -166,13 +166,17 @@ impl Parser {
                         continue;
                     }
                     self.status = status;
-                    // A close-delimited body ends with the connection itself
-                    self.keep_alive = keep_alive && body != Body::Eof;
                     let body = if self.head_request || no_body_status(status) {
                         Body::Exact(0)
                     } else {
                         body
                     };
+                    // A close-delimited body ends with the connection itself.
+                    // Decided on the body as it will actually be read: a 204
+                    // or a HEAD response without Content-Length ends at the
+                    // empty line, not at the close its headers would imply
+                    // (RFC 9112 Section 6.3), and nginx sends its 204s that way
+                    self.keep_alive = keep_alive && body != Body::Eof;
                     self.state = State::Body(body);
                 }
                 State::Body(Body::Exact(0)) => {
@@ -545,6 +549,26 @@ mod tests {
         let data = resp("HTTP/1.1 204 No Content\n\n");
         assert_eq!(p.feed(&data).unwrap(), 1);
         assert_eq!(p.status(), 204);
+    }
+
+    /// Read by its headers alone such a response is close-delimited, but it
+    /// has no body to delimit: the connection stays usable. nginx sends its
+    /// 204s exactly like this
+    #[test]
+    fn bodyless_responses_without_content_length_keep_alive() {
+        let mut p = Parser::new();
+        let data = resp("HTTP/1.1 204 No Content\nServer: nginx\n\n");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert!(p.keep_alive());
+
+        let mut p = Parser::new();
+        assert_eq!(p.feed(&resp("HTTP/1.1 304 Not Modified\n\n")).unwrap(), 1);
+        assert!(p.keep_alive());
+
+        let mut p = Parser::new();
+        p.set_head_request(true);
+        assert_eq!(p.feed(&resp("HTTP/1.1 200 OK\nServer: x\n\n")).unwrap(), 1);
+        assert!(p.keep_alive());
     }
 
     #[test]
