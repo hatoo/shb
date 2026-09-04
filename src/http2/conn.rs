@@ -66,7 +66,9 @@ const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
 /// run of 800 requests at 400 streams came back with 600 of them reset by
 /// httpd, h2o and nghttpx alike. Their limit is 100, which is the usual one,
 /// and assuming it costs nothing - the real figure arrives a round trip later
-/// and the next fill uses it.
+/// and the next fill uses it. It stands in for the peer's first SETTINGS and
+/// no longer: one that arrives without naming a limit has set none, and the
+/// assumption gives way to the unlimited the specification starts from.
 const ASSUMED_MAX_CONCURRENT: u32 = 100;
 /// Receive-window credit to hand back in one go, once this much has been used
 const WINDOW_REFRESH: u32 = 1 << 30;
@@ -563,6 +565,16 @@ impl Connection {
                 _ => {}
             }
         }
+        // The peer has now said what it will take, and if that said nothing
+        // about streams it takes any number: the limit is unlimited until a
+        // SETTINGS sets it (RFC 9113 Section 6.5.2), and this one has not.
+        // nghttp2 lifts its own guess of 100 the same way. Node's default
+        // server sends an empty SETTINGS, and a run at 200 streams a
+        // connection was held to 100 of them for its whole length.
+        if self.max_concurrent_assumed {
+            self.max_concurrent = u32::MAX;
+            self.max_concurrent_assumed = false;
+        }
         self.frame_header(0, SETTINGS, FLAG_ACK, 0);
         Ok(())
     }
@@ -570,10 +582,10 @@ impl Connection {
     /// REFUSED_STREAM means the peer never acted on the stream (RFC 9113
     /// Section 8.7), so the request goes back rather than into the error
     /// count. It also says the peer had all it would take when this stream
-    /// arrived, which matters while its SETTINGS has not said how many that
-    /// is - the first flight leaves before it has - so what is still open
-    /// below the refused stream becomes the figure to assume. Any other code
-    /// is a stream that went wrong, and stays an error.
+    /// arrived, which matters while its SETTINGS has not arrived to say how
+    /// many that is - the first flight leaves before it has - so what is
+    /// still open below the refused stream becomes the figure to assume. Any
+    /// other code is a stream that went wrong, and stays an error.
     fn on_rst_stream(
         &mut self,
         stream: u32,
@@ -1083,6 +1095,42 @@ mod tests {
             matches!(events[..], [Event::Reset { stream_id: 21 }]),
             "{events:?}"
         );
+    }
+
+    /// Node's default server sends an empty SETTINGS, and a run at 200
+    /// streams a connection against it never had more than 100 open: the
+    /// guess made for the first flight was being kept as if the peer had
+    /// confirmed it. RFC 9113 Section 6.5.2: unlimited until set.
+    #[test]
+    fn a_settings_that_names_no_stream_limit_lifts_the_assumption() {
+        let mut c = connected();
+        for _ in 0..ASSUMED_MAX_CONCURRENT {
+            c.start_stream(&[0x82], b"").unwrap();
+        }
+        assert!(!c.can_open(), "the assumption holds until the peer speaks");
+
+        let mut events = Vec::new();
+        c.feed(&frame(SETTINGS, 0, 0, &[]), &mut events).unwrap();
+        assert!(c.can_open());
+        assert_eq!(c.max_concurrent, u32::MAX);
+        for _ in 0..1000 {
+            c.start_stream(&[0x82], b"").unwrap();
+        }
+
+        // Having spoken, the peer's refusals no longer set the figure
+        c.take_output();
+        c.feed(
+            &frame(RST_STREAM, 0, 2201, &REFUSED_STREAM.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(c.max_concurrent, u32::MAX);
+
+        // And an ACK of ours is not the peer speaking
+        let mut c = connected();
+        c.feed(&frame(SETTINGS, FLAG_ACK, 0, &[]), &mut events)
+            .unwrap();
+        assert_eq!(c.max_concurrent, ASSUMED_MAX_CONCURRENT);
     }
 
     #[test]
