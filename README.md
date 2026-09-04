@@ -130,7 +130,7 @@ and `--disable-keepalive` only applies to HTTP/1.1.
 | `-H, --header` | — | Extra header, repeatable: `-H 'Name: Value'` |
 | `-d, --data` | — | Request body; `@file` reads a file, `@-` reads stdin |
 | `--connect-timeout` | `5s` | Connection establishment timeout |
-| `--timeout` | off | Give up on a response after this long; the request counts as an error and its connection is replaced |
+| `--timeout` | off | Give up on a response after this long; the request counts as an error and its connection is replaced. On HTTP/2 the same goes for a connection that has carried nothing for this long while requests are still owed |
 | `--disable-keepalive` | off | Reconnect for every request (HTTP/1.1 only) |
 | `--http2` | off | Use HTTP/2 |
 | `--http3` | off | Use HTTP/3 (requires an `https://` URL) |
@@ -270,11 +270,14 @@ Latency distribution:
 ```
 
 A request counts as an error when its stream is reset, its connection is
-lost, or its response never comes. One that an HTTP/3 server turns away
-unprocessed — on a stream at or above a GOAWAY's id, or reset with
-`H3_REQUEST_REJECTED` — is sent again on the replacement connection and
-counted once, when it is answered, with its latency measured from the
-resend.
+lost, or its response never comes. One that the server turns away
+unprocessed — on a stream above the last one a GOAWAY says it acted on, or
+reset with `REFUSED_STREAM` on HTTP/2 or `H3_REQUEST_REJECTED` on HTTP/3 —
+is sent again and counted once, when it is answered, with its latency
+measured from the resend. That is a server declining requests, however
+many; on HTTP/2 a connection that closes without having answered anything
+is a server declining the connection, and what it turned away on it counts
+as errors.
 
 `-j` prints the same run as JSON, with every latency in seconds:
 
