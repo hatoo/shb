@@ -278,6 +278,10 @@ pub struct Connection {
     local_uni: Vec<(u64, SendStream)>,
 
     rtt: Rtt,
+    /// When the first RTT sample was taken. Persistent congestion is only
+    /// declared for packets sent after it (RFC 9002 Section 7.6.2): before
+    /// there is a sample the duration it is measured against is a guess.
+    rtt_sampled_at: Option<Instant>,
     congestion: Congestion,
     pto_count: u32,
     /// Probe packets owed to the current timeout, counted down as they are
@@ -402,6 +406,7 @@ impl Connection {
             peer_uni: Vec::new(),
             local_uni: Vec::new(),
             rtt: Rtt::default(),
+            rtt_sampled_at: None,
             congestion: Congestion::default(),
             pto_count: 0,
             pto_probes: 0,
@@ -1545,6 +1550,9 @@ impl Connection {
             let delay = Duration::from_micros(delay << self.params.ack_delay_exponent);
             let max = Duration::from_millis(self.params.max_ack_delay_ms);
             self.rtt.update(sample, delay, max);
+            if self.rtt_sampled_at.is_none() {
+                self.rtt_sampled_at = Some(now);
+            }
         }
         let mut bytes = 0;
         for p in &acked {
@@ -1607,17 +1615,35 @@ impl Connection {
                 self.on_frame_lost(space, *f);
             }
         }
-        // RFC 9002 Section 7.6.1: two ack-eliciting packets, everything from
-        // one to the other lost, and long enough between them
-        let mut eliciting = lost.iter().filter(|p| p.ack_eliciting);
-        let (Some(first), Some(last)) = (eliciting.next(), eliciting.next_back()) else {
+        // RFC 9002 Section 7.6: a stretch longer than three PTOs in which
+        // every ack-eliciting packet was lost, and only after the first RTT
+        // sample, since before it the three PTOs are a guess. The stretch
+        // has to be unbroken: a packet between two lost ones that is not
+        // itself lost was acknowledged, or is still in flight, and either
+        // says the path was carrying something (Section 7.6.2). Lost
+        // packets arrive here in number order, so the stretch is a run of
+        // consecutive numbers.
+        let Some(sampled_at) = self.rtt_sampled_at else {
             return;
         };
         let duration = self
             .rtt
             .persistent_congestion_duration(Duration::from_millis(self.params.max_ack_delay_ms));
-        if last.time_sent.saturating_duration_since(first.time_sent) > duration {
-            self.congestion.on_persistent_congestion();
+        let mut first: Option<&SentPacket> = None;
+        let mut previous = None;
+        for p in lost {
+            if previous.is_some_and(|n| p.number != n + 1) {
+                first = None;
+            }
+            previous = Some(p.number);
+            if !p.ack_eliciting || p.time_sent < sampled_at {
+                continue;
+            }
+            let start = *first.get_or_insert(p);
+            if p.time_sent.saturating_duration_since(start.time_sent) > duration {
+                self.congestion.on_persistent_congestion();
+                return;
+            }
         }
     }
 
@@ -2685,10 +2711,20 @@ mod tests {
         }
     }
 
+    /// A connection with one RTT sample behind it, which is what
+    /// persistent congestion is measured against
+    fn sampled_connection(now: Instant) -> Connection {
+        let mut conn = test_connection();
+        conn.rtt
+            .update(Duration::from_millis(20), Duration::ZERO, Duration::ZERO);
+        conn.rtt_sampled_at = Some(now);
+        conn
+    }
+
     #[test]
     fn losing_everything_for_long_enough_collapses_the_window() {
-        let mut conn = test_connection();
         let now = Instant::now();
+        let mut conn = sampled_connection(now);
         let span = conn
             .rtt
             .persistent_congestion_duration(Duration::from_millis(conn.params.max_ack_delay_ms));
@@ -2702,6 +2738,29 @@ mod tests {
             crate::quic::recovery::MIN_WINDOW,
             "the path stopped carrying anything, so halving is not enough"
         );
+    }
+
+    /// RFC 9002 Section 7.6.2: not when a packet between the two was
+    /// acknowledged - the path carried that one - and not before the first
+    /// RTT sample, when the three PTOs are a guess (Appendix B.8)
+    #[test]
+    fn a_stretch_with_an_acknowledged_packet_in_it_is_not_persistent_congestion() {
+        let now = Instant::now();
+        let mut conn = sampled_connection(now);
+        let span = conn
+            .rtt
+            .persistent_congestion_duration(Duration::from_millis(conn.params.max_ack_delay_ms));
+        let floor = crate::quic::recovery::MIN_WINDOW;
+
+        // Packet 2, sent between them, is not in the lost set
+        let lost = [lost_packet(1, now), lost_packet(3, now + span + span)];
+        conn.on_lost_packets(Space::Data, &lost, now + span + span);
+        assert!(conn.congestion.window > floor, "something got through");
+
+        let mut conn = test_connection();
+        let lost = [lost_packet(1, now), lost_packet(2, now + span + span)];
+        conn.on_lost_packets(Space::Data, &lost, now + span + span);
+        assert!(conn.congestion.window > floor, "no RTT sample yet");
     }
 
     #[test]
