@@ -1286,6 +1286,11 @@ fn h3_server_addr() -> SocketAddr {
                                 else {
                                     return;
                                 };
+                                // A response that takes longer than a run is
+                                // willing to wait for
+                                if request.uri().path() == "/slow" {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
                                 // Drain the request body for the echo check
                                 let mut req_body = Vec::new();
                                 while let Ok(Some(mut chunk)) = stream.recv_data().await {
@@ -1682,6 +1687,36 @@ fn a_server_that_allows_no_streams_ends_an_http2_run_with_timeout() {
     ]);
     assert_eq!(report["requests"]["ok"], 0, "report: {report}");
     assert_eq!(report["requests"]["errors"], 8, "report: {report}");
+}
+
+/// And over HTTP/3, where giving up on a response closes the QUIC
+/// connection and opens another: the run ends at the timeout, not at the
+/// server's, and the requests in flight on the connection are the errors
+#[test]
+fn a_slow_response_ends_an_http3_run_at_its_timeout() {
+    let addr = h3_server_addr();
+    let url = format!("https://127.0.0.1:{}/slow", addr.port());
+    let start = std::time::Instant::now();
+    let report = shb_json(&[
+        "--http3",
+        "--timeout",
+        "500ms",
+        "-n",
+        "4",
+        "-c",
+        "1",
+        "-p",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 4, "report: {report}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "two connections' worth of timeouts, not the server's two seconds each"
+    );
 }
 
 /// A UDP relay in front of the HTTP/3 server that loses, duplicates and

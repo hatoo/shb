@@ -907,38 +907,6 @@ pub fn run_worker(
         cq.sync();
 
         let now = Instant::now();
-        // A response that never comes would otherwise hold the run open for
-        // ever: a wedged server is a result to report, not a reason to wait
-        if let Some(limit) = timeout {
-            for (conn_idx, conn) in conns.iter_mut().enumerate() {
-                if !conn
-                    .streams
-                    .iter()
-                    .any(|s| now.duration_since(s.start) >= limit)
-                {
-                    continue;
-                }
-                begin_close(
-                    &submitter,
-                    &mut sq,
-                    conn_idx,
-                    conn,
-                    &mut stats,
-                    &tls_config,
-                    connect_timeout,
-                    timeout,
-                    target,
-                    &mut started,
-                    budget,
-                    stop,
-                    &mut transmit_buf,
-                    gso,
-                    now,
-                    &mut retired,
-                )?;
-            }
-        }
-
         for cqe in &mut cq {
             let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
             if ud == TIMEOUT_USER_DATA {
@@ -1094,6 +1062,59 @@ pub fn run_worker(
                 gso,
             )?;
             if !alive {
+                begin_close(
+                    &submitter,
+                    &mut sq,
+                    conn_idx,
+                    conn,
+                    &mut stats,
+                    &tls_config,
+                    connect_timeout,
+                    timeout,
+                    target,
+                    &mut started,
+                    budget,
+                    stop,
+                    &mut transmit_buf,
+                    gso,
+                    now,
+                    &mut retired,
+                )?;
+            }
+        }
+
+        // A response that never comes would otherwise hold the run open for
+        // ever: a wedged server is a result to report, not a reason to wait.
+        // Looked at after the batch has been read, so that a response that
+        // arrived in it is not counted as one that never came. The server
+        // is told: it used to be left to find out from its idle timer,
+        // which for nginx meant "quic client timed out" in its log five
+        // seconds after every request shb gave up on.
+        if let Some(limit) = timeout {
+            for (conn_idx, conn) in conns.iter_mut().enumerate() {
+                if !conn
+                    .streams
+                    .iter()
+                    .any(|s| now.duration_since(s.start) >= limit)
+                {
+                    continue;
+                }
+                if let Some(quic) = conn.quic.as_mut() {
+                    // What the code means (RFC 9114 Section 8.1): the
+                    // connection goes because shb has cancelled what it was
+                    // waiting for on it, which a server's log can tell from
+                    // a client that was simply done
+                    quic.close(proto::H3_REQUEST_CANCELLED, b"");
+                }
+                pump_transmits(
+                    &submitter,
+                    &mut sq,
+                    conn_idx,
+                    conn,
+                    now,
+                    &mut transmit_buf,
+                    gso,
+                )?;
                 begin_close(
                     &submitter,
                     &mut sq,
