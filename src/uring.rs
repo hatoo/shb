@@ -128,8 +128,14 @@ pub fn batch_size(connections: usize) -> usize {
 ///
 /// The other two protocols keep to [`batch_size`]. HTTP/1.1 has one request
 /// per connection and so nothing to join; HTTP/3 joins its datagrams inside
-/// its own transmit pass, where waiting for more completions only delays them
-/// - measured at 32 x 32 it costs a third of the throughput.
+/// its own transmit pass, where waiting for more completions only delays them.
+/// Re-measured against a server costing 0.05us a request rather than the nginx
+/// the first measurement used, that is worse than it looked: at 32 workers and
+/// one connection each, holding out for 16 completions instead of 1 leaves
+/// 1.66M requests a second against 6.31M. Where a worker has connections to
+/// spare - 32 of them each - the number stops mattering, which is why the
+/// quarter-of-the-connections rule is safe: it only reaches for more where
+/// there is more to reach for.
 pub fn batch_size_multiplexed(parallel: usize) -> usize {
     if !MIN_TIMEOUT_OK.load(std::sync::atomic::Ordering::Relaxed) {
         return 1;
