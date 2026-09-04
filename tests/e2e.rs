@@ -936,6 +936,43 @@ fn h2_resends_the_streams_a_goaway_left_unprocessed() {
     assert_all_ok(&report, 200, "200");
 }
 
+/// A GOAWAY does not end the streams below its line, and a request body
+/// still leaving on one of them is still owed. The fill pass that pumps
+/// bodies used to return at the GOAWAY before pumping, so a body waiting on
+/// window credit never left, the server never answered, and the request
+/// timed out: three of them per connection here, where the credit for a
+/// body larger than the window arrives together with the GOAWAY.
+#[test]
+fn h2_finishes_sending_bodies_after_a_goaway() {
+    let addr = start_scripted_h2_server(H2Script {
+        streams_per_connection: Some(3),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let path = std::env::temp_dir().join("shb-e2e-goaway-body.txt");
+    std::fs::write(&path, vec![b'a'; 200_000]).unwrap();
+    let report = shb_json(&[
+        "--http2",
+        "-m",
+        "POST",
+        "-d",
+        &format!("@{}", path.display()),
+        "-p",
+        "32",
+        "-n",
+        "12",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_all_ok(&report, 12, "200");
+}
+
 /// Sending unprocessed requests again has to stop somewhere, or a server
 /// that processes nothing keeps a counted run going for ever. A run may
 /// retry as many requests as it was asked for plus one per completed

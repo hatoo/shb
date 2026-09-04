@@ -141,15 +141,17 @@ fn fill_streams(
     budget: Budget,
     stop: bool,
 ) {
-    if stop || conn.goaway {
-        return;
-    }
     let Some(h2) = conn.h2.as_mut() else {
         return;
     };
     // A body that did not fit the windows when its stream opened leaves as the
-    // peer grants credit, which is what has just arrived
+    // peer grants credit, which is what has just arrived. That holds after a
+    // GOAWAY too: the streams below its line are still going to be answered,
+    // and only once their bodies have arrived
     h2.pump_bodies(body);
+    if stop || conn.goaway {
+        return;
+    }
     while conn.streams.len() < parallel && budget.may_start(*started) {
         let Some(stream_id) = h2.start_stream(header_block, body) else {
             break;
