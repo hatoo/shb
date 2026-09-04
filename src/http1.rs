@@ -22,9 +22,9 @@ use crate::uring::{
 };
 
 struct Conn {
+    /// -1 when there is no connection: [`Conn::close`] puts it back, and a
+    /// successful Connect CQE is what makes it a socket again
     fd: RawFd,
-    /// Whether the TCP connection is established (true after a successful Connect CQE)
-    connected: bool,
     parser: Parser,
     /// TLS session (https URLs only; recreated per TCP connection)
     tls: Option<TlsSession>,
@@ -49,7 +49,6 @@ impl Conn {
     fn new() -> Self {
         Conn {
             fd: -1,
-            connected: false,
             parser: Parser::new(),
             tls: None,
             out: Vec::new(),
@@ -68,7 +67,6 @@ impl Conn {
             drop(unsafe { TcpStream::from_raw_fd(self.fd) });
             self.fd = -1;
         }
-        self.connected = false;
         self.recv_armed = false;
         self.sending = false;
         self.tls = None;
@@ -304,7 +302,6 @@ pub fn run_worker(
                         keep_conn = false;
                     } else {
                         let conn = &mut conns[conn_idx];
-                        conn.connected = true;
                         // Arm a connection-lifetime multishot recv right away
                         push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         if let Some(setup) = tls_setup {
@@ -441,7 +438,11 @@ pub fn run_worker(
                 if !stop && budget.may_start(started) {
                     started += 1;
                     conn.begin_request(timeout);
-                    if keep_conn && conn.connected {
+                    // Every path that finishes a request also says whether the
+                    // connection survives it, and none of them keeps one that
+                    // was never established
+                    debug_assert!(!keep_conn || conn.fd >= 0, "reusing a closed connection");
+                    if keep_conn {
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
