@@ -24,6 +24,8 @@ pub const STREAM_QPACK_ENCODER: u64 = 0x02;
 pub const STREAM_QPACK_DECODER: u64 = 0x03;
 
 // Error codes (RFC 9114 Section 8.1)
+/// Nothing went wrong; the connection is simply done with
+pub const H3_NO_ERROR: u64 = 0x100;
 /// The server never started on the request, so it can be sent again
 /// without anything happening twice
 pub const H3_REQUEST_REJECTED: u64 = 0x10b;

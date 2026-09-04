@@ -558,7 +558,7 @@ fn drive(
                 *started -= 1;
             }
             if conn.streams.is_empty() {
-                quic.close(0, b"");
+                quic.close(proto::H3_NO_ERROR, b"");
                 alive = false;
             }
         }
@@ -942,7 +942,7 @@ pub fn run_worker(
     let now = Instant::now();
     for conn in &mut conns {
         if let Some(quic) = conn.quic.as_mut() {
-            quic.close(0, b"");
+            quic.close(proto::H3_NO_ERROR, b"");
             transmit_buf.clear();
             if let Ok(n) = quic.poll_transmit(now, &mut transmit_buf, None)
                 && n > 0
