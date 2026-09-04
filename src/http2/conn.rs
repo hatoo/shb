@@ -328,10 +328,15 @@ impl Connection {
     }
 
     /// Queue a GOAWAY, so a clean teardown is not logged as an error by the peer
+    ///
+    /// The last stream id is the highest one the *peer* opened that we will
+    /// still act on (RFC 9113 Section 6.8), not the highest of ours. Push is
+    /// off, so the peer never opened one and the field is 0 - what curl and
+    /// h2load send. Naming our own last stream put an odd id there, and
+    /// nghttp2 logged a protocol error for every session shb closed.
     pub fn send_goaway(&mut self) {
-        let last = self.next_id.saturating_sub(2);
         self.frame_header(8, GOAWAY, 0, 0);
-        self.out.extend_from_slice(&last.to_be_bytes());
+        self.out.extend_from_slice(&0u32.to_be_bytes());
         self.out.extend_from_slice(&0u32.to_be_bytes());
     }
 
@@ -908,6 +913,24 @@ mod tests {
             .unwrap();
         assert!(matches!(events[0], Event::Goaway));
         assert!(c.start_stream(&[0x82], b"").is_none());
+    }
+
+    /// A client has no stream of the server's to name, so the field is 0
+    /// whatever it has opened itself
+    #[test]
+    fn our_goaway_names_no_stream() {
+        let mut c = connected();
+        c.start_stream(&[0x82], b"").unwrap();
+        c.start_stream(&[0x82], b"").unwrap();
+        c.take_output();
+        c.send_goaway();
+        let out = c.take_output().unwrap();
+        assert_eq!(out[3], GOAWAY);
+        assert_eq!(
+            &out[FRAME_HEADER_LEN..],
+            &[0u8; 8],
+            "last stream 0, NO_ERROR"
+        );
     }
 
     #[test]

@@ -591,8 +591,33 @@ pub fn run_worker(
     // Best-effort GOAWAY before closing so servers do not log our teardown as
     // a connection error. The frame is tiny, so a non-blocking send on the raw
     // fd is enough; if the socket buffer is full we just close as before.
+    //
+    // It has to follow what the ring is sending rather than land in the
+    // middle of it. The sends the last flush pushed were never submitted, and
+    // a TCP send completes at submission unless the socket buffer is full, so
+    // one submit that does not wait finishes nearly all of them; a connection
+    // whose send is still not done gets no GOAWAY and is closed as before.
+    sq.sync();
+    let _ = uring::submit_and_wait_timeout(&submitter, Duration::ZERO, 1);
+    cq.sync();
+    for cqe in &mut cq {
+        let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
+        if let Some(bid) = cqueue::buffer_select(flags) {
+            buf_ring.recycle(bid);
+        }
+        if ud == TIMEOUT_USER_DATA {
+            continue;
+        }
+        let (op, conn_idx, generation) = uring::decode_user_data(ud);
+        let conn = &mut conns[conn_idx];
+        if op == OP_SEND && generation == conn.generation && res > 0 {
+            conn.out_off += res as usize;
+            conn.sending = conn.out_off < conn.out.len();
+        }
+    }
     for conn in &mut conns {
         if conn.connected
+            && !conn.sending
             && let Some(h2) = conn.h2.as_mut()
         {
             h2.send_goaway();
