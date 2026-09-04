@@ -105,7 +105,10 @@ pub fn parse_target(
             .split_once(':')
             .with_context(|| format!("invalid header (expected \"Name: Value\"): {header}"))?;
         let name = name.trim();
-        let value = value.trim_start();
+        // Whitespace around a value is not part of it (RFC 9110 Section
+        // 5.5), and a trailing space that HTTP/1.1 would shrug off makes an
+        // HTTP/2 or HTTP/3 field malformed (RFC 9113 Section 8.2.1)
+        let value = value.trim();
         if name.is_empty() {
             bail!("invalid header (empty name): {header}");
         }
@@ -313,6 +316,14 @@ mod tests {
             req(&["Accept: application/json", "X-A: 1"], "GET", None),
             "GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:8111\r\n\
              Accept: application/json\r\nX-A: 1\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn whitespace_around_a_header_value_is_dropped() {
+        assert_eq!(
+            req(&["X-A:  a b  ", "X-B:\tc\t"], "GET", None),
+            "GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:8111\r\nX-A: a b\r\nX-B: c\r\n\r\n"
         );
     }
 
