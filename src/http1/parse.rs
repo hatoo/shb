@@ -254,12 +254,29 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
     let Some(nl) = memchr(b'\n', buf) else {
         return Ok(None);
     };
-    // "HTTP/1.1 200 OK" — the status code is always at the same offset
-    if buf.len() < 12 || !buf.starts_with(b"HTTP/1.") {
+    // "HTTP/1.1 200 OK": HTTP-version SP status-code SP reason-phrase, the
+    // version being "HTTP/1." and one digit (RFC 9112 Section 4), so the
+    // status code is always at the same offset. The line runs at least to
+    // the end of the code, and the newline found above says it is all here.
+    if nl < 12 || !buf.starts_with(b"HTTP/1.") {
         bail!("not an HTTP/1.x response");
     }
-    let http_1_0 = buf[7] == b'0';
+    let http_1_0 = match buf[7] {
+        b'0' => true,
+        b'1' => false,
+        // "HTTP/1.9", or a two-digit minor that happened to start with a 1
+        _ => bail!("unsupported HTTP version"),
+    };
+    if buf[8] != b' ' {
+        bail!("malformed status line");
+    }
     let status = parse_status(&buf[9..12])?;
+    // A space and the reason phrase follow, but some servers send the code
+    // and the line ending alone, and that is readable; a fourth digit is not
+    match buf[12] {
+        b' ' | b'\r' | b'\n' => {}
+        _ => bail!("malformed status line"),
+    }
     let mut pos = nl + 1;
     let mut content_length: Option<u64> = None;
     let mut te_present = false;
@@ -724,6 +741,43 @@ mod tests {
     fn non_http_response_is_rejected() {
         let mut p = Parser::new();
         assert!(p.feed(b"gibberish that is long enough\r\n\r\n").is_err());
+    }
+
+    /// The version is "HTTP/1." and one digit, then one space, then three
+    /// digits (RFC 9112 Section 4); anything else in those twelve bytes is
+    /// not a response, however it goes on
+    #[test]
+    fn status_line_shape_is_checked() {
+        for line in [
+            "HTTP/1.9 200 OK",
+            "HTTP/1.10 200 OK",
+            "HTTP/1.1X200 OK",
+            "HTTP/1.1  200 OK",
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.1 200OK",
+            "HTTP/1.1 20 OK",
+            "HTTP/2.0 200 OK",
+            "HTTP/1.1",
+            "HTTP/1.1 200",
+        ] {
+            let mut p = Parser::new();
+            let data = resp(&format!("{line}\nContent-Length: 2\n\nok"));
+            let bad = line != "HTTP/1.1 200";
+            assert_eq!(p.feed(&data).is_err(), bad, "{line:?}");
+        }
+    }
+
+    /// The reason phrase is optional and some servers leave out the space
+    /// before the line ending too
+    #[test]
+    fn a_missing_reason_phrase_is_fine() {
+        for head in ["HTTP/1.1 200 \r\n", "HTTP/1.1 200\r\n", "HTTP/1.1 200\n"] {
+            let mut p = Parser::new();
+            let mut data = head.as_bytes().to_vec();
+            data.extend_from_slice(b"Content-Length: 2\r\n\r\nok");
+            assert_eq!(p.feed(&data).unwrap(), 1, "{head:?}");
+            assert_eq!(p.status(), 200);
+        }
     }
 
     #[test]
