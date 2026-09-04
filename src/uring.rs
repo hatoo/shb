@@ -122,10 +122,12 @@ static MIN_TIMEOUT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// A completion is what lets its connection issue the next request, so waiting
 /// on a batch stalls that fraction of the worker's pipeline. Waiting for a
 /// quarter of the connections amortises the syscall without the batch ever
-/// needing a full round trip to fill. Measured against a server fast enough to
-/// keep shb on the critical path: a quarter is 7-14% ahead of waiting for all
-/// of them at 3 to 6 connections per worker, and within noise from 12 up,
-/// where the cap of 8 applies either way.
+/// needing a full round trip to fill. Re-measured against a server costing
+/// 0.05us a request: a quarter is 60% ahead of waiting for all of them at 3
+/// connections a worker and 10% ahead at 6, and within noise from 12 up, where
+/// the cap of 8 applies either way. It was 7-14% against nginx, so the rule
+/// holds either side of the trade below - this is what a run gets when it says
+/// nothing, and [`set_batch_size`] is how it says otherwise.
 const BATCH_SHARE: usize = 4;
 
 /// How many CQEs one io_uring_enter should wait for
@@ -149,8 +151,18 @@ pub fn batch_size(connections: usize) -> usize {
 /// only if their completions are handled in one pass and the connection is
 /// flushed once afterwards. The more streams a connection carries, the more
 /// completions land together and the more there is to join up: at 32 streams
-/// this cuts kernel time per request from 11.5 to 3.1 microseconds and adds
-/// nothing to the median latency.
+/// and a server that is itself the bottleneck this cuts kernel time per
+/// request from 9.5 to 2.8 microseconds and adds nothing to the median
+/// latency.
+///
+/// The sign flips where the server is not the bottleneck, for the same reason
+/// the wait above does. A `min_complete` of 1 does not mean one completion an
+/// `io_uring_enter`; it means not waiting for a second, and the kernel still
+/// returns everything ready. Where completions are plentiful there is nothing
+/// left to batch and the holding out is all cost: against a server costing
+/// 0.05us a request, at 32 streams, a batch of 16 spends 0.588us of kernel
+/// time a request against 1's 0.353 and reaches 8.6M requests a second against
+/// 15.3M - measured with the wait held short, so that only the batching is.
 ///
 /// The other two protocols keep to [`batch_size`]. HTTP/1.1 has one request
 /// per connection and so nothing to join; HTTP/3 joins its datagrams inside

@@ -649,9 +649,12 @@ pub fn run_worker(
                         quic.handle_timeout(now);
                         expired = true;
                     } else {
-                        // Wait exactly until the nearest QUIC timer (often the
-                        // pacer, microseconds away): rounding it up would
-                        // quantize the pacing rate and stall the connection
+                        // Wait exactly until the nearest QUIC timer - loss
+                        // detection, the probe timeout or the idle deadline -
+                        // rather than rounding up to the poll interval, which
+                        // would quantize when a loss is noticed. There is no
+                        // pacer here to be one of them: sending is gated by a
+                        // congestion window, not a rate.
                         wait = wait.min(deadline - now);
                         break;
                     }
