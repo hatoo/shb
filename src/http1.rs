@@ -80,6 +80,7 @@ impl Conn {
 
     fn close(&mut self) {
         if self.fd >= 0 {
+            self.send_close_notify();
             // Close by turning the fd back into a TcpStream and dropping it
             drop(unsafe { TcpStream::from_raw_fd(self.fd) });
             self.fd = -1;
@@ -92,6 +93,35 @@ impl Conn {
         self.out_off = 0;
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
+    }
+
+    /// Best-effort close_notify before the socket goes, so a TLS server sees
+    /// a connection that finished rather than one that was cut off (RFC 8446
+    /// Section 6.1): OpenSSL 3 logs the bare FIN as an unexpected EOF. The
+    /// alert is one small record, so a non-blocking send on the raw fd is
+    /// enough, and if the socket buffer is full it closes as it did before.
+    /// The send buffer is the kernel's while a send is in flight, and a
+    /// connection closed mid-send is being torn down for an error, so that
+    /// case keeps the bare close.
+    fn send_close_notify(&mut self) {
+        let Some(tls) = &mut self.tls else {
+            return;
+        };
+        if self.sending {
+            return;
+        }
+        tls.send_close_notify();
+        if tls.take_ciphertext_into(&mut self.out).is_err() || self.out.is_empty() {
+            return;
+        }
+        unsafe {
+            libc::send(
+                self.fd,
+                self.out.as_ptr() as *const libc::c_void,
+                self.out.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            );
+        }
     }
 
     /// Reset per-request state for the next request

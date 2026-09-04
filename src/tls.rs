@@ -200,6 +200,17 @@ impl TlsSession {
         Ok(())
     }
 
+    /// Queue the close_notify alert, which is how a TLS connection says it
+    /// has finished rather than failed (RFC 8446 Section 6.1)
+    ///
+    /// Anything still waiting to be encrypted is dropped: the alert means
+    /// nothing follows it, and the peer would discard what did. The bytes
+    /// come out of the next ciphertext drain like anything else.
+    pub fn send_close_notify(&mut self) {
+        self.pending_plaintext.clear();
+        self.conn.send_close_notify();
+    }
+
     /// Drain pending ciphertext (handshake messages included) into a reusable
     /// send buffer.
     pub fn take_ciphertext_into(&mut self, out: &mut Vec<u8>) -> Result<()> {
@@ -228,5 +239,110 @@ impl TlsSession {
         let mut out = Vec::new();
         self.take_ciphertext_into(&mut out)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use rustls::{ServerConfig, ServerConnection};
+
+    use super::*;
+
+    /// A server for the client under test to talk to, in memory
+    fn server() -> ServerConnection {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
+        ServerConnection::new(Arc::new(config)).unwrap()
+    }
+
+    /// Carry one flight each way until neither side has anything to send
+    fn handshake(client: &mut TlsSession, server: &mut ServerConnection) {
+        let mut scratch = vec![0u8; 16 * 1024];
+        for _ in 0..8 {
+            let to_server = client.take_ciphertext().unwrap();
+            if !to_server.is_empty() {
+                server.read_tls(&mut &to_server[..]).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut to_client = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut to_client).unwrap();
+            }
+            if to_client.is_empty() && to_server.is_empty() {
+                break;
+            }
+            client
+                .feed_into(&to_client, &mut scratch, |_| Ok(()))
+                .unwrap();
+        }
+        assert!(!client.conn.is_handshaking());
+        assert!(!server.is_handshaking());
+    }
+
+    /// Once the socket closes, the server reads a clean end of stream
+    /// rather than an error, which is what distinguishes a connection that
+    /// finished from one that was cut off
+    #[test]
+    fn close_notify_makes_the_eof_a_clean_one() {
+        let setup = setup("localhost", b"http/1.1").unwrap();
+        let mut client = TlsSession::new(&setup).unwrap();
+        let mut server = server();
+        handshake(&mut client, &mut server);
+
+        client.send_close_notify();
+        let bytes = client.take_ciphertext().unwrap();
+        // Exactly one record. Under TLS 1.3 its type is encrypted with the
+        // rest, so what it says is left to the server to read.
+        assert_eq!(
+            bytes.len(),
+            5 + u16::from_be_bytes([bytes[3], bytes[4]]) as usize
+        );
+        server.read_tls(&mut &bytes[..]).unwrap();
+        server.process_new_packets().unwrap();
+
+        // Then the socket closes
+        assert_eq!(server.read_tls(&mut &[][..]).unwrap(), 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(server.reader().read(&mut buf).unwrap(), 0, "a clean EOF");
+    }
+
+    /// Without the alert the same close is an error, which is what
+    /// OpenSSL 3 servers were logging
+    #[test]
+    fn a_bare_close_is_an_unexpected_eof() {
+        let setup = setup("localhost", b"http/1.1").unwrap();
+        let mut client = TlsSession::new(&setup).unwrap();
+        let mut server = server();
+        handshake(&mut client, &mut server);
+
+        assert_eq!(server.read_tls(&mut &[][..]).unwrap(), 0);
+        let mut buf = [0u8; 16];
+        let err = server.reader().read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Plaintext the client had not managed to encrypt yet must not follow
+    /// the alert onto the wire
+    #[test]
+    fn close_notify_discards_unsent_plaintext() {
+        let setup = setup("localhost", b"http/1.1").unwrap();
+        let mut client = TlsSession::new(&setup).unwrap();
+        // Before the handshake rustls only buffers, and refuses past 64 KiB,
+        // so this leaves a backlog behind
+        client.write_plaintext(&vec![b'x'; 100 * 1024]).unwrap();
+        assert!(!client.pending_plaintext.is_empty());
+        client.send_close_notify();
+        assert!(client.pending_plaintext.is_empty());
     }
 }
