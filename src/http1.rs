@@ -216,6 +216,17 @@ fn flush(
     Ok(())
 }
 
+/// The stream ended: a close-delimited body completes normally here, and
+/// anything else was cut short
+fn finish_at_eof(conn: &mut Conn, stats: &mut Stats) {
+    if conn.parser.mark_eof() {
+        stats.record_success(conn.parser.status(), conn.request_start);
+        conn.deadline = None;
+    } else {
+        stats.errors += 1;
+    }
+}
+
 fn push_recv_multi(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
@@ -465,13 +476,7 @@ pub fn run_worker(
                         if let Some(bid) = cqueue::buffer_select(flags) {
                             buf_ring.recycle(bid);
                         }
-                        // EOF: a close-delimited body completes normally here
-                        if conn.parser.mark_eof() {
-                            stats.record_success(conn.parser.status(), conn.request_start);
-                            conn.deadline = None;
-                        } else {
-                            stats.errors += 1;
-                        }
+                        finish_at_eof(conn, &mut stats);
                         request_finished = true;
                         keep_conn = false;
                     } else {
@@ -499,6 +504,14 @@ pub fn run_worker(
                         };
                         buf_ring.recycle(bid);
                         match done {
+                            // The server's close_notify ends the stream as
+                            // a FIN would, and the FIN may not follow until
+                            // it has ours
+                            Ok(0) if conn.tls.as_ref().is_some_and(|t| t.peer_closed()) => {
+                                finish_at_eof(conn, &mut stats);
+                                request_finished = true;
+                                keep_conn = false;
+                            }
                             Ok(0) => {
                                 if !conn.recv_armed {
                                     push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;

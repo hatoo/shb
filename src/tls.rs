@@ -111,6 +111,8 @@ pub struct TlsSession {
     conn: ClientConnection,
     /// Plaintext rustls would not take yet, offered again on every flush
     pending_plaintext: Vec<u8>,
+    /// Whether the peer's close_notify has arrived
+    peer_closed: bool,
 }
 
 impl TlsSession {
@@ -119,6 +121,7 @@ impl TlsSession {
             conn: ClientConnection::new(setup.config.clone(), setup.server_name.clone())
                 .context("failed to create TLS session")?,
             pending_plaintext: Vec::new(),
+            peer_closed: false,
         })
     }
 
@@ -144,9 +147,11 @@ impl TlsSession {
             if n == 0 {
                 break;
             }
-            self.conn
+            let state = self
+                .conn
                 .process_new_packets()
                 .map_err(|e| anyhow::anyhow!("TLS error: {e}"))?;
+            self.peer_closed |= state.peer_has_closed();
             loop {
                 let n = self.read_plaintext(scratch)?;
                 if n == 0 {
@@ -156,6 +161,17 @@ impl TlsSession {
             }
         }
         Ok(())
+    }
+
+    /// Whether the peer has sent close_notify, after which no more plaintext
+    /// can come (RFC 8446 Section 6.1)
+    ///
+    /// The end of the stream, for a body that runs to it - which is not the
+    /// same moment as the socket's: a server doing a two-way shutdown sends
+    /// the alert and then waits for ours before it closes, so a client that
+    /// only counts the FIN waits with it.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed
     }
 
     /// Read decrypted plaintext into buf; Ok(0) means none is available
@@ -336,6 +352,34 @@ mod tests {
         let mut buf = [0u8; 16];
         let err = server.reader().read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The server's close_notify is the end of the stream, whatever the
+    /// socket does afterwards
+    #[test]
+    fn the_peers_close_notify_is_reported() {
+        let setup = setup("localhost", b"http/1.1").unwrap();
+        let mut client = TlsSession::new(&setup).unwrap();
+        let mut server = server();
+        handshake(&mut client, &mut server);
+        assert!(!client.peer_closed());
+
+        server.writer().write_all(b"tail of a body").unwrap();
+        server.send_close_notify();
+        let mut bytes = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut bytes).unwrap();
+        }
+        let mut scratch = vec![0u8; 1024];
+        let mut got = Vec::new();
+        client
+            .feed_into(&bytes, &mut scratch, |b| {
+                got.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, b"tail of a body", "the data ahead of the alert");
+        assert!(client.peer_closed());
     }
 
     /// Plaintext the client had not managed to encrypt yet must not follow
