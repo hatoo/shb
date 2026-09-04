@@ -1361,7 +1361,13 @@ impl Connection {
             self.needs_send = true;
             return Ok(());
         }
-        if self.peer_cids.iter().any(|c| c.seq == seq) {
+        if let Some(known) = self.peer_cids.iter().find(|c| c.seq == seq) {
+            // A repeat has to be a repeat: the same sequence number with a
+            // different connection ID or token is PROTOCOL_VIOLATION (RFC
+            // 9000 Section 19.15), since one of the two is not the peer's
+            if known.cid.as_slice() != cid || known.token.is_some_and(|t| Some(t) != token) {
+                bail!("NEW_CONNECTION_ID repeats sequence number {seq} with different contents");
+            }
             return Ok(());
         }
         if retire_prior_to > self.retire_prior_to {
@@ -3065,6 +3071,33 @@ mod tests {
         with_handshake_cid(&mut conn, &[0; 8]);
         assert!(new_cid(&mut conn, 1, 0, &[]).is_err(), "zero length");
         assert!(new_cid(&mut conn, 1, 2, &[1; 8]).is_err(), "retires itself");
+    }
+
+    /// RFC 9000 Section 19.15: a sequence number seen again has to carry
+    /// the same connection ID and the same token, or the frame is not the
+    /// peer's. A repeat of a lost frame is ordinary and ignored.
+    #[test]
+    fn a_repeated_sequence_number_must_repeat_its_contents() {
+        let mut conn = client();
+        with_handshake_cid(&mut conn, &[0; 8]);
+        new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
+        new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
+        assert_eq!(conn.peer_cids.len(), 2, "the repeat changes nothing");
+        assert!(
+            new_cid(&mut conn, 1, 0, &[2; 8]).is_err(),
+            "a different connection ID"
+        );
+        let other_token = conn.handle_frame(
+            Space::Data,
+            Frame::NewConnectionId {
+                seq: 1,
+                retire_prior_to: 0,
+                cid: &[1; 8],
+                reset_token: &[9; 16],
+            },
+            Instant::now(),
+        );
+        assert!(other_token.is_err(), "a different token");
     }
 
     /// RFC 9000 Section 6.2: a Version Negotiation packet is heeded only
