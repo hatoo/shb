@@ -716,6 +716,11 @@ struct H2Script {
     /// opens with the dynamic table size update RFC 7541 Section 4.2 says it
     /// must. That is what nghttp2 does.
     header_table_size_zero: bool,
+    /// Act on this many streams per connection and no more: the first one
+    /// past the line draws a GOAWAY naming the last one acted on, streams
+    /// above it are never answered, and the connection closes once those
+    /// below it have been. That is nginx's keepalive_requests.
+    streams_per_connection: Option<u32>,
 }
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -749,7 +754,18 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
     const FLAG_ACK: u8 = 0x1;
     const FLAG_END_STREAM: u8 = 0x1;
     const FLAG_END_HEADERS: u8 = 0x4;
+    const NO_ERROR: u32 = 0x0;
     const COMPRESSION_ERROR: u32 = 0x9;
+
+    let goaway = |last: u32, code: u32| {
+        let mut payload = last.to_be_bytes().to_vec();
+        payload.extend_from_slice(&code.to_be_bytes());
+        h2_frame(GOAWAY, 0, 0, &payload)
+    };
+    // The highest stream id this connection acts on
+    let last_stream = script
+        .streams_per_connection
+        .map_or(u32::MAX, |n| (2 * n).saturating_sub(1));
 
     let mut settings = Vec::new();
     if script.header_table_size_zero {
@@ -770,6 +786,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
     let mut size_update_due = false;
     // Streams whose request body has not finished arriving
     let mut awaiting_body: Vec<u32> = Vec::new();
+    let mut goaway_sent = false;
     loop {
         match sock.read(&mut chunk) {
             Ok(0) | Err(_) => return,
@@ -818,10 +835,15 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
                     if std::mem::take(&mut size_update_due)
                         && payload.first().map(|b| b & 0xe0) != Some(0x20)
                     {
-                        let mut goaway = 0u32.to_be_bytes().to_vec();
-                        goaway.extend_from_slice(&COMPRESSION_ERROR.to_be_bytes());
-                        let _ = sock.write_all(&h2_frame(GOAWAY, 0, 0, &goaway));
+                        let _ = sock.write_all(&goaway(0, COMPRESSION_ERROR));
                         return;
+                    }
+                    if stream > last_stream {
+                        if !goaway_sent {
+                            out.extend_from_slice(&goaway(last_stream, NO_ERROR));
+                            goaway_sent = true;
+                        }
+                        continue;
                     }
                     if flags & FLAG_END_STREAM != 0 {
                         respond(&mut out, stream);
@@ -829,6 +851,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
                         awaiting_body.push(stream);
                     }
                 }
+                DATA if stream > last_stream => {}
                 DATA => {
                     // Credit goes straight back, on both windows
                     let credit = (len as u32).to_be_bytes();
@@ -848,6 +871,9 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
         if sock.write_all(&out).is_err() {
             return;
         }
+        if goaway_sent && awaiting_body.is_empty() {
+            return;
+        }
     }
 }
 
@@ -860,6 +886,7 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
 fn h2_shrinks_its_encoder_table_when_the_server_cuts_it() {
     let addr = start_scripted_h2_server(H2Script {
         header_table_size_zero: true,
+        ..H2Script::default()
     });
     let url = format!("http://{addr}/");
     let report = shb_json(&[
@@ -877,6 +904,65 @@ fn h2_shrinks_its_encoder_table_when_the_server_cuts_it() {
         &url,
     ]);
     assert_all_ok(&report, 100, "200");
+}
+
+/// A GOAWAY names the last stream the server acted on, and RFC 9113 Section
+/// 8.7 says the ones above it may be sent again: they were never looked at.
+/// They were being counted as errors when the server then closed - nginx
+/// with keepalive_requests 20 failed 1100 of 2000 requests at 32 streams a
+/// connection - so the server here does what nginx does and the run has to
+/// come out whole.
+#[test]
+fn h2_resends_the_streams_a_goaway_left_unprocessed() {
+    let addr = start_scripted_h2_server(H2Script {
+        streams_per_connection: Some(20),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "32",
+        "-n",
+        "200",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_all_ok(&report, 200, "200");
+}
+
+/// Sending unprocessed requests again has to stop somewhere, or a server
+/// that processes nothing keeps a counted run going for ever. A run may
+/// retry as many requests as it was asked for plus one per completed
+/// request, so this one ends with every request an error.
+#[test]
+fn h2_a_server_that_acts_on_nothing_still_ends_the_run() {
+    let addr = start_scripted_h2_server(H2Script {
+        streams_per_connection: Some(0),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "4",
+        "-n",
+        "20",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 20, "report: {report}");
 }
 
 // ------------------------------------------------------------------------

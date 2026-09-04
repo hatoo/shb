@@ -76,6 +76,9 @@ pub enum Event {
     End { stream_id: u32 },
     /// The peer gave up on this stream
     Reset { stream_id: u32 },
+    /// The peer never acted on this stream, so the request is not lost: it
+    /// can be sent again as if for the first time (RFC 9113 Section 8.7)
+    Unprocessed { stream_id: u32 },
     /// No more streams may be opened on this connection
     Goaway,
 }
@@ -417,10 +420,7 @@ impl Connection {
                         events.push(Event::Reset { stream_id: stream });
                     }
                 }
-                GOAWAY => {
-                    self.goaway = true;
-                    events.push(Event::Goaway);
-                }
+                GOAWAY => self.on_goaway(payload, events)?,
                 // PRIORITY and anything unknown are ignored, as the spec allows
                 _ => {}
             }
@@ -557,6 +557,35 @@ impl Connection {
             }
         }
         self.frame_header(0, SETTINGS, FLAG_ACK, 0);
+        Ok(())
+    }
+
+    /// The last stream id says which of our streams the peer will still
+    /// answer: everything above it was never looked at (RFC 9113 Section
+    /// 6.8), and nginx sends one for every keepalive_requests-th connection
+    /// with a window's worth of streams above the line. Those are retired
+    /// here as unprocessed rather than left to be failed when the peer
+    /// closes; the ones at or below the line are answered in the ordinary
+    /// way, and the connection is replaced once they have been.
+    fn on_goaway(&mut self, payload: &[u8], events: &mut Vec<Event>) -> Result<()> {
+        if payload.len() < 8 {
+            bail!("malformed GOAWAY");
+        }
+        let last = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+        // The error code follows; a load generator has no different answer
+        // to a GOAWAY that blames it than to one that does not
+        self.goaway = true;
+        let unprocessed: Vec<u32> = self
+            .open
+            .iter()
+            .filter(|s| s.id > last)
+            .map(|s| s.id)
+            .collect();
+        for id in unprocessed {
+            self.open.take(id as u64);
+            events.push(Event::Unprocessed { stream_id: id });
+        }
+        events.push(Event::Goaway);
         Ok(())
     }
 
@@ -913,6 +942,65 @@ mod tests {
             .unwrap();
         assert!(matches!(events[0], Event::Goaway));
         assert!(c.start_stream(&[0x82], b"").is_none());
+    }
+
+    /// nginx with keepalive_requests 20 and 32 streams in flight: the GOAWAY
+    /// names stream 39, and 1, 3 .. 39 are still answered while 41 onwards
+    /// never were. Those come back as unprocessed the moment the GOAWAY is
+    /// read, and the answered ones end as they always did.
+    #[test]
+    fn goaway_gives_back_the_streams_above_its_last_stream_id() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            c.start_stream(&[0x82], b"").unwrap();
+        }
+        c.take_output();
+        // Last stream 3, NO_ERROR
+        c.feed(&frame(GOAWAY, 0, 0, &[0, 0, 0, 3, 0, 0, 0, 0]), &mut events)
+            .unwrap();
+        let unprocessed: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Unprocessed { stream_id } => Some(*stream_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unprocessed, [5, 7]);
+        assert!(matches!(events.last(), Some(Event::Goaway)));
+
+        // 1 and 3 are still the peer's to answer
+        events.clear();
+        c.feed(
+            &frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &[0x88]),
+            &mut events,
+        )
+        .unwrap();
+        assert!(
+            matches!(events[1], Event::End { stream_id: 3 }),
+            "{events:?}"
+        );
+        // And a late answer on a stream given back is not a second ending
+        events.clear();
+        c.feed(
+            &frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 5, &[0x88]),
+            &mut events,
+        )
+        .unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::End { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_goaway_is_malformed() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        assert!(
+            c.feed(&frame(GOAWAY, 0, 0, &[0, 0, 0, 1]), &mut events)
+                .is_err()
+        );
     }
 
     /// A client has no stream of the server's to name, so the field is 0

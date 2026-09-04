@@ -215,7 +215,24 @@ fn flush(
 /// Turn the connection's events into statistics
 ///
 /// A request is found by its stream number, which is where its slot is.
-fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
+///
+/// A request the peer never acted on goes back to the budget rather than to
+/// either count, and the next fill sends it again as a new request - timed
+/// from then, since what the first attempt measured was a server declining
+/// to look at it. A counted run may do that as many times as it has requests,
+/// plus once for every request that has completed: a server that acts on
+/// some of what it is sent is never cut off, however many it turns away
+/// (nginx turns away more than it answers at 32 streams against a
+/// keepalive_requests of 20), and one that acts on nothing ends the run
+/// with errors instead of keeping it going for ever.
+fn process_events(
+    conn: &mut Conn,
+    events: &[Event],
+    stats: &mut Stats,
+    budget: Budget,
+    started: &mut u64,
+    retried: &mut u64,
+) {
     for event in events {
         match *event {
             Event::Status { stream_id, status } => {
@@ -239,6 +256,19 @@ fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats) {
             Event::Reset { stream_id } => {
                 if conn.streams.take(stream_id as u64).is_some() {
                     stats.errors += 1;
+                }
+            }
+            Event::Unprocessed { stream_id } => {
+                if conn.streams.take(stream_id as u64).is_some() {
+                    if budget
+                        .expected_requests()
+                        .is_none_or(|n| *retried < n + stats.completed)
+                    {
+                        *retried += 1;
+                        *started -= 1;
+                    } else {
+                        stats.errors += 1;
+                    }
                 }
             }
             Event::Goaway => conn.goaway = true,
@@ -305,6 +335,8 @@ pub fn run_worker(
     // attempts also consume one unit of the request budget so that -n
     // terminates when the server is unreachable.
     let mut started: u64 = 0;
+    // Requests sent again because the peer never acted on them
+    let mut retried: u64 = 0;
 
     // Held for its lifetime: the SQE points at it until the run is over
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
@@ -524,12 +556,21 @@ pub fn run_worker(
                             }
                         };
                         buf_ring.recycle(bid);
-                        process_events(conn, &events, &mut stats);
+                        process_events(
+                            conn,
+                            &events,
+                            &mut stats,
+                            budget,
+                            &mut started,
+                            &mut retried,
+                        );
                         if !feed_ok {
                             conn.fail_inflight(&mut stats);
                             conn_broken = true;
                         } else if conn.goaway && conn.streams.is_empty() {
-                            // GOAWAY and every in-flight stream has drained
+                            // GOAWAY and every stream the peer was still
+                            // going to answer has been answered: nothing is
+                            // gained by waiting for it to close
                             conn_broken = true;
                         } else {
                             fill_streams(
