@@ -213,6 +213,14 @@ pub struct Connection {
     retire_pending: Vec<u64>,
     /// RESET_STREAM frames still to send, as (stream, error, final size)
     reset_pending: Vec<(u64, u64, u64)>,
+    /// Streams owed a MAX_STREAM_DATA: within half a window of their limit,
+    /// or the last one sent was lost
+    credit_pending: Vec<u64>,
+    /// A MAX_DATA is owed, for the same two reasons
+    max_data_owed: bool,
+    /// What a stream is promised to begin with, and how far ahead of what
+    /// has been read its limit is kept
+    stream_window: u64,
 
     params: Params,
     /// The max_idle_timeout shb advertised, which binds it as much as the
@@ -246,6 +254,8 @@ pub struct Connection {
 
     /// Connection-level flow control
     max_data_local: u64,
+    /// How far ahead of what has arrived the limit is kept
+    max_data_window: u64,
     data_received: u64,
     max_data_peer: u64,
     data_sent: u64,
@@ -355,6 +365,9 @@ impl Connection {
             retire_prior_to: 0,
             retire_pending: Vec::new(),
             reset_pending: Vec::new(),
+            credit_pending: Vec::new(),
+            max_data_owed: false,
+            stream_window: local_params.initial_max_stream_data,
             original_dcid: initial_dcid,
             retry_token: Vec::new(),
             retried: false,
@@ -373,6 +386,7 @@ impl Connection {
             closed: None,
             close_pending: None,
             max_data_local: local_params.initial_max_data,
+            max_data_window: local_params.initial_max_data,
             data_received: 0,
             max_data_peer: 0,
             data_sent: 0,
@@ -908,9 +922,34 @@ impl Connection {
 
         // Hand the peer more connection-level credit once it has used enough
         // of what it has that another window would not arrive in time
-        if self.data_received + self.max_data_local / 2 > self.max_data_local && room(out) > 16 {
-            self.max_data_local += self.data_received;
+        let window = self.max_data_window;
+        if self.data_received + window / 2 >= self.max_data_local {
+            self.max_data_local = self.data_received + window;
+            self.max_data_owed = true;
+        }
+        if self.max_data_owed && room(out) > 16 {
             frame::put_max_data(out, self.max_data_local);
+            frames.push(SentFrame::MaxData(self.max_data_local));
+            self.max_data_owed = false;
+            ack_eliciting = true;
+        }
+
+        // And per stream. Without this a single response could never be
+        // longer than the window a stream starts with: a 1.2 GB body over
+        // HTTP/3 stopped at a gigabyte, where HTTP/2 finished.
+        while let Some(&id) = self.credit_pending.last() {
+            if room(out) < 24 {
+                break;
+            }
+            self.credit_pending.pop();
+            // Retired since, or ended: nothing is owed any more
+            let window = self.stream_window;
+            let Some(recv) = self.recv_mut(id).filter(|r| !r.size_known()) else {
+                continue;
+            };
+            let limit = recv.grant(window);
+            frame::put_max_stream_data(out, id, limit);
+            frames.push(SentFrame::MaxStreamData { id, limit });
             ack_eliciting = true;
         }
 
@@ -1581,7 +1620,9 @@ impl Connection {
             SentFrame::Ping
             | SentFrame::Crypto { .. }
             | SentFrame::RetireConnectionId(_)
-            | SentFrame::ResetStream { .. } => {}
+            | SentFrame::ResetStream { .. }
+            | SentFrame::MaxData(_)
+            | SentFrame::MaxStreamData { .. } => {}
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -1603,6 +1644,9 @@ impl Connection {
                 error,
                 final_size,
             } => self.reset_pending.push((id, error, final_size)),
+            // Sent again with the current limit, not the lost one
+            SentFrame::MaxData(_) => self.max_data_owed = true,
+            SentFrame::MaxStreamData { id, .. } => self.queue_credit(id),
             SentFrame::Crypto { offset, len } => {
                 // Rewind to the lost run. Anything after it goes out again
                 // too, which costs a little bandwidth once and avoids
@@ -1889,7 +1933,7 @@ impl Connection {
         let (send_buf, recv_buf) = self.spare_bufs.pop().unwrap_or_default();
         self.streams.push_back(Some(StreamPair {
             send: SendStream::with_buf(limit, send_buf),
-            recv: RecvStream::with_buf(recv_buf),
+            recv: RecvStream::with_buf(self.stream_window, recv_buf),
             finished: false,
             queued: false,
         }));
@@ -1944,15 +1988,40 @@ impl Connection {
         self.queue_send(id);
     }
 
+    /// The receive half of a stream, wherever it lives
+    fn recv_mut(&mut self, id: u64) -> Option<&mut RecvStream> {
+        if let Some(i) = self.stream_index(id) {
+            return self.streams[i].as_mut().map(|pair| &mut pair.recv);
+        }
+        self.peer_uni
+            .iter_mut()
+            .find(|(uid, _)| *uid == id)
+            .map(|(_, recv)| recv)
+    }
+
+    /// Note that a stream is owed a MAX_STREAM_DATA. Whether it still is
+    /// when a packet is built is checked then.
+    fn queue_credit(&mut self, id: u64) {
+        if !self.credit_pending.contains(&id) {
+            self.credit_pending.push(id);
+        }
+    }
+
     /// Show what a stream has ready without copying it out first
+    ///
+    /// Reading is what frees credit, so this is where a stream nearing its
+    /// limit is noted for a MAX_STREAM_DATA
     pub fn consume(&mut self, id: u64, f: impl FnOnce(&[u8]) -> Result<()>) -> Result<usize> {
-        if let Some(pair) = self.stream_mut(id) {
-            return pair.recv.consume(f);
+        let window = self.stream_window;
+        let Some(recv) = self.recv_mut(id) else {
+            return Ok(0);
+        };
+        let n = recv.consume(f)?;
+        if recv.wants_credit(window) {
+            self.queue_credit(id);
+            self.needs_send = true;
         }
-        if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
-            return recv.consume(f);
-        }
-        Ok(0)
+        Ok(n)
     }
 
     /// Say a stream has data, unless the last event said the same
@@ -2031,7 +2100,8 @@ impl Connection {
             let pos = match self.peer_uni.iter().position(|(i, _)| *i == id) {
                 Some(pos) => pos,
                 None => {
-                    self.peer_uni.push((id, RecvStream::default()));
+                    self.peer_uni
+                        .push((id, RecvStream::new(self.stream_window)));
                     self.events.push_back(Event::Opened(id));
                     self.peer_uni.len() - 1
                 }
@@ -3141,6 +3211,100 @@ mod tests {
             Some(received + Duration::from_secs(1) + idle),
             "a receive lets the next send restart it again"
         );
+    }
+
+    /// A response longer than the window a stream starts with needs the
+    /// limit raised, and a raise that is lost needs sending again with the
+    /// current value (RFC 9000 Section 13.3) - or the peer stalls for good.
+    /// A 1.2 GB body over HTTP/3 stopped at a gigabyte.
+    #[test]
+    fn stream_credit_is_raised_at_half_the_window_and_sent_again_if_lost() {
+        let mut conn = client();
+        conn.max_streams_bidi = 1;
+        conn.params.initial_max_stream_data_bidi_remote = 1000;
+        conn.max_data_peer = 1000;
+        let window = 1 << 20;
+        let (id, _) = conn.send_oneshot(b"request").unwrap();
+        let body = vec![0u8; window / 2];
+        conn.on_stream(id, 0, &body, false).unwrap();
+        let mut got = 0;
+        conn.consume(id, |data| {
+            got += data.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, window / 2);
+        assert_eq!(conn.credit_pending, vec![id], "half the window read");
+
+        // The packet carries the request and the connection's own credit
+        // too; only the stream's is of interest here
+        fn credit(frames: &[SentFrame]) -> Vec<SentFrame> {
+            frames
+                .iter()
+                .copied()
+                .filter(|f| matches!(f, SentFrame::MaxStreamData { .. }))
+                .collect()
+        }
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let limit = window as u64 / 2 + window as u64;
+        let expected = SentFrame::MaxStreamData { id, limit };
+        assert_eq!(
+            credit(&frames),
+            vec![expected],
+            "a window past what was read"
+        );
+        assert!(
+            frame::Iter::new(&out).any(|f| matches!(
+                f,
+                Ok(Frame::MaxStreamData { id: i, limit: l }) if i == id && l == limit
+            )),
+            "and it is on the wire"
+        );
+        assert!(conn.credit_pending.is_empty());
+
+        conn.on_frame_lost(Space::Data, expected);
+        assert_eq!(conn.credit_pending, vec![id]);
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert_eq!(credit(&frames), vec![expected], "sent again after the loss");
+
+        // Once the end of the stream is known nothing more is owed
+        conn.on_frame_lost(Space::Data, expected);
+        conn.on_stream(id, window as u64 / 2, b"", true).unwrap();
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert!(credit(&frames).is_empty());
+    }
+
+    /// The same for the connection as a whole: a lost MAX_DATA is sent
+    /// again with the current limit
+    #[test]
+    fn connection_credit_is_recorded_as_sent_and_sent_again_if_lost() {
+        let mut conn = client();
+        let window = 1u64 << 20;
+        conn.data_received = window / 2 + 1;
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let limit = window / 2 + 1 + window;
+        assert_eq!(frames, vec![SentFrame::MaxData(limit)]);
+        assert_eq!(conn.max_data_local, limit);
+
+        conn.data_received += 10;
+        conn.on_frame_lost(Space::Data, SentFrame::MaxData(limit));
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert_eq!(frames, vec![SentFrame::MaxData(limit)], "the current value");
     }
 
     /// RFC 9000 Section 10.1.2: a PING before the effective idle timeout

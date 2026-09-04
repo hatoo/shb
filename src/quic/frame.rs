@@ -415,11 +415,6 @@ pub fn put_max_data(out: &mut Vec<u8>, limit: u64) {
     put_varint(out, limit);
 }
 
-/// Only the decoder side of this is used in anger: shb reads MAX_STREAM_DATA
-/// from the peer but never sends one, since it grants stream credit once
-/// through the transport parameters and never revises it. The encoder is here
-/// so the decoder can be round-tripped.
-#[cfg(test)]
 pub fn put_max_stream_data(out: &mut Vec<u8>, id: u64, limit: u64) {
     put_varint(out, MAX_STREAM_DATA);
     put_varint(out, id);

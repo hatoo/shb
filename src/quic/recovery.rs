@@ -42,9 +42,10 @@ pub struct SentPacket {
     pub frames: Vec<SentFrame>,
 }
 
-/// The parts of a packet that have to be recovered if it is lost. Frames the
-/// peer will learn about another way - ACK, MAX_DATA - are deliberately not
-/// here: resending stale flow control credit is worse than useless.
+/// The parts of a packet that have to be recovered if it is lost. An ACK is
+/// deliberately not here: the next one carries the same ranges. The flow
+/// control frames are, but what goes out again is not the lost value: it is
+/// the current one (RFC 9000 Section 13.3), since a limit grows only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SentFrame {
     Crypto {
@@ -68,6 +69,14 @@ pub enum SentFrame {
         id: u64,
         error: u64,
         final_size: u64,
+    },
+    /// Connection-level credit; a peer that never hears of it stalls at the
+    /// old limit for good, since nothing else raises it
+    MaxData(u64),
+    /// Credit for one stream, the same way
+    MaxStreamData {
+        id: u64,
+        limit: u64,
     },
 }
 

@@ -246,11 +246,14 @@ pub struct RecvStream {
     final_size: Option<u64>,
     /// Total bytes delivered, for connection-level flow control accounting
     received: u64,
+    /// The most the peer may send on this stream, as last told
+    max_data: u64,
 }
 
 impl RecvStream {
-    /// The receiving half of [`SendStream::with_buf`]
-    pub fn with_buf(mut ready: Vec<u8>) -> Self {
+    /// The receiving half of [`SendStream::with_buf`]. `window` is what the
+    /// transport parameters promised the peer for a stream.
+    pub fn with_buf(window: u64, mut ready: Vec<u8>) -> Self {
         ready.clear();
         ready.shrink_to(POOLED_CAPACITY);
         Self {
@@ -259,7 +262,28 @@ impl RecvStream {
             pending: Vec::new(),
             final_size: None,
             received: 0,
+            max_data: window,
         }
+    }
+
+    pub fn new(window: u64) -> Self {
+        Self::with_buf(window, Vec::new())
+    }
+
+    /// Whether the peer is within half a window of the limit it was given.
+    /// A limit raised only once it is reached would stall the stream for a
+    /// round trip each time; raised at the halfway mark, the new one is
+    /// there before the old one runs out. Nothing is owed once the end is
+    /// known (RFC 9000 Section 13.3).
+    pub fn wants_credit(&self, window: u64) -> bool {
+        !self.size_known() && self.read_offset + window / 2 >= self.max_data
+    }
+
+    /// Raise the limit to a window past what has been read, and say what
+    /// it is now so that it can be sent
+    pub fn grant(&mut self, window: u64) -> u64 {
+        self.max_data = self.max_data.max(self.read_offset + window);
+        self.max_data
     }
 
     pub fn take_buf(&mut self) -> Vec<u8> {
@@ -328,6 +352,12 @@ impl RecvStream {
         self.ready.clear();
         self.read_offset += n as u64;
         Ok(n)
+    }
+
+    /// The peer has said where the stream ends, so no more credit is owed
+    /// on it (RFC 9000 Section 13.3)
+    pub fn size_known(&self) -> bool {
+        self.final_size.is_some()
     }
 
     pub fn is_finished(&self) -> bool {
