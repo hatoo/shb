@@ -35,10 +35,20 @@ pub enum Incoming<'a> {
         end: usize,
     },
     Retry {
+        /// The Retry's Destination Connection ID, which a genuine one sets
+        /// to the Source Connection ID of the Initial it answers
+        dcid: ConnectionId,
         scid: ConnectionId,
         token: &'a [u8],
     },
-    VersionNegotiation,
+    VersionNegotiation {
+        /// The two connection IDs, for the client to check the packet is a
+        /// reply to its own Initial (RFC 9000 Section 6.2)
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        /// The versions the server offered, four bytes each
+        versions: &'a [u8],
+    },
 }
 
 /// Parse one packet's framing out of a datagram. Datagrams can hold several
@@ -72,6 +82,7 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
     if dcid_len > MAX_CID_LEN || buf.len() < pos + dcid_len + 1 {
         bail!("long header destination connection ID is bad");
     }
+    let dcid = ConnectionId::new(&buf[pos..pos + dcid_len])?;
     pos += dcid_len;
     let scid_len = buf[pos] as usize;
     pos += 1;
@@ -83,7 +94,12 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
 
     // Version zero means the peer does not speak ours (RFC 9000 Section 17.2.1)
     if version == 0 {
-        return Ok(Incoming::VersionNegotiation);
+        // The rest is the list of versions it does speak, four bytes each
+        return Ok(Incoming::VersionNegotiation {
+            dcid,
+            scid,
+            versions: &buf[pos..buf.len() - (buf.len() - pos) % 4],
+        });
     }
     if version != VERSION_1 {
         bail!("unsupported QUIC version {version:#x}");
@@ -98,6 +114,7 @@ pub fn decode_header(buf: &[u8], local_cid_len: usize) -> Result<Incoming<'_>> {
             // a client that follows a Retry
             let split = buf.len() - 16;
             Ok(Incoming::Retry {
+                dcid,
                 scid,
                 token: &buf[pos..split],
             })
@@ -335,13 +352,24 @@ mod tests {
     fn version_negotiation_is_recognised() {
         let mut buf = vec![0x80];
         buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.push(0);
-        buf.push(0);
+        buf.push(2);
+        buf.extend_from_slice(&[0xaa, 0xbb]); // dcid
+        buf.push(3);
+        buf.extend_from_slice(&[1, 2, 3]); // scid
         buf.extend_from_slice(&VERSION_1.to_be_bytes());
-        assert!(matches!(
-            decode_header(&buf, 0).unwrap(),
-            Incoming::VersionNegotiation
-        ));
+        buf.extend_from_slice(&0xdeadbeefu32.to_be_bytes());
+        let Incoming::VersionNegotiation {
+            dcid,
+            scid,
+            versions,
+        } = decode_header(&buf, 0).unwrap()
+        else {
+            panic!("expected a Version Negotiation packet");
+        };
+        assert_eq!(dcid.as_slice(), &[0xaa, 0xbb]);
+        assert_eq!(scid.as_slice(), &[1, 2, 3]);
+        assert_eq!(versions.len(), 8, "the two versions it offered");
+        assert_eq!(&versions[..4], &VERSION_1.to_be_bytes());
     }
 
     #[test]
@@ -353,9 +381,10 @@ mod tests {
         buf.extend_from_slice(&[0xab, 0xcd]);
         buf.extend_from_slice(b"token");
         buf.extend_from_slice(&[0xee; 16]);
-        let Incoming::Retry { scid, token } = decode_header(&buf, 0).unwrap() else {
+        let Incoming::Retry { dcid, scid, token } = decode_header(&buf, 0).unwrap() else {
             panic!("expected a Retry");
         };
+        assert_eq!(dcid.len(), 0, "no destination CID in this one");
         assert_eq!(scid.as_slice(), &[0xab, 0xcd]);
         assert_eq!(token, b"token", "the tag is split off the end");
     }

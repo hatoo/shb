@@ -19,8 +19,10 @@ const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
 const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
 const ACK_DELAY_EXPONENT: u64 = 0x0a;
 const MAX_ACK_DELAY: u64 = 0x0b;
+const ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
 const ACTIVE_CONNECTION_ID_LIMIT_ID: u64 = 0x0e;
 const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
+const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
 
 /// How many of the peer's connection IDs shb will hold at once (RFC 9000
 /// Section 18.2). The minimum: a client that never migrates needs one, and
@@ -43,6 +45,10 @@ pub struct Params {
     pub max_ack_delay_ms: u64,
     pub active_connection_id_limit: u64,
     pub initial_source_connection_id: Option<ConnectionId>,
+    /// The three connection IDs a server has to echo so the client knows its
+    /// first flight was not tampered with (RFC 9000 Section 7.3)
+    pub original_destination_connection_id: Option<ConnectionId>,
+    pub retry_source_connection_id: Option<ConnectionId>,
     /// What the peer will end its handshake connection ID with if it loses
     /// the connection's state (RFC 9000 Section 10.3)
     pub stateless_reset_token: Option<[u8; 16]>,
@@ -65,6 +71,8 @@ impl Default for Params {
             max_ack_delay_ms: 25,
             active_connection_id_limit: 2,
             initial_source_connection_id: None,
+            original_destination_connection_id: None,
+            retry_source_connection_id: None,
             stateless_reset_token: None,
         }
     }
@@ -136,6 +144,18 @@ impl Params {
                         bail!("initial_source_connection_id is too long");
                     }
                     out.initial_source_connection_id = Some(ConnectionId::new(value)?);
+                }
+                ORIGINAL_DESTINATION_CONNECTION_ID => {
+                    if value.len() > MAX_CID_LEN {
+                        bail!("original_destination_connection_id is too long");
+                    }
+                    out.original_destination_connection_id = Some(ConnectionId::new(value)?);
+                }
+                RETRY_SOURCE_CONNECTION_ID => {
+                    if value.len() > MAX_CID_LEN {
+                        bail!("retry_source_connection_id is too long");
+                    }
+                    out.retry_source_connection_id = Some(ConnectionId::new(value)?);
                 }
                 STATELESS_RESET_TOKEN => {
                     let Ok(token) = <[u8; 16]>::try_from(value) else {
@@ -261,6 +281,25 @@ mod tests {
             p.initial_source_connection_id.unwrap().as_slice(),
             &[1, 2, 3, 4]
         );
+    }
+
+    /// The connection IDs a client checks its first flight against
+    /// (RFC 9000 Section 7.3) all have to survive the parse
+    #[test]
+    fn the_echoed_connection_ids_are_kept_for_checking() {
+        let mut buf = Vec::new();
+        put_varint(&mut buf, ORIGINAL_DESTINATION_CONNECTION_ID);
+        put_varint(&mut buf, 3);
+        buf.extend_from_slice(&[9, 9, 9]);
+        put_varint(&mut buf, RETRY_SOURCE_CONNECTION_ID);
+        put_varint(&mut buf, 2);
+        buf.extend_from_slice(&[7, 7]);
+        let p = Params::decode(&buf).unwrap();
+        assert_eq!(
+            p.original_destination_connection_id.unwrap().as_slice(),
+            &[9, 9, 9]
+        );
+        assert_eq!(p.retry_source_connection_id.unwrap().as_slice(), &[7, 7]);
     }
 
     /// The token is what tells a stateless reset from line noise, so it has

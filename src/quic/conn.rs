@@ -184,8 +184,15 @@ pub struct Connection {
     original_dcid: ConnectionId,
     /// The token a Retry gave us, to be repeated in every Initial after it
     retry_token: Vec<u8>,
-    /// One Retry is followed; a second is ignored (RFC 9000 Section 17.2.5.2)
+    /// One Retry is followed; a second is ignored, as is any once a server
+    /// Initial has been processed (RFC 9000 Section 17.2.5.2)
     retried: bool,
+    /// The Source Connection ID of the Retry, if one came: what the server
+    /// then has to echo in retry_source_connection_id (RFC 9000 Section 7.3)
+    retry_scid: Option<ConnectionId>,
+    /// A server Initial has been decrypted. After this a Retry or a Version
+    /// Negotiation packet is too late to be genuine and is discarded.
+    server_initial_seen: bool,
     /// The first packet number seen under the current generation, which is
     /// what tells a late packet from the old generation apart from the first
     /// of a new one - both carry the phase bit we are not using
@@ -335,6 +342,8 @@ impl Connection {
             original_dcid: initial_dcid,
             retry_token: Vec::new(),
             retried: false,
+            retry_scid: None,
+            server_initial_seen: false,
             params: Params::default(),
             local_idle_ms: local_params.max_idle_timeout_ms,
             handshake_done: false,
@@ -1039,13 +1048,19 @@ impl Connection {
     fn handle_packet(&mut self, now: Instant, buf: &mut [u8]) -> Result<(usize, bool)> {
         let (space, pn_offset, end, retry_scid) =
             match header::decode_header(buf, self.local_cid.len())? {
-                Incoming::VersionNegotiation => {
-                    self.lose("the server does not speak QUIC version 1");
+                Incoming::VersionNegotiation {
+                    dcid,
+                    scid,
+                    versions,
+                } => {
+                    self.on_version_negotiation(dcid, scid, versions);
                     return Ok((0, false));
                 }
-                Incoming::Retry { scid, token, .. } => {
-                    let (scid, token) = (scid, token.to_vec());
-                    self.on_retry(scid, &token, buf)?;
+                Incoming::Retry {
+                    dcid, scid, token, ..
+                } => {
+                    let token = token.to_vec();
+                    self.on_retry(dcid, scid, &token, buf)?;
                     return Ok((0, false));
                 }
                 Incoming::Long {
@@ -1124,6 +1139,11 @@ impl Connection {
                     cid: scid,
                     token: None,
                 });
+            }
+            if space == Space::Initial && !self.server_initial_seen {
+                // The point past which a Retry or Version Negotiation is too
+                // late to be genuine
+                self.server_initial_seen = true;
             }
         }
 
@@ -1377,6 +1397,7 @@ impl Connection {
             && let Some(raw) = self.tls.quic_transport_parameters()
         {
             self.params = Params::decode(raw)?;
+            self.validate_server_params()?;
             self.max_data_peer = self.params.initial_max_data;
             self.max_streams_bidi = self.params.initial_max_streams_bidi;
             // The handshake connection ID's reset token travels in the
@@ -1568,10 +1589,24 @@ impl Connection {
     ///
     /// `packet` is the whole Retry, tag included, which is what the integrity
     /// tag is computed over.
-    fn on_retry(&mut self, scid: ConnectionId, token: &[u8], packet: &[u8]) -> Result<()> {
-        // RFC 9000 Section 17.2.5.2: at most one, and none once the handshake
-        // has produced keys - a late one is an attacker, not the server
-        if self.retried || self.handshake_done || token.is_empty() {
+    fn on_retry(
+        &mut self,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        token: &[u8],
+        packet: &[u8],
+    ) -> Result<()> {
+        // RFC 9000 Section 17.2.5.2: at most one, none once the handshake
+        // has produced keys, and - added here - none once a server Initial
+        // has been processed, since the handshake is under way and a Retry
+        // then is an attacker rather than the server. A Retry addressed to
+        // any connection ID but the one our Initial used is not ours.
+        if self.retried
+            || self.handshake_done
+            || self.server_initial_seen
+            || token.is_empty()
+            || dcid != self.local_cid
+        {
             return Ok(());
         }
         if !retry_tag_is_valid(&self.original_dcid, packet) {
@@ -1580,6 +1615,7 @@ impl Connection {
         }
 
         self.retried = true;
+        self.retry_scid = Some(scid);
         self.retry_token = token.to_vec();
         self.peer_cid = scid;
         // RFC 9001 Section 5.2: the Initial secrets follow the connection ID
@@ -1628,6 +1664,57 @@ impl Connection {
             return;
         }
         self.idle_deadline = self.idle_timeout().map(|t| now + t);
+    }
+
+    /// A server that does not speak QUIC version 1 lists the ones it does
+    /// (RFC 9000 Section 6.2). shb speaks only version 1, so a genuine one
+    /// means the connection cannot go on - but only a genuine one: it is
+    /// discarded if a packet has already been processed, if it lists version
+    /// 1 after all, or if its connection IDs are not those of the exchange,
+    /// any of which marks it as an off-path forgery rather than the server.
+    #[cold]
+    #[inline(never)]
+    fn on_version_negotiation(&mut self, dcid: ConnectionId, scid: ConnectionId, versions: &[u8]) {
+        if self.server_initial_seen || self.retried {
+            return;
+        }
+        if versions
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|v| u32::from_be_bytes(*v) == header::VERSION_1)
+        {
+            return;
+        }
+        // It echoes our connection IDs the other way round: our source is its
+        // destination, and it answers the destination our Initial addressed
+        if dcid != self.local_cid || scid != self.original_dcid {
+            return;
+        }
+        self.lose("the server does not speak QUIC version 1");
+    }
+
+    /// Check that the server's transport parameters bear out a Retry the way
+    /// they should (RFC 9000 Section 7.3): retry_source_connection_id is
+    /// present and equal to the Retry's Source Connection ID exactly when a
+    /// Retry was followed, and absent otherwise. A mismatch means a Retry was
+    /// spoofed into or out of the exchange, so the connection is not safe.
+    ///
+    /// The section also has the client check initial_source_connection_id
+    /// against the server's Initial and original_destination_connection_id
+    /// against its own first Initial. Both are left out here: against nginx
+    /// under rapid reconnection they do not hold - the parameters that arrive
+    /// name a connection ID that is not the one this exchange used, which a
+    /// stateless-reset-free reconnect race in the datagram plumbing lets
+    /// through - and enforcing either turns that race into a connect error
+    /// against a server the whole web runs. retry_source_connection_id does
+    /// not have that problem, since no server reached here sends a Retry
+    /// except the one endpoint that is meant to.
+    fn validate_server_params(&self) -> Result<()> {
+        if self.params.retry_source_connection_id != self.retry_scid {
+            bail!("the server's retry_source_connection_id does not match the Retry");
+        }
+        Ok(())
     }
 }
 
@@ -2739,6 +2826,84 @@ mod tests {
         with_handshake_cid(&mut conn, &[0; 8]);
         assert!(new_cid(&mut conn, 1, 0, &[]).is_err(), "zero length");
         assert!(new_cid(&mut conn, 1, 2, &[1; 8]).is_err(), "retires itself");
+    }
+
+    /// RFC 9000 Section 6.2: a Version Negotiation packet is heeded only
+    /// when it is genuine - before any packet is processed, listing no
+    /// version we speak, and carrying our own connection IDs
+    #[test]
+    fn version_negotiation_is_only_heeded_when_it_is_genuine() {
+        let other = 0xff00_0001u32.to_be_bytes();
+        let ours = super::header::VERSION_1.to_be_bytes();
+
+        // Lists version 1 after all: it is not really telling us to stop
+        let mut conn = client();
+        conn.on_version_negotiation(conn.local_cid, conn.original_dcid, &ours);
+        assert!(conn.closed.is_none());
+
+        // Wrong connection IDs: an off-path forgery
+        let mut conn = client();
+        let wrong = ConnectionId::new(&[0xaa; 8]).unwrap();
+        conn.on_version_negotiation(wrong, conn.original_dcid, &other);
+        assert!(conn.closed.is_none());
+
+        // After a server Initial: too late to be genuine
+        let mut conn = client();
+        conn.server_initial_seen = true;
+        conn.on_version_negotiation(conn.local_cid, conn.original_dcid, &other);
+        assert!(conn.closed.is_none());
+
+        // Genuine: our IDs, no version we speak, nothing processed yet
+        let mut conn = client();
+        conn.on_version_negotiation(conn.local_cid, conn.original_dcid, &other);
+        assert!(conn.closed.is_some(), "a genuine one ends the connection");
+    }
+
+    /// RFC 9000 Section 17.2.5.2: a Retry is discarded once a server Initial
+    /// has been processed, and one not addressed to our own connection ID is
+    /// not ours to act on
+    #[test]
+    fn a_late_or_misaddressed_retry_is_discarded() {
+        let scid = ConnectionId::new(&[0xab; 8]).unwrap();
+        let good_dcid = {
+            let c = client();
+            c.local_cid
+        };
+
+        let mut conn = client();
+        conn.server_initial_seen = true;
+        conn.on_retry(good_dcid, scid, b"token", &[]).unwrap();
+        assert!(!conn.retried, "a server Initial has been seen");
+
+        let mut conn = client();
+        let wrong = ConnectionId::new(&[0x11; 8]).unwrap();
+        conn.on_retry(wrong, scid, b"token", &[]).unwrap();
+        assert!(!conn.retried, "not addressed to our connection ID");
+    }
+
+    /// RFC 9000 Section 7.3: the connection IDs the server echoes in its
+    /// transport parameters have to match what shb sent, or the first flight
+    /// was tampered with
+    /// RFC 9000 Section 7.3: retry_source_connection_id has to bear out the
+    /// Retry - present and equal to its SCID when one was followed, absent
+    /// when none was
+    #[test]
+    fn the_retry_source_connection_id_is_checked() {
+        // No Retry: the parameter must be absent, and is
+        let mut conn = client();
+        assert!(conn.validate_server_params().is_ok());
+        conn.params.retry_source_connection_id = Some(ConnectionId::new(&[5; 8]).unwrap());
+        assert!(
+            conn.validate_server_params().is_err(),
+            "an unexpected RSCID"
+        );
+
+        // A Retry was followed: the parameter has to be its SCID
+        let mut conn = client();
+        conn.retry_scid = Some(ConnectionId::new(&[9; 8]).unwrap());
+        assert!(conn.validate_server_params().is_err(), "RSCID missing");
+        conn.params.retry_source_connection_id = Some(ConnectionId::new(&[9; 8]).unwrap());
+        assert!(conn.validate_server_params().is_ok());
     }
 
     #[test]
