@@ -433,6 +433,10 @@ cheap:
   CPU doubles, which is why the default is what it is. Lower it when the thing
   being measured is faster than a wait: it buys throughput, and it stops the
   wait from showing up in the latencies as though the server had spent it.
+
+  HTTP/1.1 and HTTP/2 only. HTTP/3 cuts each wait short at its nearest QUIC
+  timer, usually the pacer and microseconds away, so the setting never comes
+  into it there - measured across four configurations it moves nothing.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and

@@ -104,6 +104,10 @@ pub struct Args {
     /// latency and costs nothing. Lower it when the server answers faster than
     /// shb can ask - it buys throughput and truer latencies for a few percent
     /// more CPU per request.
+    ///
+    /// HTTP/1.1 and HTTP/2 only. HTTP/3 already cuts each wait short at its
+    /// nearest QUIC timer, which is usually the pacer and microseconds away,
+    /// so this never comes into it.
     #[arg(long, value_name = "MICROSECONDS", default_value_t = uring::DEFAULT_BATCH_LINGER, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..=1_000_000))]
     pub batch_linger: u32,
 

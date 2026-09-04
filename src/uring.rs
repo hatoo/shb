@@ -74,6 +74,10 @@ const MAX_BATCH_MULTIPLEXED: usize = 32;
 /// 1.7M requests a second where 10us reached 10M, for 6% more CPU a request.
 /// Which of those a run is in is not something a worker can tell, so it is
 /// [`set_batch_linger`] and the default is the one that suits a real server.
+///
+/// HTTP/1.1 and HTTP/2 only in practice. HTTP/3 passes a `max_wait` cut down to
+/// its nearest QUIC timer - usually the pacer, microseconds away - and that
+/// bounds this as well, so changing it moves nothing there.
 pub const DEFAULT_BATCH_LINGER: u32 = 500;
 
 static BATCH_LINGER: std::sync::atomic::AtomicU32 =
