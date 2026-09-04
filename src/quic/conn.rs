@@ -1140,32 +1140,40 @@ impl Connection {
     /// Returns how much of the buffer this packet took, and whether it was
     /// decrypted and acted on
     fn handle_packet(&mut self, now: Instant, buf: &mut [u8]) -> Result<(usize, bool)> {
-        let (space, pn_offset, end, retry_scid) =
-            match header::decode_header(buf, self.local_cid.len())? {
-                Incoming::VersionNegotiation {
-                    dcid,
-                    scid,
-                    versions,
-                } => {
-                    self.on_version_negotiation(dcid, scid, versions);
-                    return Ok((0, false));
-                }
-                Incoming::Retry {
-                    dcid, scid, token, ..
-                } => {
-                    let token = token.to_vec();
-                    self.on_retry(dcid, scid, &token, buf)?;
-                    return Ok((0, false));
-                }
-                Incoming::Long {
-                    space,
-                    scid,
-                    pn_offset,
-                    end,
-                    ..
-                } => (space, pn_offset, end, Some(scid)),
-                Incoming::Short { pn_offset, end, .. } => (Space::Data, pn_offset, end, None),
-            };
+        // Nothing in a header has been authenticated, so a packet whose
+        // header cannot be read - a version we do not speak, a connection
+        // ID longer than allowed, a length past the datagram, a 0-RTT type
+        // - is discarded with the rest of the datagram rather than allowed
+        // to end the connection (RFC 9000 Section 5.2). Anyone on the path
+        // can send one.
+        let Ok(incoming) = header::decode_header(buf, self.local_cid.len()) else {
+            return Ok((0, false));
+        };
+        let (space, pn_offset, end, retry_scid) = match incoming {
+            Incoming::VersionNegotiation {
+                dcid,
+                scid,
+                versions,
+            } => {
+                self.on_version_negotiation(dcid, scid, versions);
+                return Ok((0, false));
+            }
+            Incoming::Retry {
+                dcid, scid, token, ..
+            } => {
+                let token = token.to_vec();
+                self.on_retry(dcid, scid, &token, buf)?;
+                return Ok((0, false));
+            }
+            Incoming::Long {
+                space,
+                scid,
+                pn_offset,
+                end,
+                ..
+            } => (space, pn_offset, end, Some(scid)),
+            Incoming::Short { pn_offset, end, .. } => (Space::Data, pn_offset, end, None),
+        };
 
         // A packet in a space whose keys have not arrived yet is dropped, not
         // an error: it is normal for a Handshake packet to overtake the
@@ -3640,6 +3648,46 @@ mod tests {
             (0x100..0x200).contains(&error),
             "0x100 plus the alert, got {error:#x}"
         );
+    }
+
+    /// RFC 9000 Section 5.2: a packet whose header cannot be read is
+    /// discarded, not acted on - nothing in it is authenticated, and
+    /// anyone on the path can send one
+    #[test]
+    fn an_unreadable_long_header_is_discarded_rather_than_fatal() {
+        let mut conn = client();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        let dcid = conn.local_cid;
+
+        // A long header up to the connection IDs, with the flaw chosen
+        let long = |first: u8, version: u32, dcid_len: u8, tail: &[u8]| {
+            let mut d = vec![first];
+            d.extend_from_slice(&version.to_be_bytes());
+            d.push(dcid_len);
+            d.extend_from_slice(dcid.as_slice());
+            d.push(0);
+            d.extend_from_slice(tail);
+            d.resize(d.len().max(64), 0);
+            d
+        };
+        let dcid_len = dcid.len() as u8;
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("unknown version", long(0xc0, 2, dcid_len, &[0, 0x10])),
+            ("connection ID too long", long(0xc0, 1, 21, &[0, 0x10])),
+            (
+                "length past the datagram",
+                long(0xc0, 1, dcid_len, &[0, 0x7f, 0xff]),
+            ),
+            ("0-RTT", long(0xd0, 1, dcid_len, &[0x10])),
+        ];
+        for (what, mut datagram) in cases {
+            conn.handle_datagram(now, &mut datagram)
+                .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            assert!(conn.closed.is_none(), "{what} ended the connection");
+            assert_eq!(conn.poll_event(), None, "{what}");
+        }
     }
 
     /// RFC 9000 Section 10.1.2: a PING before the effective idle timeout
