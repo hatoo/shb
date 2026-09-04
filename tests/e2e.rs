@@ -1653,6 +1653,37 @@ fn a_silent_server_ends_an_http2_run_too() {
     assert_eq!(report["requests"]["errors"], 2, "report: {report}");
 }
 
+/// A server whose SETTINGS allows no streams at all, and refuses the first
+/// flight it got before saying so, leaves the connection with nothing in
+/// flight and every request still to send; --timeout measured only streams
+/// in flight, so a counted run against it waited for ever and the option
+/// meant to end such a wait could not. A connection idle that long with
+/// requests owed is now failed like a response that never came.
+#[test]
+fn a_server_that_allows_no_streams_ends_an_http2_run_with_timeout() {
+    let addr = start_scripted_h2_server(H2Script {
+        accept_per_read: Some(0),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "--timeout",
+        "500ms",
+        "-p",
+        "4",
+        "-n",
+        "8",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 8, "report: {report}");
+}
+
 /// A UDP relay in front of the HTTP/3 server that loses, duplicates and
 /// reorders datagrams
 ///

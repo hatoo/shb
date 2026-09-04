@@ -107,6 +107,10 @@ struct Conn {
     /// connection. They are kept out of the budget until it answers
     /// something, and charged as errors if it never does.
     held: u64,
+    /// When this connection was last seen with a request in flight, or was
+    /// last started. What --timeout measures on a connection that has
+    /// nothing in flight and something still to send.
+    idle_since: Instant,
 }
 
 impl Conn {
@@ -126,6 +130,7 @@ impl Conn {
             streams: H2Ring::new(),
             answered: 0,
             held: 0,
+            idle_since: Instant::now(),
         }
     }
 
@@ -146,6 +151,7 @@ impl Conn {
         self.streams.clear();
         self.answered = 0;
         self.held = 0;
+        self.idle_since = Instant::now();
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
     }
@@ -424,12 +430,33 @@ pub fn run_worker(
         if let Some(limit) = timeout {
             let now = Instant::now();
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
-                if !conn
-                    .streams
-                    .iter()
-                    .any(|s| now.duration_since(s.start) >= limit)
-                {
+                let wedged = if conn.streams.is_empty() {
+                    // Nothing in flight and something still to send is a
+                    // wait on something other than a response - a SETTINGS
+                    // that allows no streams, a handshake the server never
+                    // finishes, a first flight refused with no room to send
+                    // it again - and the same limit applies to it. Nothing
+                    // is owed a connection that is idle because the run is
+                    // out of requests, or has not connected yet: the
+                    // connect has its own timeout.
+                    conn.connected
+                        && (conn.held > 0 || budget.may_start(started))
+                        && now.duration_since(conn.idle_since) >= limit
+                } else {
+                    conn.idle_since = now;
+                    conn.streams
+                        .iter()
+                        .any(|s| now.duration_since(s.start) >= limit)
+                };
+                if !wedged {
                     continue;
+                }
+                if conn.streams.is_empty() && conn.held == 0 {
+                    // It carried nothing at all: a connect that did not work
+                    // out, which is what it costs the budget
+                    stats.errors += 1;
+                    stats.connect_errors += 1;
+                    started += 1;
                 }
                 conn.fail_inflight(&mut stats);
                 conn.close();
