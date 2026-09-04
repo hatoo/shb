@@ -465,7 +465,7 @@ impl Connection {
                 CONTINUATION => self.on_continuation(stream, flags, payload, events)?,
                 SETTINGS => self.on_settings(flags, payload)?,
                 WINDOW_UPDATE => self.on_window_update(stream, payload)?,
-                PING => self.on_ping(flags, payload),
+                PING => self.on_ping(stream, flags, payload)?,
                 RST_STREAM => self.on_rst_stream(stream, payload, events)?,
                 GOAWAY => self.on_goaway(payload, events)?,
                 // PRIORITY and anything unknown are ignored, as the spec allows
@@ -693,12 +693,23 @@ impl Connection {
         Ok(())
     }
 
-    fn on_ping(&mut self, flags: u8, payload: &[u8]) {
-        if flags & FLAG_ACK != 0 || payload.len() != 8 {
-            return;
+    /// RFC 9113 Section 6.7: a PING belongs to the connection and carries
+    /// eight bytes. One on a stream is a connection error of type
+    /// PROTOCOL_ERROR and one of another length FRAME_SIZE_ERROR; both were
+    /// being let through, the short one without an answer and the misplaced
+    /// one with an answer on stream 0.
+    fn on_ping(&mut self, stream: u32, flags: u8, payload: &[u8]) -> Result<()> {
+        if stream != 0 {
+            bail!("PING on stream {stream}");
         }
-        self.frame_header(8, PING, FLAG_ACK, 0);
-        self.out.extend_from_slice(payload);
+        if payload.len() != 8 {
+            bail!("malformed PING");
+        }
+        if flags & FLAG_ACK == 0 {
+            self.frame_header(8, PING, FLAG_ACK, 0);
+            self.out.extend_from_slice(payload);
+        }
+        Ok(())
     }
 
     /// Account for a stream ending, returning false if none was open
@@ -986,6 +997,24 @@ mod tests {
         assert_eq!(out[3], PING);
         assert_eq!(out[4], FLAG_ACK);
         assert_eq!(&out[9..17], b"12345678");
+        // An ACK is the end of it
+        c.feed(&frame(PING, FLAG_ACK, 0, b"12345678"), &mut events)
+            .unwrap();
+        assert!(c.take_output().is_none());
+    }
+
+    /// RFC 9113 Section 6.7: a PING on a stream is a PROTOCOL_ERROR, and
+    /// one of any length but eight a FRAME_SIZE_ERROR
+    #[test]
+    fn a_ping_on_a_stream_or_of_the_wrong_length_is_a_connection_error() {
+        let mut events = Vec::new();
+        let mut c = connected();
+        assert!(
+            c.feed(&frame(PING, 0, 1, b"12345678"), &mut events)
+                .is_err()
+        );
+        let mut c = connected();
+        assert!(c.feed(&frame(PING, 0, 0, b"1234567"), &mut events).is_err());
     }
 
     #[test]
