@@ -81,6 +81,12 @@ struct Conn {
     generation: u64,
     /// In-flight requests, up to the configured parallelism
     streams: H2Ring<InFlight>,
+    /// Responses received on this connection since it was opened
+    answered: u64,
+    /// Requests the peer gave back before it had answered anything on this
+    /// connection. They are kept out of the budget until it answers
+    /// something, and charged as errors if it never does.
+    held: u64,
 }
 
 impl Conn {
@@ -98,6 +104,8 @@ impl Conn {
             goaway: false,
             generation: 0,
             streams: H2Ring::new(),
+            answered: 0,
+            held: 0,
         }
     }
 
@@ -116,14 +124,20 @@ impl Conn {
         self.h2 = None;
         self.tls = None;
         self.streams.clear();
+        self.answered = 0;
+        self.held = 0;
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
     }
 
-    /// Count all in-flight requests as errors (used when the connection dies)
+    /// Count all in-flight requests as errors (used when the connection dies),
+    /// and with them whatever the peer gave back while this connection had
+    /// answered nothing: it has now answered nothing at all, and those were
+    /// not requests it declined but a connection it declined
     fn fail_inflight(&mut self, stats: &mut Stats) {
-        stats.errors += self.streams.len() as u64;
+        stats.errors += self.streams.len() as u64 + self.held;
         self.streams.clear();
+        self.held = 0;
     }
 }
 
@@ -221,20 +235,20 @@ fn flush(
 /// A request the peer never acted on goes back to the budget rather than to
 /// either count, and the next fill sends it again as a new request - timed
 /// from then, since what the first attempt measured was a server declining
-/// to look at it. A counted run may do that as many times as it has requests,
-/// plus once for every request that has completed: a server that acts on
-/// some of what it is sent is never cut off, however many it turns away
-/// (nginx turns away more than it answers at 32 streams against a
-/// keepalive_requests of 20), and one that acts on nothing ends the run
-/// with errors instead of keeping it going for ever.
-fn process_events(
-    conn: &mut Conn,
-    events: &[Event],
-    stats: &mut Stats,
-    budget: Budget,
-    started: &mut u64,
-    retried: &mut u64,
-) {
+/// to look at it. That has to stop somewhere, or a server that acts on
+/// nothing keeps a run going for ever, and the line is the connection: one
+/// that has answered a request is declining requests, however many, and one
+/// that never answers anything is declining the connection, and what it gave
+/// back is failed with it. The give-backs of a connection that has not
+/// answered yet wait for its first answer rather than being judged on the
+/// spot, since they routinely arrive ahead of it - nginx queues its GOAWAY in
+/// front of the responses to the streams below its line, and nghttp2 sends
+/// its RST_STREAMs before the DATA that ends the responses it did take.
+///
+/// Counting retries per run instead let a server that answers ten streams a
+/// connection run out of retries partway through a long run: nginx with
+/// keepalive_requests 10 failed 761 of 1000 requests at 100 streams.
+fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats, started: &mut u64) {
     for event in events {
         match *event {
             Event::Status { stream_id, status } => {
@@ -252,6 +266,11 @@ fn process_events(
                         stats.errors += 1;
                     } else {
                         stats.record_success(inflight.status, inflight.start);
+                        conn.answered += 1;
+                        // The connection does answer, so what it gave back
+                        // before this can go and be sent again
+                        *started -= conn.held;
+                        conn.held = 0;
                     }
                 }
             }
@@ -262,14 +281,10 @@ fn process_events(
             }
             Event::Unprocessed { stream_id } => {
                 if conn.streams.take(stream_id as u64).is_some() {
-                    if budget
-                        .expected_requests()
-                        .is_none_or(|n| *retried < n + stats.completed)
-                    {
-                        *retried += 1;
+                    if conn.answered > 0 {
                         *started -= 1;
                     } else {
-                        stats.errors += 1;
+                        conn.held += 1;
                     }
                 }
             }
@@ -337,8 +352,6 @@ pub fn run_worker(
     // attempts also consume one unit of the request budget so that -n
     // terminates when the server is unreachable.
     let mut started: u64 = 0;
-    // Requests sent again because the peer never acted on them
-    let mut retried: u64 = 0;
 
     // Held for its lifetime: the SQE points at it until the run is over
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
@@ -473,7 +486,6 @@ pub fn run_worker(
                 }
                 OP_SEND => {
                     if res < 0 {
-                        conns[conn_idx].fail_inflight(&mut stats);
                         conn_broken = true;
                     } else {
                         stats.bytes_sent += res as u64;
@@ -525,15 +537,13 @@ pub fn run_worker(
                             uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
                             conn.recv_armed = true;
                         } else {
-                            conn.fail_inflight(&mut stats);
                             conn_broken = true;
                         }
                     } else if res == 0 {
                         if let Some(bid) = cqueue::buffer_select(flags) {
                             buf_ring.recycle(bid);
                         }
-                        // EOF mid-connection: fail whatever is still in flight
-                        conn.fail_inflight(&mut stats);
+                        // EOF mid-connection
                         conn_broken = true;
                     } else {
                         stats.bytes_received += res as u64;
@@ -558,16 +568,8 @@ pub fn run_worker(
                             }
                         };
                         buf_ring.recycle(bid);
-                        process_events(
-                            conn,
-                            &events,
-                            &mut stats,
-                            budget,
-                            &mut started,
-                            &mut retried,
-                        );
+                        process_events(conn, &events, &mut stats, &mut started);
                         if !feed_ok {
-                            conn.fail_inflight(&mut stats);
                             conn_broken = true;
                         } else if conn.goaway && conn.streams.is_empty() {
                             // GOAWAY and every stream the peer was still
@@ -595,6 +597,10 @@ pub fn run_worker(
 
             if conn_broken {
                 let conn = &mut conns[conn_idx];
+                // Whatever was still in flight is lost with the connection.
+                // A connection that drained after a GOAWAY has nothing in
+                // flight, and may still owe for what it gave back.
+                conn.fail_inflight(&mut stats);
                 conn.close();
                 if !stop && budget.may_start(started) {
                     match uring::start_connect(
@@ -688,4 +694,102 @@ pub fn run_worker(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(conn: &mut Conn, ids: impl IntoIterator<Item = u32>) -> u64 {
+        let mut started = 0;
+        for id in ids {
+            conn.streams.push(
+                id as u64,
+                InFlight {
+                    start: Instant::now(),
+                    status: 0,
+                },
+            );
+            started += 1;
+        }
+        started
+    }
+
+    fn answered(id: u32) -> [Event; 2] {
+        [
+            Event::Status {
+                stream_id: id,
+                status: 200,
+            },
+            Event::End { stream_id: id },
+        ]
+    }
+
+    /// nginx at keepalive_requests: the GOAWAY leaves ahead of the responses
+    /// to the streams below its line, so the give-backs arrive first
+    #[test]
+    fn give_backs_wait_for_the_connection_to_answer_something() {
+        let mut conn = Conn::new();
+        let mut stats = Stats::default();
+        let mut started = open(&mut conn, [1, 3, 5]);
+        process_events(
+            &mut conn,
+            &[
+                Event::Unprocessed { stream_id: 3 },
+                Event::Unprocessed { stream_id: 5 },
+                Event::Goaway,
+            ],
+            &mut stats,
+            &mut started,
+        );
+        assert_eq!(started, 3, "not back in the budget yet");
+        assert_eq!(conn.held, 2);
+        process_events(&mut conn, &answered(1), &mut stats, &mut started);
+        assert_eq!(started, 1, "the answer releases them");
+        assert_eq!(conn.held, 0);
+        assert_eq!((stats.completed, stats.errors), (1, 0));
+    }
+
+    /// Once the connection has answered, a give-back is sent again at once
+    #[test]
+    fn give_backs_after_an_answer_go_straight_back_to_the_budget() {
+        let mut conn = Conn::new();
+        let mut stats = Stats::default();
+        let mut started = open(&mut conn, [1, 3]);
+        process_events(&mut conn, &answered(1), &mut stats, &mut started);
+        process_events(
+            &mut conn,
+            &[Event::Unprocessed { stream_id: 3 }],
+            &mut stats,
+            &mut started,
+        );
+        assert_eq!(started, 1);
+        assert_eq!(conn.held, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    /// A connection that dies having answered nothing declined the
+    /// connection, not the requests: what it gave back is failed with it
+    #[test]
+    fn a_connection_that_never_answers_fails_what_it_gave_back() {
+        let mut conn = Conn::new();
+        let mut stats = Stats::default();
+        let mut started = open(&mut conn, [1, 3, 5]);
+        process_events(
+            &mut conn,
+            &[
+                Event::Unprocessed { stream_id: 1 },
+                Event::Unprocessed { stream_id: 3 },
+                Event::Goaway,
+            ],
+            &mut stats,
+            &mut started,
+        );
+        conn.fail_inflight(&mut stats);
+        assert_eq!(stats.errors, 3, "two given back, one still in flight");
+        assert_eq!(started, 3, "and the budget is not refunded");
+        assert_eq!(conn.held, 0);
+        conn.close();
+        assert_eq!((conn.answered, conn.held), (0, 0));
+    }
 }

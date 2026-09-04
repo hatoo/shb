@@ -852,7 +852,11 @@ fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
                     }
                     if stream > last_stream {
                         if !goaway_sent {
-                            out.extend_from_slice(&goaway(last_stream, NO_ERROR));
+                            // Ahead of the responses already queued: nginx
+                            // sends control frames in front of everything
+                            // else, so its GOAWAY reaches the client before
+                            // the answers to the streams below its line
+                            out.splice(0..0, goaway(last_stream, NO_ERROR));
                             goaway_sent = true;
                         }
                         continue;
@@ -1028,10 +1032,11 @@ fn h2_resends_the_streams_the_server_refused() {
     assert_all_ok(&report, 1000, "200");
 }
 
-/// Sending unprocessed requests again has to stop somewhere, or a server
-/// that processes nothing keeps a counted run going for ever. A run may
-/// retry as many requests as it was asked for plus one per completed
-/// request, so this one ends with every request an error.
+/// Sending back what the server gave back has to stop somewhere, or a
+/// server that acts on nothing keeps a run going for ever - and on -z it
+/// opened nine thousand connections in two seconds and reported nothing at
+/// all. A connection that never answers anything fails what it gave back,
+/// so this run ends with every request an error, one connection per flight.
 #[test]
 fn h2_a_server_that_acts_on_nothing_still_ends_the_run() {
     let addr = start_scripted_h2_server(H2Script {
@@ -1055,6 +1060,36 @@ fn h2_a_server_that_acts_on_nothing_still_ends_the_run() {
     ]);
     assert_eq!(report["requests"]["ok"], 0, "report: {report}");
     assert_eq!(report["requests"]["errors"], 20, "report: {report}");
+}
+
+/// The line between a server that declines requests and one that declines
+/// everything is the connection, not the run. It was the run: as many
+/// retries as requests plus one per completion, which a server that answers
+/// ten streams a connection and gives back ninety exhausts a tenth of the
+/// way through - nginx with keepalive_requests 10 failed 761 of 1000 at 100
+/// streams a connection, and 934 of 1000 with keepalive_timeout 0.
+#[test]
+fn h2_a_server_that_answers_a_little_per_connection_fails_nothing() {
+    let addr = start_scripted_h2_server(H2Script {
+        streams_per_connection: Some(10),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "100",
+        "-n",
+        "1000",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_all_ok(&report, 1000, "200");
 }
 
 // ------------------------------------------------------------------------
