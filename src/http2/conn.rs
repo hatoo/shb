@@ -121,7 +121,8 @@ pub struct Connection {
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Whether `max_concurrent` is still the assumption rather than the
-    /// peer's word: a refusal can lower the one but not the other
+    /// peer's word, which its first SETTINGS gives - by naming a figure, or
+    /// by naming none
     max_concurrent_assumed: bool,
     /// Our remaining connection-level send credit
     send_window: i64,
@@ -142,6 +143,9 @@ pub struct Connection {
     table_size_update: Option<u32>,
     /// A GOAWAY has been received
     goaway: bool,
+    /// The peer's preface - its first SETTINGS - has arrived. Until it has,
+    /// nothing else may (RFC 9113 Section 3.4).
+    peer_preface_seen: bool,
 }
 
 impl Connection {
@@ -164,6 +168,7 @@ impl Connection {
             table_size: DEFAULT_HEADER_TABLE_SIZE,
             table_size_update: None,
             goaway: false,
+            peer_preface_seen: false,
         }
     }
 
@@ -405,6 +410,14 @@ impl Connection {
     /// Read as many whole frames from `buf` as possible, returning how many
     /// bytes were consumed
     fn run(&mut self, buf: &[u8], events: &mut Vec<Event>) -> Result<usize> {
+        // What a server that does not speak HTTP/2 sends back to the preface
+        // is an HTTP/1.1 status line, and read as a frame that is 4.7 MB of
+        // type 0x54 that never finishes arriving: python -m http.server
+        // answered with a 501 and the run ended with every request an error
+        // and nothing said. It is recognisable from its first five bytes.
+        if !self.peer_preface_seen && buf.starts_with(b"HTTP/") {
+            bail!("server answered the HTTP/2 preface with HTTP/1.1; is h2c enabled?");
+        }
         let mut pos = 0;
         while buf.len() - pos >= FRAME_HEADER_LEN {
             let h = &buf[pos..pos + FRAME_HEADER_LEN];
@@ -415,6 +428,24 @@ impl Connection {
             let kind = head as u8;
             let flags = h[4];
             let stream = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
+
+            // The server's preface is a SETTINGS frame, and it MUST be the
+            // first frame it sends; anything else is a connection error of
+            // type PROTOCOL_ERROR (RFC 9113 Section 3.4). Its ACK of ours
+            // does not count, which is how nghttp2 reads it too. Judged from
+            // the header rather than the whole frame, since what is not a
+            // frame at all tends to claim megabytes that never arrive: this
+            // python's http.server answers the preface with an HTML page and
+            // no status line.
+            if !self.peer_preface_seen {
+                if kind != SETTINGS || flags & FLAG_ACK != 0 {
+                    bail!(
+                        "server's first frame is not SETTINGS (type {kind:#x}); is it speaking HTTP/2?"
+                    );
+                }
+                self.peer_preface_seen = true;
+            }
+
             let end = pos + FRAME_HEADER_LEN + len;
             if buf.len() < end {
                 break;
@@ -591,11 +622,14 @@ impl Connection {
 
     /// REFUSED_STREAM means the peer never acted on the stream (RFC 9113
     /// Section 8.7), so the request goes back rather than into the error
-    /// count. It also says the peer had all it would take when this stream
-    /// arrived, which matters while its SETTINGS has not arrived to say how
-    /// many that is - the first flight leaves before it has - so what is
-    /// still open below the refused stream becomes the figure to assume. Any
-    /// other code is a stream that went wrong, and stays an error.
+    /// count. Any other code is a stream that went wrong, and stays an
+    /// error.
+    ///
+    /// A refusal used to lower the stream limit assumed before the peer's
+    /// SETTINGS arrived. Nothing can arrive before that SETTINGS now - it
+    /// has to be the peer's first frame - so by the time a refusal is read
+    /// the peer has said what it takes, or said nothing and takes any
+    /// number, and a refusal is then its own to explain.
     fn on_rst_stream(
         &mut self,
         stream: u32,
@@ -606,18 +640,12 @@ impl Connection {
             bail!("malformed RST_STREAM");
         }
         let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        if code != REFUSED_STREAM {
-            if self.finish_stream(stream) {
-                events.push(Event::Reset { stream_id: stream });
-            }
-            return Ok(());
-        }
-        if self.max_concurrent_assumed {
-            let taken = self.open.iter().filter(|s| s.id < stream).count() as u32;
-            self.max_concurrent = self.max_concurrent.min(taken.max(1));
-        }
         if self.finish_stream(stream) {
-            events.push(Event::Unprocessed { stream_id: stream });
+            events.push(if code == REFUSED_STREAM {
+                Event::Unprocessed { stream_id: stream }
+            } else {
+                Event::Reset { stream_id: stream }
+            });
         }
         Ok(())
     }
@@ -698,11 +726,68 @@ mod tests {
         v
     }
 
-    fn connected() -> Connection {
+    /// Our preface sent, and nothing heard from the peer yet
+    fn preface_sent() -> Connection {
         let mut c = Connection::new();
         c.initiate();
         c.take_output();
         c
+    }
+
+    /// Both prefaces exchanged: ours out, the peer's empty SETTINGS in
+    fn connected() -> Connection {
+        let mut c = preface_sent();
+        c.feed(&frame(SETTINGS, 0, 0, &[]), &mut Vec::new())
+            .unwrap();
+        c.take_output();
+        c
+    }
+
+    /// python -m http.server answers the preface with "HTTP/1.1 501", which
+    /// read as a frame header is 4.7 MB of type 0x54 that never finishes
+    /// arriving; the run ended with every request an error and nothing said
+    #[test]
+    fn an_http1_answer_to_the_preface_is_named() {
+        let mut c = preface_sent();
+        let mut events = Vec::new();
+        let err = c
+            .feed(b"HTTP/1.1 501 Unsupported method ('PRI')\r\n", &mut events)
+            .unwrap_err();
+        assert!(err.to_string().contains("h2c"), "{err}");
+
+        // However it arrives
+        let mut c = preface_sent();
+        c.feed(b"HT", &mut events).unwrap();
+        c.feed(b"TP/1.1 400 Bad Request\r\n", &mut events)
+            .unwrap_err();
+    }
+
+    /// RFC 9113 Section 3.4: the server's preface is a SETTINGS frame, and
+    /// it MUST be the first frame the server sends
+    #[test]
+    fn the_servers_first_frame_must_be_its_settings() {
+        let mut events = Vec::new();
+        let mut c = preface_sent();
+        assert!(
+            c.feed(&frame(PING, 0, 0, b"12345678"), &mut events)
+                .is_err()
+        );
+        // Its ACK of our SETTINGS is not its preface
+        let mut c = preface_sent();
+        assert!(
+            c.feed(&frame(SETTINGS, FLAG_ACK, 0, &[]), &mut events)
+                .is_err()
+        );
+        // After its SETTINGS anything goes
+        let mut c = preface_sent();
+        let mut data = frame(SETTINGS, 0, 0, &[]);
+        data.extend_from_slice(&frame(PING, 0, 0, b"12345678"));
+        c.feed(&data, &mut events).unwrap();
+
+        // Judged from the header: an HTML page read as a frame claims 3.9 MB
+        // of type 'O', and waiting for the rest of it is waiting for ever
+        let mut c = preface_sent();
+        assert!(c.feed(b"<!DOCTYPE HTML>\n<html>", &mut events).is_err());
     }
 
     #[test]
@@ -1074,18 +1159,15 @@ mod tests {
 
     /// Node with maxConcurrentStreams: 8 refused 92 of the 100 streams in
     /// the first flight, and every one was an error. A refusal is not an
-    /// answer: the request goes back to be sent again, and until the peer's
-    /// SETTINGS says how many streams it takes, the refusal is the best
-    /// estimate there is.
+    /// answer: the request goes back to be sent again.
     #[test]
-    fn a_refused_stream_is_given_back_and_lowers_the_assumption() {
+    fn a_refused_stream_is_given_back() {
         let mut c = connected();
         let mut events = Vec::new();
         for _ in 0..12 {
             c.start_stream(&[0x82], b"").unwrap();
         }
         c.take_output();
-        // Streams 1 .. 15 were taken; 17 was one too many
         c.feed(
             &frame(RST_STREAM, 0, 17, &REFUSED_STREAM.to_be_bytes()),
             &mut events,
@@ -1095,24 +1177,6 @@ mod tests {
             matches!(events[..], [Event::Unprocessed { stream_id: 17 }]),
             "{events:?}"
         );
-        assert_eq!(c.max_concurrent, 8, "what was open below the refusal");
-        assert!(!c.can_open(), "eleven are still open, more than eight");
-
-        // The peer's own figure replaces the estimate
-        let mut payload = SETTINGS_MAX_CONCURRENT_STREAMS.to_be_bytes().to_vec();
-        payload.extend_from_slice(&300u32.to_be_bytes());
-        c.feed(&frame(SETTINGS, 0, 0, &payload), &mut events)
-            .unwrap();
-        assert!(c.can_open());
-        // And a refusal after that leaves it alone
-        events.clear();
-        c.feed(
-            &frame(RST_STREAM, 0, 19, &REFUSED_STREAM.to_be_bytes()),
-            &mut events,
-        )
-        .unwrap();
-        assert!(matches!(events[..], [Event::Unprocessed { stream_id: 19 }]));
-        assert_eq!(c.max_concurrent, 300);
 
         // Any other code is a stream that went wrong
         events.clear();
@@ -1122,42 +1186,6 @@ mod tests {
             matches!(events[..], [Event::Reset { stream_id: 21 }]),
             "{events:?}"
         );
-    }
-
-    /// Node's default server sends an empty SETTINGS, and a run at 200
-    /// streams a connection against it never had more than 100 open: the
-    /// guess made for the first flight was being kept as if the peer had
-    /// confirmed it. RFC 9113 Section 6.5.2: unlimited until set.
-    #[test]
-    fn a_settings_that_names_no_stream_limit_lifts_the_assumption() {
-        let mut c = connected();
-        for _ in 0..ASSUMED_MAX_CONCURRENT {
-            c.start_stream(&[0x82], b"").unwrap();
-        }
-        assert!(!c.can_open(), "the assumption holds until the peer speaks");
-
-        let mut events = Vec::new();
-        c.feed(&frame(SETTINGS, 0, 0, &[]), &mut events).unwrap();
-        assert!(c.can_open());
-        assert_eq!(c.max_concurrent, u32::MAX);
-        for _ in 0..1000 {
-            c.start_stream(&[0x82], b"").unwrap();
-        }
-
-        // Having spoken, the peer's refusals no longer set the figure
-        c.take_output();
-        c.feed(
-            &frame(RST_STREAM, 0, 2201, &REFUSED_STREAM.to_be_bytes()),
-            &mut events,
-        )
-        .unwrap();
-        assert_eq!(c.max_concurrent, u32::MAX);
-
-        // And an ACK of ours is not the peer speaking
-        let mut c = connected();
-        c.feed(&frame(SETTINGS, FLAG_ACK, 0, &[]), &mut events)
-            .unwrap();
-        assert_eq!(c.max_concurrent, ASSUMED_MAX_CONCURRENT);
     }
 
     #[test]

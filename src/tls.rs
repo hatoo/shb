@@ -263,11 +263,10 @@ impl TlsSession {
         Ok(out)
     }
 
-    /// Whether the handshake is still in progress. Plaintext written before
-    /// it finishes waits, so a request timed from before is timing the
-    /// handshake as well.
-    pub fn is_handshaking(&self) -> bool {
-        self.conn.is_handshaking()
+    /// The protocol the server chose from the ALPN offer, once the handshake
+    /// is done; None if it chose nothing
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.conn.alpn_protocol()
     }
 }
 

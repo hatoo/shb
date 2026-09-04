@@ -8,6 +8,7 @@ mod hpack;
 
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::clock::Instant;
@@ -45,6 +46,25 @@ fn build_header_block(target: &Target) -> Vec<u8> {
         &headers,
         target.body.len(),
     )
+}
+
+/// Whether a run has had its one warning yet
+static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// What to say about a server that would not take h2 in the handshake
+const NO_H2: &str = "server did not negotiate h2; does it speak HTTP/2?";
+
+/// Say something once per run, on stderr
+///
+/// What goes wrong in a run is a count in the report, not a message, since a
+/// server under load goes wrong thousands of times a second. A server that
+/// is not speaking HTTP/2 at all is a different thing: every request will be
+/// an error and the report cannot say why, so the first such connection of
+/// the run says it - once, however many workers and connections meet it.
+fn warn_once(what: &str) {
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("{what}");
+    }
 }
 
 /// An in-flight request (one open stream)
@@ -472,12 +492,14 @@ pub fn run_worker(
                             conn.tls = Some(TlsSession::new(setup)?);
                         }
                         // Prior knowledge: send the client preface + SETTINGS
-                        // and the first requests in a single flush. In TLS
-                        // mode the preface waits inside the session for the
-                        // handshake, and the requests are not opened until it
-                        // is done.
+                        // and the first requests in a single flush. Over TLS
+                        // neither goes until the handshake is done and the
+                        // server has agreed to h2; this flush carries the
+                        // ClientHello.
                         let mut h2 = Connection::new();
-                        h2.initiate();
+                        if tls_setup.is_none() {
+                            h2.initiate();
+                        }
                         conn.h2 = Some(h2);
                         fill_streams(
                             conn,
@@ -562,43 +584,76 @@ pub fn run_worker(
                         // In TLS mode decrypt into scratch and feed the
                         // plaintext; otherwise feed the socket bytes directly
                         events.clear();
-                        let feed_ok = {
+                        let fed = {
                             let h2 = conn.h2.as_mut().context("recv without h2 connection")?;
                             match &mut conn.tls {
-                                Some(tls) => tls
-                                    .feed_into(
+                                Some(tls) => {
+                                    let was_handshaking = tls.is_handshaking();
+                                    let fed = tls.feed_into(
                                         buf_ring.data(bid, res as usize),
                                         &mut scratch,
                                         |plain| h2.feed(plain, &mut events),
-                                    )
-                                    .is_ok(),
-                                None => h2
-                                    .feed(buf_ring.data(bid, res as usize), &mut events)
-                                    .is_ok(),
+                                    );
+                                    // This receive finished the handshake, so
+                                    // the preface can go - if the server
+                                    // agreed to h2. One that chose nothing
+                                    // from the ALPN offer will answer it
+                                    // with HTTP/1.1 or silence, and there is
+                                    // no sense sending it: the connection is
+                                    // a connect that did not work out, and
+                                    // counts as one.
+                                    if fed.is_ok() && was_handshaking && !tls.is_handshaking() {
+                                        if tls.alpn_protocol().is_some_and(|p| p == b"h2") {
+                                            h2.initiate();
+                                        } else {
+                                            warn_once(NO_H2);
+                                            stats.errors += 1;
+                                            stats.connect_errors += 1;
+                                            started += 1;
+                                            conn_broken = true;
+                                        }
+                                    }
+                                    fed
+                                }
+                                None => h2.feed(buf_ring.data(bid, res as usize), &mut events),
                             }
                         };
                         buf_ring.recycle(bid);
                         process_events(conn, &events, &mut stats, &mut started);
-                        if !feed_ok {
-                            conn_broken = true;
-                        } else if conn.goaway && conn.streams.is_empty() {
+                        match fed {
+                            Err(e) => {
+                                let e = format!("{e:#}");
+                                // nginx without http2 does not choose nothing
+                                // from the offer of h2: it ends the handshake
+                                // with a no_application_protocol alert. The
+                                // same answer by another route.
+                                if e.contains("NoApplicationProtocol") {
+                                    warn_once(NO_H2);
+                                } else {
+                                    warn_once(&e);
+                                }
+                                conn_broken = true;
+                            }
+                            // The handshake ended without h2
+                            Ok(()) if conn_broken => {}
                             // GOAWAY and every stream the peer was still
                             // going to answer has been answered: nothing is
                             // gained by waiting for it to close
-                            conn_broken = true;
-                        } else {
-                            fill_streams(
-                                conn,
-                                &header_block,
-                                &target.body,
-                                parallel,
-                                &mut started,
-                                budget,
-                                stop,
-                            );
-                            // Window updates / ACKs / new request HEADERS go
-                            // out in the flush pass below
-                            conn.needs_flush = true;
+                            Ok(()) if conn.goaway && conn.streams.is_empty() => conn_broken = true,
+                            Ok(()) => {
+                                fill_streams(
+                                    conn,
+                                    &header_block,
+                                    &target.body,
+                                    parallel,
+                                    &mut started,
+                                    budget,
+                                    stop,
+                                );
+                                // Window updates / ACKs / new request HEADERS
+                                // go out in the flush pass below
+                                conn.needs_flush = true;
+                            }
                         }
                     }
                 }
@@ -687,6 +742,8 @@ pub fn run_worker(
     for conn in &mut conns {
         if conn.connected
             && !conn.sending
+            // A connection still in its handshake has said nothing to go away from
+            && !conn.tls.as_ref().is_some_and(TlsSession::is_handshaking)
             && let Some(h2) = conn.h2.as_mut()
         {
             h2.send_goaway();

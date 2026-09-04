@@ -1092,6 +1092,136 @@ fn h2_a_server_that_answers_a_little_per_connection_fails_nothing() {
     assert_all_ok(&report, 1000, "200");
 }
 
+/// Run shb expecting success and return the parsed JSON report with what it
+/// said on stderr
+fn shb_json_and_stderr(args: &[&str]) -> (serde_json::Value, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_shb"))
+        .arg("-j")
+        .args(args)
+        .output()
+        .expect("run shb");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "shb failed: {stderr}");
+    (
+        serde_json::from_slice(&output.stdout).expect("JSON report"),
+        stderr,
+    )
+}
+
+/// Answer whatever arrives with an HTTP/1.1 400 and wait for the peer to
+/// hang up, as an HTTP/1.1-only server does with an HTTP/2 preface
+fn answer_with_http1_400(mut sock: impl std::io::Read + std::io::Write) {
+    let mut buf = [0u8; 4096];
+    if sock.read(&mut buf).is_err() {
+        return;
+    }
+    let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+    // Read on until the client closes, so the close here carries no RST
+    // that could overtake the response
+    while matches!(sock.read(&mut buf), Ok(n) if n > 0) {}
+}
+
+fn start_http1_only_server() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || answer_with_http1_400(stream));
+        }
+    });
+    addr
+}
+
+/// A TLS server that offers no ALPN protocol at all, which is what a server
+/// that does not speak HTTP/2 does with a client's offer of h2
+fn start_tls_server_without_h2() -> SocketAddr {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+    let cert = certified.cert.der().clone();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = std::sync::Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("tls versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .expect("server cert"),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut conn = rustls::ServerConnection::new(config).expect("tls server");
+                answer_with_http1_400(rustls::Stream::new(&mut conn, &mut stream));
+            });
+        }
+    });
+    addr
+}
+
+/// python -m http.server answered the preface with an HTTP/1.1 501, which
+/// read as a frame is 4.7 MB of type 0x54 that never finishes arriving, and
+/// the run ended with every request an error and not a word about why. RFC
+/// 9113 Section 3.4: the server's first frame is its SETTINGS or the
+/// connection is in error, and this one is in error in a way worth naming.
+#[test]
+fn h2_says_when_the_server_answers_the_preface_with_http1() {
+    let addr = start_http1_only_server();
+    let url = format!("http://{addr}/");
+    let (report, stderr) = shb_json_and_stderr(&[
+        "--http2",
+        "-p",
+        "2",
+        "-n",
+        "4",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 4, "report: {report}");
+    assert!(stderr.contains("is h2c enabled"), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches("h2c").count(),
+        1,
+        "said once, not per connection: {stderr}"
+    );
+}
+
+/// The same over TLS is decided in the handshake: a server that chooses
+/// nothing from the ALPN offer is not going to answer the preface, so the
+/// preface is not sent and the connection counts as a connect that failed
+#[test]
+fn h2_says_when_the_server_does_not_negotiate_h2() {
+    let addr = start_tls_server_without_h2();
+    let url = format!("https://{addr}/");
+    let (report, stderr) = shb_json_and_stderr(&[
+        "--http2",
+        "-n",
+        "3",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        "--timeout",
+        "2s",
+        &url,
+    ]);
+    assert_eq!(report["requests"]["ok"], 0, "report: {report}");
+    assert_eq!(report["requests"]["errors"], 3, "report: {report}");
+    assert_eq!(report["requests"]["connectErrors"], 3, "report: {report}");
+    assert!(stderr.contains("did not negotiate h2"), "stderr: {stderr}");
+}
+
 // ------------------------------------------------------------------------
 // HTTP/3
 //
