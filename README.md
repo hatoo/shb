@@ -275,9 +275,10 @@ unprocessed — on a stream above the last one a GOAWAY says it acted on, or
 reset with `REFUSED_STREAM` on HTTP/2 or `H3_REQUEST_REJECTED` on HTTP/3 —
 is sent again and counted once, when it is answered, with its latency
 measured from the resend. That is a server declining requests, however
-many; on HTTP/2 a connection that closes without having answered anything
-is a server declining the connection, and what it turned away on it counts
-as errors.
+many; a connection that closes without having answered anything is a server
+declining the connection, and what it turned away on it counts as errors, so
+that a server turning everything away ends a run rather than being asked
+for ever.
 
 `-j` prints the same run as JSON, with every latency in seconds:
 

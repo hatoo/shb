@@ -153,6 +153,62 @@ fn local_params(connect_timeout: Duration) -> LocalParamsInput {
     }
 }
 
+/// Requests a connection gave back - ones the server never started on, so
+/// they can be sent again without anything happening twice - and what
+/// became of them
+///
+/// A give-back is sent again unless the connection it came from answered
+/// nothing at all, in which case it is an error: that ends a run against a
+/// server that turns everything away in one round trip per connection,
+/// while a server that answers some of each connection's requests and
+/// turns the rest away - nginx past `keepalive_requests`, however many
+/// streams are open - is never cut off. The verdict is not always ready
+/// when the give-back is: a GOAWAY can arrive a datagram ahead of the
+/// responses it lets through, so a give-back from a connection that has
+/// answered nothing yet waits until it does, or until nothing is left in
+/// flight to answer.
+#[derive(Default)]
+struct GiveBacks {
+    /// Requests answered on this connection since it was opened
+    completed: u64,
+    /// Given back while nothing had been answered, verdict pending
+    unjudged: u64,
+    /// Sent again from this connection
+    retried: u64,
+}
+
+impl GiveBacks {
+    fn give_back(&mut self, parallel: usize, stats: &mut Stats, started: &mut u64) {
+        if self.completed == 0 {
+            self.unjudged += 1;
+        } else if self.retried < parallel as u64 * self.completed {
+            // A bound that nothing well-behaved reaches: at most the streams
+            // open at once come back from a connection that closes, and a
+            // server that keeps a connection open only to turn away more
+            // than it answers, many times over, is asked no further
+            self.retried += 1;
+            *started -= 1;
+        } else {
+            stats.errors += 1;
+        }
+    }
+
+    /// Settle the give-backs that were waiting on this connection, once it
+    /// has answered something or has nothing left in flight
+    fn judge(&mut self, drained: bool, parallel: usize, stats: &mut Stats, started: &mut u64) {
+        if self.unjudged == 0 {
+            return;
+        }
+        if self.completed > 0 {
+            for _ in 0..std::mem::take(&mut self.unjudged) {
+                self.give_back(parallel, stats, started);
+            }
+        } else if drained {
+            stats.errors += std::mem::take(&mut self.unjudged);
+        }
+    }
+}
+
 struct InFlight {
     stream_id: u64,
     start: Instant,
@@ -196,6 +252,7 @@ struct Conn {
     generation: u64,
     /// In-flight requests, up to the configured parallelism
     streams: H3Ring<InFlight>,
+    give_backs: GiveBacks,
     /// The connection is over and its requests are accounted for, but the
     /// socket stays until the send of its CONNECTION_CLOSE completes, or
     /// until this deadline. Closing the socket earlier would hand the
@@ -221,6 +278,7 @@ impl Conn {
             recv_armed: false,
             generation: 0,
             streams: H3Ring::new(),
+            give_backs: GiveBacks::default(),
             closing: None,
         }
     }
@@ -254,6 +312,7 @@ impl Conn {
         self.sending = false;
         self.recv_armed = false;
         self.streams.clear();
+        self.give_backs = GiveBacks::default();
         self.closing = None;
         // Bump the generation so CQEs of operations on the old socket are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
@@ -269,6 +328,9 @@ impl Conn {
         }
         stats.errors += self.streams.len() as u64;
         self.streams.clear();
+        // Nothing will be answered on it now, so what was waiting on that
+        // is settled the same way
+        stats.errors += std::mem::take(&mut self.give_backs.unjudged);
     }
 }
 
@@ -471,26 +533,6 @@ fn pump_transmits(
 /// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
 ///
 /// Returns false if the connection is broken.
-/// Give a request the server never started on back to the budget, so the
-/// next fill sends it again as a new request
-///
-/// A counted run may do that as many times as it has requests, plus once for
-/// every request that has completed: a server that turns some away and
-/// answers the rest is never cut off, and one that turns everything away
-/// ends the run with errors rather than sending for ever. A timed run ends
-/// on the clock either way.
-fn send_again(budget: Budget, stats: &mut Stats, started: &mut u64, retried: &mut u64) {
-    if budget
-        .expected_requests()
-        .is_none_or(|n| *retried < n + stats.completed)
-    {
-        *retried += 1;
-        *started -= 1;
-    } else {
-        stats.errors += 1;
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn drive(
     conn: &mut Conn,
@@ -498,7 +540,6 @@ fn drive(
     request: &[u8],
     parallel: usize,
     started: &mut u64,
-    retried: &mut u64,
     budget: Budget,
     stop: bool,
 ) -> bool {
@@ -585,13 +626,19 @@ fn drive(
                 continue;
             };
             let status = inflight.reader.status();
-            if reset == Some(proto::H3_REQUEST_REJECTED) {
+            // A GOAWAY says nothing at or above its stream id was processed
+            // (RFC 9114 Section 5.2), whatever code a reset there carries:
+            // nginx past twice keepalive_requests ends the connection and
+            // resets what is open with H3_INTERNAL_ERROR, having said so
+            // in the GOAWAY it queued first
+            let unprocessed = status == 0 && conn.goaway.is_some_and(|goaway| id >= goaway);
+            if reset == Some(proto::H3_REQUEST_REJECTED) || (reset.is_some() && unprocessed) {
                 // The server never started on it, so it can be sent again
                 // without anything happening twice (RFC 9114 Section
                 // 4.1.1). It goes back to the budget and out on the next
                 // connection, timed from there: what is measured is a
                 // request the server answered, not one it turned away.
-                send_again(budget, stats, started, retried);
+                conn.give_backs.give_back(parallel, stats, started);
             } else if reset.is_some() || status == 0 {
                 // Every response begins with a HEADERS frame carrying
                 // :status (RFC 9114 Section 4.1); a stream that ends without
@@ -602,6 +649,7 @@ fn drive(
                 stats.errors += 1;
             } else {
                 stats.record_success(status, inflight.start);
+                conn.give_backs.completed += 1;
             }
             quic.retire(id);
         }
@@ -628,13 +676,15 @@ fn drive(
             for id in unprocessed {
                 conn.streams.take(id);
                 quic.retire(id);
-                send_again(budget, stats, started, retried);
+                conn.give_backs.give_back(parallel, stats, started);
             }
             if conn.streams.is_empty() {
                 quic.close(proto::H3_NO_ERROR, b"");
                 alive = false;
             }
         }
+        conn.give_backs
+            .judge(conn.streams.is_empty(), parallel, stats, started);
 
         flush_unsent(quic, &mut conn.streams)?;
         // Back where the next pass will find them, with the capacity they grew
@@ -700,8 +750,6 @@ pub fn run_worker(
         stats.latencies_ns.reserve(n as usize);
     }
     let mut started: u64 = 0;
-    // Requests sent again because the server never started on them
-    let mut retried: u64 = 0;
 
     // Held for its lifetime: the SQE points at it until the run is over
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
@@ -805,7 +853,6 @@ pub fn run_worker(
                     &request,
                     parallel,
                     &mut started,
-                    &mut retried,
                     budget,
                     stop,
                 );
@@ -1019,7 +1066,6 @@ pub fn run_worker(
                 &request,
                 parallel,
                 &mut started,
-                &mut retried,
                 budget,
                 stop,
             );
@@ -1183,4 +1229,76 @@ fn finish_close(
     conn.recv_armed = true;
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// nginx past keepalive_requests: it answers some of a connection's
+    /// requests and turns the rest away, so the rest go out again
+    #[test]
+    fn a_connection_that_answered_something_sends_its_give_backs_again() {
+        let mut stats = Stats::default();
+        let mut started = 100;
+        let mut g = GiveBacks {
+            completed: 10,
+            ..Default::default()
+        };
+        for _ in 0..90 {
+            g.give_back(100, &mut stats, &mut started);
+        }
+        assert_eq!((started, stats.errors), (10, 0));
+    }
+
+    /// A server that turns everything away: once nothing is left in flight
+    /// on a connection that answered nothing, what it turned away is an
+    /// error, which is what ends a counted run
+    #[test]
+    fn a_connection_that_answered_nothing_counts_its_give_backs_as_errors() {
+        let mut stats = Stats::default();
+        let mut started = 8;
+        let mut g = GiveBacks::default();
+        for _ in 0..8 {
+            g.give_back(8, &mut stats, &mut started);
+        }
+        assert_eq!((started, stats.errors), (8, 0), "not decided yet");
+        g.judge(false, 8, &mut stats, &mut started);
+        assert_eq!(stats.errors, 0, "something is still in flight");
+        g.judge(true, 8, &mut stats, &mut started);
+        assert_eq!((started, stats.errors), (8, 8));
+    }
+
+    /// A GOAWAY can arrive a datagram ahead of the responses it lets
+    /// through, so the verdict waits for them
+    #[test]
+    fn a_give_back_waits_for_the_first_answer() {
+        let mut stats = Stats::default();
+        let mut started = 100;
+        let mut g = GiveBacks::default();
+        for _ in 0..90 {
+            g.give_back(100, &mut stats, &mut started);
+        }
+        g.judge(false, 100, &mut stats, &mut started);
+        assert_eq!((started, stats.errors, g.unjudged), (100, 0, 90));
+        g.completed = 10;
+        g.judge(false, 100, &mut stats, &mut started);
+        assert_eq!((started, stats.errors, g.unjudged), (10, 0, 0));
+    }
+
+    /// A server that keeps a connection open only to turn away many times
+    /// more than it answers is asked no further
+    #[test]
+    fn give_backs_on_one_connection_are_bounded_by_what_it_answered() {
+        let mut stats = Stats::default();
+        let mut started = 1000;
+        let mut g = GiveBacks {
+            completed: 1,
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            g.give_back(8, &mut stats, &mut started);
+        }
+        assert_eq!((started, stats.errors), (992, 32));
+    }
 }
