@@ -60,6 +60,9 @@ pub fn parse_target(
     } else {
         bail!("only http:// and https:// URLs are supported");
     };
+    // The fragment is the client's own business and never goes on the wire
+    // (RFC 9110 Section 7.1)
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -321,6 +324,19 @@ mod tests {
             target("http://127.0.0.1:8080/a/b?c=1&d=2").path,
             "/a/b?c=1&d=2"
         );
+    }
+
+    #[test]
+    fn a_fragment_is_not_sent() {
+        assert_eq!(
+            target("http://127.0.0.1:8080/index.html#top").path,
+            "/index.html"
+        );
+        assert_eq!(target("http://127.0.0.1:8080/a?b=1#c").path, "/a?b=1");
+        // Without a path the fragment would otherwise end up in the port
+        let t = target("http://127.0.0.1:8080#top");
+        assert_eq!(t.path, "/");
+        assert_eq!(t.addr.port(), 8080);
     }
 
     #[test]
