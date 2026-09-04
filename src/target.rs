@@ -17,9 +17,13 @@ pub struct Target {
     pub path: String,
     /// HTTP method (validated as an RFC 9110 token by [`parse_target`])
     pub method: String,
-    /// Custom headers in curl -H order (Host excluded; it becomes
-    /// [`Target::authority`]). Names keep the user's casing, which HTTP/1.1
-    /// sends as given; the HTTP/2 and HTTP/3 workers lower-case them
+    /// Custom headers in curl -H order. Host is excluded (it becomes
+    /// [`Target::authority`]), and so are Content-Length and
+    /// Transfer-Encoding: framing follows [`Target::body`], and the one
+    /// `Content-Length` that cannot - the `0` of a request without a body -
+    /// is a header here so that every protocol sends it. Names keep the
+    /// user's casing, which HTTP/1.1 sends as given; the HTTP/2 and HTTP/3
+    /// workers lower-case them
     pub headers: Vec<(String, String)>,
     /// Request body (empty = no body)
     pub body: Vec<u8>,
@@ -134,6 +138,7 @@ pub fn parse_target(
     }
     let authority = host_override.unwrap_or_else(|| authority.to_string());
     let body: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
+    frame_body(&mut headers, &body)?;
 
     let request_bytes = encode_request(method, path, &authority, &headers, &body)?;
 
@@ -149,6 +154,45 @@ pub fn parse_target(
         request_bytes,
         disable_keepalive,
     })
+}
+
+/// Settle how the body is framed, which is shb's to decide rather than the
+/// user's: every protocol derives Content-Length from the body itself, so a
+/// copy given with -H went out alongside it, and the whole body is in memory
+/// before the first request, so chunking has nothing to offer. A
+/// Content-Length given by hand is checked against the body and then dropped
+/// in favour of the derived one; one that disagrees would announce a body
+/// other than the one sent, which RFC 9110 Section 8.6 rules out, and sending
+/// it next to a Transfer-Encoding is what RFC 9112 Section 6.2 forbids. The
+/// one Content-Length the body cannot stand for is the `0` of a request
+/// without one, which stays a header so that the HTTP/2 and HTTP/3 blocks,
+/// which add a content-length only for a body with bytes, send it too.
+fn frame_body(headers: &mut Vec<(String, String)>, body: &[u8]) -> Result<()> {
+    let mut content_length_given = false;
+    for (name, value) in headers.iter() {
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            bail!("Transfer-Encoding is not supported: the body is sent with a Content-Length");
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("invalid Content-Length: {value:?}");
+            }
+            let n: u64 = value.parse().context("Content-Length overflow")?;
+            if n != body.len() as u64 {
+                bail!(
+                    "Content-Length {n} does not match the {} byte body given with -d",
+                    body.len()
+                );
+            }
+            content_length_given = true;
+        }
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+    if body.is_empty() && content_length_given {
+        headers.push(("Content-Length".to_string(), "0".to_string()));
+    }
+    Ok(())
 }
 
 /// RFC 9110 Section 5.6.2 token characters
@@ -391,6 +435,69 @@ mod tests {
         let req = String::from_utf8(t.request_bytes).unwrap();
         assert!(req.contains("Connection: keep-alive"), "{req:?}");
         assert!(!req.contains("Connection: close"), "{req:?}");
+    }
+
+    /// The error text of a rejected POST with a body
+    fn err_for_body(header_args: &[&str], body: &[u8]) -> String {
+        let headers: Vec<String> = header_args.iter().map(|s| s.to_string()).collect();
+        match parse_target("http://127.0.0.1:1/", "POST", &headers, Some(body), false) {
+            Ok(_) => panic!("expected a rejection"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_content_length_given_by_hand_is_sent_once() {
+        let request = req(&["Content-Length: 5"], "POST", Some(b"hello"));
+        assert_eq!(request.matches("Content-Length").count(), 1, "{request:?}");
+        assert!(request.contains("Content-Length: 5\r\n"), "{request:?}");
+
+        // Without a body it is kept, which a GET would not get on its own
+        let request = req(&["content-length: 0"], "GET", None);
+        assert_eq!(
+            request.matches("Content-Length: 0\r\n").count(),
+            1,
+            "{request:?}"
+        );
+        assert!(!request.contains("content-length"), "{request:?}");
+    }
+
+    #[test]
+    fn a_content_length_that_is_not_the_body_length_is_rejected() {
+        let err = err_for_body(&["Content-Length: 2"], b"abc");
+        assert!(err.contains("Content-Length 2"), "{err}");
+        let err = err_for_body(&["Content-Length: three"], b"abc");
+        assert!(err.contains("Content-Length"), "{err}");
+        let err = err_for_body(&["Content-Length: 99999999999999999999999"], b"abc");
+        assert!(err.contains("Content-Length"), "{err}");
+    }
+
+    #[test]
+    fn transfer_encoding_is_rejected() {
+        let err = err_for_body(&["Transfer-Encoding: chunked"], b"abc");
+        assert!(err.contains("Transfer-Encoding"), "{err}");
+    }
+
+    /// HTTP/2 and HTTP/3 build their header blocks from `headers` and the
+    /// body length, adding a content-length only for a body with bytes, so
+    /// the header list must carry a Content-Length exactly when the body
+    /// cannot stand for one
+    #[test]
+    fn framing_reaches_the_other_protocols_through_the_header_list() {
+        let content_lengths = |t: &Target| {
+            t.headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .count()
+        };
+        let given = vec!["Content-Length: 3".to_string()];
+        let t = parse_target("http://127.0.0.1:1/", "POST", &given, Some(b"abc"), false)
+            .expect("parse");
+        assert_eq!(content_lengths(&t), 0, "the body length stands for it");
+
+        let given = vec!["Content-Length: 0".to_string()];
+        let t = parse_target("http://127.0.0.1:1/", "POST", &given, None, false).expect("parse");
+        assert_eq!(content_lengths(&t), 1, "nothing else would send it");
     }
 
     #[test]
