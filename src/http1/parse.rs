@@ -12,6 +12,7 @@
 //! That check costs one extra name comparison on lines starting with `c`.
 
 use anyhow::{Context, Result, bail};
+use memchr::memchr;
 
 /// How the body of the response being read is delimited
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -423,10 +424,6 @@ fn ci_ends_with_chunked(value: &[u8]) -> bool {
         None => return false,
     };
     tail.iter().zip(b"chunked").all(|(a, b)| a | 0x20 == *b)
-}
-
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    memchr::memchr(needle, haystack)
 }
 
 #[cfg(test)]
