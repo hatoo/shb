@@ -138,7 +138,7 @@ pub fn parse_target(
     }
     let authority = host_override.unwrap_or_else(|| authority.to_string());
     let body: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
-    frame_body(&mut headers, &body)?;
+    frame_body(method, &mut headers, &body)?;
 
     let request_bytes = encode_request(method, path, &authority, &headers, &body)?;
 
@@ -165,9 +165,11 @@ pub fn parse_target(
 /// other than the one sent, which RFC 9110 Section 8.6 rules out, and sending
 /// it next to a Transfer-Encoding is what RFC 9112 Section 6.2 forbids. The
 /// one Content-Length the body cannot stand for is the `0` of a request
-/// without one, which stays a header so that the HTTP/2 and HTTP/3 blocks,
-/// which add a content-length only for a body with bytes, send it too.
-fn frame_body(headers: &mut Vec<(String, String)>, body: &[u8]) -> Result<()> {
+/// without one, which a method that gives content a meaning sends
+/// unprompted - a bare POST is one that some servers answer with 411 - and
+/// which stays a header so that the HTTP/2 and HTTP/3 blocks, which add a
+/// content-length only for a body with bytes, send it too.
+fn frame_body(method: &str, headers: &mut Vec<(String, String)>, body: &[u8]) -> Result<()> {
     let mut content_length_given = false;
     for (name, value) in headers.iter() {
         if name.eq_ignore_ascii_case("transfer-encoding") {
@@ -189,10 +191,17 @@ fn frame_body(headers: &mut Vec<(String, String)>, body: &[u8]) -> Result<()> {
         }
     }
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
-    if body.is_empty() && content_length_given {
+    if body.is_empty() && (content_length_given || defines_content(method)) {
         headers.push(("Content-Length".to_string(), "0".to_string()));
     }
     Ok(())
+}
+
+/// Methods that define a meaning for request content, which a user agent
+/// should send a Content-Length with even when there is none (RFC 9110
+/// Section 8.6; PATCH is RFC 5789)
+fn defines_content(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH")
 }
 
 /// RFC 9110 Section 5.6.2 token characters
@@ -460,6 +469,32 @@ mod tests {
             "{request:?}"
         );
         assert!(!request.contains("content-length"), "{request:?}");
+    }
+
+    #[test]
+    fn a_bodyless_post_says_so() {
+        for method in ["POST", "PUT", "PATCH"] {
+            let request = req(&[], method, None);
+            assert!(
+                request.ends_with("Content-Length: 0\r\n\r\n"),
+                "{method}: {request:?}"
+            );
+            assert_eq!(request.matches("Content-Length").count(), 1, "{method}");
+        }
+        // Content means nothing to these, so they say nothing about it
+        for method in ["GET", "DELETE", "OPTIONS"] {
+            let request = req(&[], method, None);
+            assert!(!request.contains("Content-Length"), "{method}: {request:?}");
+        }
+        // And it reaches HTTP/2 and HTTP/3 the way every header does
+        let t = parse_target("http://127.0.0.1:1/", "PUT", &[], None, false).expect("parse");
+        assert!(
+            t.headers
+                .iter()
+                .any(|(name, value)| name == "Content-Length" && value == "0"),
+            "{:?}",
+            t.headers
+        );
     }
 
     #[test]
