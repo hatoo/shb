@@ -218,6 +218,22 @@ pub struct Connection {
     /// The max_idle_timeout shb advertised, which binds it as much as the
     /// peer's binds the peer
     local_idle_ms: u64,
+    /// How long the handshake may take, which is what the idle timer
+    /// enforces until the connection is up: a server too slow to finish it
+    /// is as much a failed connect as one that never answers
+    handshake_timeout_ms: u64,
+    /// An ack-eliciting packet has gone out since a packet was last
+    /// received. RFC 9000 Section 10.1 restarts the idle timer on the first
+    /// one and not on the ones after it, so that a peer that has stopped
+    /// answering is still noticed.
+    sent_since_recv: bool,
+    /// When to send a PING so that neither side's idle timer runs out while
+    /// a response is still owed (RFC 9000 Section 10.1.2)
+    next_keepalive: Option<Instant>,
+    keepalive_pending: bool,
+    /// Request streams whose response has not ended, which is when a
+    /// keepalive is worth sending
+    unanswered: u64,
     handshake_done: bool,
     /// The peer has acknowledged a Handshake packet of ours, which is
     /// what ends the probing RFC 9002 Section 6.2.2.1 asks for while
@@ -346,6 +362,11 @@ impl Connection {
             server_initial_seen: false,
             params: Params::default(),
             local_idle_ms: local_params.max_idle_timeout_ms,
+            handshake_timeout_ms: local_params.handshake_timeout_ms,
+            sent_since_recv: false,
+            next_keepalive: None,
+            keepalive_pending: false,
+            unanswered: 0,
             handshake_done: false,
             handshake_acked: false,
             connected: false,
@@ -435,6 +456,9 @@ pub struct LocalParamsInput {
     pub initial_max_stream_data: u64,
     pub initial_max_streams_uni: u64,
     pub max_idle_timeout_ms: u64,
+    /// How long the handshake may take; not a transport parameter, but the
+    /// deadline the idle timer keeps until there is a connection
+    pub handshake_timeout_ms: u64,
 }
 
 // -------------------------------------------------------------------------
@@ -728,6 +752,9 @@ impl Connection {
             ack_eliciting: filled.ack_eliciting,
             frames,
         });
+        if filled.ack_eliciting {
+            self.note_sent(now);
+        }
         Ok(true)
     }
 }
@@ -845,6 +872,16 @@ impl Connection {
         // timeout raised.
         if self.pto_probes > 0 && space == self.pto_space && room(out) > 1 {
             self.pto_probes -= 1;
+            if !ack_eliciting {
+                frame::put_ping(out);
+                frames.push(SentFrame::Ping);
+                ack_eliciting = true;
+            }
+        }
+        // A keepalive is satisfied by anything the peer has to acknowledge;
+        // only a packet with nothing else in it needs the PING
+        if self.keepalive_pending && space == Space::Data && room(out) > 1 {
+            self.keepalive_pending = false;
             if !ack_eliciting {
                 frame::put_ping(out);
                 frames.push(SentFrame::Ping);
@@ -1014,7 +1051,7 @@ impl Connection {
             pos += consumed;
         }
         if processed {
-            self.arm_idle(now);
+            self.note_received(now);
         } else if let Some(tail) = tail
             && self.is_stateless_reset(&tail)
         {
@@ -1655,6 +1692,9 @@ impl Connection {
     /// than three probe timeouts so that a slow path is not taken for a dead
     /// one
     fn idle_timeout(&self) -> Option<Duration> {
+        if !self.connected {
+            return Some(Duration::from_millis(self.handshake_timeout_ms));
+        }
         let ms = match (self.local_idle_ms, self.params.max_idle_timeout_ms) {
             (0, 0) => return None,
             (0, peer) => peer,
@@ -1679,7 +1719,44 @@ impl Connection {
         if !self.connected && self.idle_deadline.is_some() {
             return;
         }
-        self.idle_deadline = self.idle_timeout().map(|t| now + t);
+        let timeout = self.idle_timeout();
+        self.idle_deadline = timeout.map(|t| now + t);
+        // Halfway to the deadline: the PING reaches the peer and its
+        // acknowledgement comes back with the other half to spare, and a
+        // peer whose own timeout is the shorter one is measured by the same
+        // clock, since the deadline is the smaller of the two
+        self.next_keepalive = timeout.map(|t| now + t / 2);
+    }
+
+    /// A packet from the peer was processed, which restarts the idle timer
+    fn note_received(&mut self, now: Instant) {
+        self.sent_since_recv = false;
+        self.arm_idle(now);
+    }
+
+    /// An ack-eliciting packet went out. RFC 9000 Section 10.1 restarts
+    /// the idle timer for the first one since a packet was received, so a
+    /// connection is not idle while a request is on its way, and not for
+    /// the ones after it, so a peer that has stopped answering is noticed
+    /// however much is sent to it.
+    fn note_sent(&mut self, now: Instant) {
+        if self.sent_since_recv {
+            return;
+        }
+        self.sent_since_recv = true;
+        if self.connected {
+            self.arm_idle(now);
+        }
+    }
+
+    /// When a PING is owed: only while a response is outstanding, since a
+    /// connection with nothing in flight has nothing to keep alive for
+    /// (RFC 9000 Section 10.1.2), and only once there is a connection
+    fn keepalive_deadline(&self) -> Option<Instant> {
+        if !self.connected || self.unanswered == 0 {
+            return None;
+        }
+        self.next_keepalive
     }
 
     /// A server that does not speak QUIC version 1 lists the ones it does
@@ -1807,6 +1884,7 @@ impl Connection {
         }
         let id = client_stream_id(Dir::Bi, self.next_bidi);
         self.next_bidi += 1;
+        self.unanswered += 1;
         let limit = self.params.initial_max_stream_data_bidi_remote;
         let (send_buf, recv_buf) = self.spare_bufs.pop().unwrap_or_default();
         self.streams.push_back(Some(StreamPair {
@@ -1899,10 +1977,15 @@ impl Connection {
         const SPARES: usize = 256;
         if let Some(i) = self.stream_index(id)
             && let Some(mut pair) = self.streams[i].take()
-            && self.spare_bufs.len() < SPARES
         {
-            self.spare_bufs
-                .push((pair.send.take_buf(), pair.recv.take_buf()));
+            // Given up on before it was answered, as after a GOAWAY
+            if !pair.finished {
+                self.unanswered -= 1;
+            }
+            if self.spare_bufs.len() < SPARES {
+                self.spare_bufs
+                    .push((pair.send.take_buf(), pair.recv.take_buf()));
+            }
         }
         // Trim the front so the ring does not grow for the life of the run
         while matches!(self.streams.front(), Some(None)) {
@@ -1923,6 +2006,7 @@ impl Connection {
             let done = pair.recv.is_finished() && !pair.finished;
             if done {
                 pair.finished = true;
+                self.unanswered -= 1;
             }
             if readable {
                 self.push_readable(id);
@@ -1974,6 +2058,7 @@ impl Connection {
                 pair.recv.reset(final_size)?;
                 if !pair.finished {
                     pair.finished = true;
+                    self.unanswered -= 1;
                     self.events.push_back(Event::Finished {
                         id,
                         reset: Some(error),
@@ -2011,10 +2096,15 @@ impl Connection {
             self.pto_fallback(),
         )
         .map(|(_, at)| at);
-        [self.loss_deadline, pto, self.idle_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.loss_deadline,
+            pto,
+            self.idle_deadline,
+            self.keepalive_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Where to probe when nothing is in flight, while that still has to be
@@ -2040,6 +2130,15 @@ impl Connection {
             } else {
                 "the handshake did not finish within the connect timeout"
             });
+            return;
+        }
+        if self.keepalive_deadline().is_some_and(|d| now >= d) {
+            // Owed again at the next half, whether or not this one is
+            // answered: the idle timer, not the keepalive, is what decides
+            // a peer that has gone quiet is gone
+            self.keepalive_pending = true;
+            self.next_keepalive = self.idle_timeout().map(|t| now + t / 2);
+            self.needs_send = true;
             return;
         }
         if self.loss_deadline.is_some_and(|d| now >= d) {
@@ -2113,6 +2212,7 @@ mod tests {
                 initial_max_stream_data: 1 << 20,
                 initial_max_streams_uni: 3,
                 max_idle_timeout_ms: 5_000,
+                handshake_timeout_ms: 5_000,
             },
         )
         .unwrap()
@@ -2208,6 +2308,7 @@ mod tests {
                 initial_max_stream_data: 1 << 20,
                 initial_max_streams_uni: 3,
                 max_idle_timeout_ms: 5_000,
+                handshake_timeout_ms: 5_000,
             },
         )
         .unwrap();
@@ -2288,6 +2389,7 @@ mod tests {
                 initial_max_stream_data: 1 << 20,
                 initial_max_streams_uni: 3,
                 max_idle_timeout_ms: 5_000,
+                handshake_timeout_ms: 5_000,
             },
         )
         .unwrap();
@@ -2395,6 +2497,7 @@ mod tests {
                 initial_max_stream_data: 1 << 20,
                 initial_max_streams_uni: 3,
                 max_idle_timeout_ms: 5_000,
+                handshake_timeout_ms: 5_000,
             },
         )
         .unwrap();
@@ -2439,6 +2542,7 @@ mod tests {
                 initial_max_stream_data: 1 << 20,
                 initial_max_streams_uni: 3,
                 max_idle_timeout_ms: 5_000,
+                handshake_timeout_ms: 5_000,
             },
         )
         .unwrap()
@@ -2980,5 +3084,117 @@ mod tests {
         packet[last] ^= 1;
         let other = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert!(!retry_tag_is_valid(&other, &packet));
+    }
+
+    /// The handshake has its own deadline: the advertised idle timeout is
+    /// what a slow response gets, the connect timeout is what a server that
+    /// never finishes the handshake gets
+    #[test]
+    fn the_handshake_deadline_is_the_connect_timeout_not_the_idle_timeout() {
+        let tls = crate::tls::client_config(b"h3").unwrap();
+        let mut conn = Connection::connect(
+            tls,
+            "localhost",
+            LocalParamsInput {
+                initial_max_data: 1 << 20,
+                initial_max_stream_data: 1 << 20,
+                initial_max_streams_uni: 3,
+                max_idle_timeout_ms: 30_000,
+                handshake_timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        assert_eq!(conn.idle_deadline, Some(now + Duration::from_secs(5)));
+        conn.connected = true;
+        conn.arm_idle(now);
+        assert_eq!(conn.idle_deadline, Some(now + Duration::from_secs(30)));
+    }
+
+    /// RFC 9000 Section 10.1: sending an ack-eliciting packet restarts the
+    /// idle timer if none has been sent since a packet was last received -
+    /// so a request on its way is not idleness - and not otherwise, so a
+    /// peer that has stopped answering is still noticed
+    #[test]
+    fn the_idle_timer_restarts_on_the_first_send_after_a_receive_only() {
+        let mut conn = client();
+        conn.connected = true;
+        let now = Instant::now();
+        conn.note_received(now);
+        let idle = Duration::from_secs(5);
+        assert_eq!(conn.idle_deadline, Some(now + idle));
+
+        let later = now + Duration::from_secs(1);
+        conn.note_sent(later);
+        assert_eq!(conn.idle_deadline, Some(later + idle), "the first send");
+        conn.note_sent(later + Duration::from_secs(1));
+        assert_eq!(conn.idle_deadline, Some(later + idle), "not the second");
+
+        let received = later + Duration::from_secs(2);
+        conn.note_received(received);
+        assert_eq!(conn.idle_deadline, Some(received + idle));
+        conn.note_sent(received + Duration::from_secs(1));
+        assert_eq!(
+            conn.idle_deadline,
+            Some(received + Duration::from_secs(1) + idle),
+            "a receive lets the next send restart it again"
+        );
+    }
+
+    /// RFC 9000 Section 10.1.2: a PING before the effective idle timeout
+    /// runs out, while a response is owed, so that a server with a short
+    /// idle timeout does not close on a slow response. nginx advertises
+    /// its keepalive_timeout; at three seconds it closed on every response
+    /// slower than that.
+    #[test]
+    fn a_keepalive_ping_goes_out_at_half_the_idle_timeout_while_a_response_is_owed() {
+        let mut conn = client();
+        conn.connected = true;
+        conn.params.max_idle_timeout_ms = 3_000;
+        conn.max_streams_bidi = 1;
+        conn.params.initial_max_stream_data_bidi_remote = 1000;
+        conn.max_data_peer = 1000;
+        let now = Instant::now();
+        conn.note_received(now);
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(now + Duration::from_secs(3)),
+            "nothing outstanding, nothing to keep alive for"
+        );
+
+        let (id, _) = conn.send_oneshot(b"request").unwrap();
+        let half = now + Duration::from_millis(1_500);
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(half),
+            "the keepalive, not the idle timer"
+        );
+        conn.handle_timeout(half);
+        assert!(conn.keepalive_pending);
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(half + Duration::from_millis(1_500)),
+            "owed again at the next half"
+        );
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        // The request itself has left already
+        conn.stream_mut(id).unwrap().send.on_sent(0, 7, true);
+        let filled = conn
+            .fill_payload(Space::Data, half, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        assert!(filled.ack_eliciting);
+        assert_eq!(frames, vec![SentFrame::Ping]);
+        assert!(!conn.keepalive_pending);
+
+        conn.on_reset(id, 0x10c, 0).unwrap();
+        assert_eq!(conn.unanswered, 0);
+        assert_eq!(
+            conn.poll_timeout(),
+            conn.idle_deadline,
+            "answered, so only the idle timer is left"
+        );
     }
 }

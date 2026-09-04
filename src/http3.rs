@@ -136,20 +136,31 @@ fn build_field_section(target: &Target) -> Vec<u8> {
     )
 }
 
+/// The least shb will wait on a connection with nothing arriving before it
+/// counts it as gone. A slow response is a result to report and --timeout
+/// is what bounds waiting for one, so the idle timeout only has to outlast
+/// it; below that, thirty seconds is what the browsers and the QUIC
+/// libraries advertise.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What shb asks of the peer, and what it promises in return
 ///
 /// The windows are large because the point is to keep the link full: a
 /// benchmark client that stalls on flow control is measuring its own limits.
-fn local_params(connect_timeout: Duration) -> LocalParamsInput {
+fn local_params(connect_timeout: Duration, timeout: Option<Duration>) -> LocalParamsInput {
     LocalParamsInput {
         initial_max_data: RECEIVE_WINDOW as u64,
         initial_max_stream_data: RECEIVE_WINDOW as u64,
         // The control stream and the two QPACK streams, and nothing else
         initial_max_streams_uni: 3,
         // Binds both sides: the peer closes a connection idle for this long,
-        // and so does shb - which, until the handshake completes, is what
-        // makes a server that never answers a failed connect
-        max_idle_timeout_ms: connect_timeout.as_millis() as u64,
+        // and so does shb. It used to be the connect timeout, which made a
+        // response slower than five seconds an idle connection.
+        max_idle_timeout_ms: IDLE_TIMEOUT
+            .max(timeout.unwrap_or(Duration::ZERO))
+            .as_millis() as u64,
+        // What makes a server that never answers a failed connect
+        handshake_timeout_ms: connect_timeout.as_millis() as u64,
     }
 }
 
@@ -768,7 +779,7 @@ pub fn run_worker(
         conn.quic = Some(Connection::connect(
             tls_config.clone(),
             &target.host,
-            local_params(connect_timeout),
+            local_params(connect_timeout, timeout),
         )?);
         uring::push_recv_multi(&submitter, &mut sq, i, conn.generation)?;
         conn.recv_armed = true;
@@ -815,6 +826,7 @@ pub fn run_worker(
                         conn,
                         &tls_config,
                         connect_timeout,
+                        timeout,
                         target,
                         &mut started,
                         budget,
@@ -874,6 +886,7 @@ pub fn run_worker(
                         &mut stats,
                         &tls_config,
                         connect_timeout,
+                        timeout,
                         target,
                         &mut started,
                         budget,
@@ -913,6 +926,7 @@ pub fn run_worker(
                     &mut stats,
                     &tls_config,
                     connect_timeout,
+                    timeout,
                     target,
                     &mut started,
                     budget,
@@ -1040,6 +1054,7 @@ pub fn run_worker(
                     &mut stats,
                     &tls_config,
                     connect_timeout,
+                    timeout,
                     target,
                     &mut started,
                     budget,
@@ -1087,6 +1102,7 @@ pub fn run_worker(
                     &mut stats,
                     &tls_config,
                     connect_timeout,
+                    timeout,
                     target,
                     &mut started,
                     budget,
@@ -1151,6 +1167,7 @@ fn begin_close(
     stats: &mut Stats,
     tls_config: &Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
+    timeout: Option<Duration>,
     target: &Target,
     started: &mut u64,
     budget: Budget,
@@ -1183,6 +1200,7 @@ fn begin_close(
         conn,
         tls_config,
         connect_timeout,
+        timeout,
         target,
         started,
         budget,
@@ -1203,6 +1221,7 @@ fn finish_close(
     conn: &mut Conn,
     tls_config: &Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
+    timeout: Option<Duration>,
     target: &Target,
     started: &mut u64,
     budget: Budget,
@@ -1223,7 +1242,7 @@ fn finish_close(
     conn.quic = Some(Connection::connect(
         tls_config.clone(),
         &target.host,
-        local_params(connect_timeout),
+        local_params(connect_timeout, timeout),
     )?);
     uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
     conn.recv_armed = true;
