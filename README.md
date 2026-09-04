@@ -265,6 +265,13 @@ Latency distribution:
   99.99% in 1.452 ms
 ```
 
+A request counts as an error when its stream is reset, its connection is
+lost, or its response never comes. One that an HTTP/3 server turns away
+unprocessed — on a stream at or above a GOAWAY's id, or reset with
+`H3_REQUEST_REJECTED` — is sent again on the replacement connection and
+counted once, when it is answered, with its latency measured from the
+resend.
+
 `-j` prints the same run as JSON, with every latency in seconds:
 
 ```json

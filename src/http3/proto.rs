@@ -23,6 +23,11 @@ pub const STREAM_CONTROL: u64 = 0x00;
 pub const STREAM_QPACK_ENCODER: u64 = 0x02;
 pub const STREAM_QPACK_DECODER: u64 = 0x03;
 
+// Error codes (RFC 9114 Section 8.1)
+/// The server never started on the request, so it can be sent again
+/// without anything happening twice
+pub const H3_REQUEST_REJECTED: u64 = 0x10b;
+
 // Settings identifiers
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
@@ -165,7 +170,9 @@ pub struct UniReader {
     kind: Option<u64>,
     pending: Vec<u8>,
     skip: u64,
-    pub goaway: bool,
+    /// The stream id a GOAWAY carried: requests on that stream and above
+    /// were never processed (RFC 9114 Section 5.2)
+    pub goaway: Option<u64>,
 }
 
 impl UniReader {
@@ -200,7 +207,29 @@ impl UniReader {
                 break;
             };
             if kind == FRAME_GOAWAY {
-                self.goaway = true;
+                // The payload is one stream id (RFC 9114 Section 7.2.6), so
+                // it is read whole rather than skipped: which requests can
+                // be sent again depends on it
+                if len > 8 {
+                    bail!("GOAWAY longer than a stream id");
+                }
+                let start = pos + n1 + n2;
+                let Some(payload) = self.pending.get(start..start + len as usize) else {
+                    break;
+                };
+                let Some((id, n)) = get_varint(payload) else {
+                    bail!("GOAWAY without a stream id");
+                };
+                if n != payload.len() {
+                    bail!("GOAWAY with trailing bytes");
+                }
+                // A later GOAWAY may only lower the id (RFC 9114 Section 5.2)
+                if self.goaway.is_some_and(|prev| id > prev) {
+                    bail!("GOAWAY raised its stream id");
+                }
+                self.goaway = Some(id);
+                pos = start + payload.len();
+                continue;
             }
             pos += n1 + n2;
             self.skip = len;
@@ -344,11 +373,31 @@ mod tests {
         let mut u = UniReader::default();
         let mut data = varint(STREAM_CONTROL);
         data.extend_from_slice(&frame(FRAME_SETTINGS, &[0x01, 0x00]));
-        assert!(!u.goaway);
+        assert_eq!(u.goaway, None);
         u.feed(&data).unwrap();
-        assert!(!u.goaway);
+        assert_eq!(u.goaway, None);
         u.feed(&frame(FRAME_GOAWAY, &varint(0))).unwrap();
-        assert!(u.goaway);
+        assert_eq!(u.goaway, Some(0));
+    }
+
+    /// The id says which requests the server never started on, so it has
+    /// to survive arriving a byte at a time; and it may only go down
+    #[test]
+    fn goaway_carries_the_first_unprocessed_stream() {
+        let mut stream = varint(STREAM_CONTROL);
+        stream.extend_from_slice(&frame(FRAME_SETTINGS, &[]));
+        stream.extend_from_slice(&frame(FRAME_GOAWAY, &varint(80)));
+        for split in 1..stream.len() {
+            let mut u = UniReader::default();
+            u.feed(&stream[..split]).unwrap();
+            u.feed(&stream[split..]).unwrap();
+            assert_eq!(u.goaway, Some(80), "split at {split}");
+        }
+        let mut u = UniReader::default();
+        u.feed(&stream).unwrap();
+        u.feed(&frame(FRAME_GOAWAY, &varint(40))).unwrap();
+        assert_eq!(u.goaway, Some(40), "lowered");
+        assert!(u.feed(&frame(FRAME_GOAWAY, &varint(44))).is_err(), "raised");
     }
 
     #[test]
@@ -356,7 +405,7 @@ mod tests {
         let mut u = UniReader::default();
         u.feed(&varint(STREAM_QPACK_ENCODER)).unwrap();
         u.feed(b"whatever the peer sends").unwrap();
-        assert!(!u.goaway);
+        assert_eq!(u.goaway, None);
         assert!(u.pending.is_empty());
     }
 }

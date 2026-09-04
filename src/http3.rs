@@ -150,8 +150,10 @@ struct Conn {
     /// Datagrams have been handed to the endpoint since the state machine was
     /// last driven
     pending: bool,
-    /// GOAWAY received: no new streams on this connection
-    goaway: bool,
+    /// GOAWAY received, with the first stream id the server did not
+    /// process: no new streams on this connection, and requests on that
+    /// stream and above are sent again on the next one
+    goaway: Option<u64>,
     /// Outgoing datagrams; the front one is in flight while `sending`
     out_queue: VecDeque<Datagram>,
     /// Buffers that have been sent and can be filled again. A datagram batch
@@ -161,7 +163,7 @@ struct Conn {
     /// Scratch for one pass of the event loop, kept so that a pass does not
     /// begin by allocating the two lists it is about to fill
     readable: Vec<u64>,
-    finished: Vec<(u64, bool)>,
+    finished: Vec<(u64, Option<u64>)>,
     /// Pinned sendmsg bookkeeping for GSO sends
     msg_state: Box<MsgState>,
     sending: bool,
@@ -182,7 +184,7 @@ impl Conn {
             h3_ready: false,
             uni: Vec::new(),
             pending: false,
-            goaway: false,
+            goaway: None,
             out_queue: VecDeque::new(),
             spare: Vec::new(),
             readable: Vec::new(),
@@ -204,7 +206,7 @@ impl Conn {
         self.quic = None;
         self.uni.clear();
         self.h3_ready = false;
-        self.goaway = false;
+        self.goaway = None;
         self.out_queue.clear();
         self.sending = false;
         self.recv_armed = false;
@@ -254,7 +256,7 @@ fn fill_streams(
     budget: Budget,
     stop: bool,
 ) -> Result<()> {
-    if stop || conn.goaway || !conn.h3_ready {
+    if stop || conn.goaway.is_some() || !conn.h3_ready {
         return Ok(());
     }
     let Some(quic) = conn.quic.as_mut() else {
@@ -500,8 +502,8 @@ fn drive(
             };
             let reader = &mut conn.uni[slot].1;
             quic.consume(id, |data| reader.feed(data))?;
-            if conn.uni[slot].1.goaway {
-                conn.goaway = true;
+            if let Some(id) = conn.uni[slot].1.goaway {
+                conn.goaway = Some(conn.goaway.map_or(id, |prev| prev.min(id)));
             }
         }
 
@@ -509,21 +511,56 @@ fn drive(
             let Some(inflight) = conn.streams.take(id) else {
                 continue;
             };
-            // Every response begins with a HEADERS frame carrying :status
-            // (RFC 9114 Section 4.1); a stream that ends without one never
-            // answered the request
-            if reset || inflight.reader.status() == 0 {
+            let status = inflight.reader.status();
+            if reset == Some(proto::H3_REQUEST_REJECTED) {
+                // The server never started on it, so it can be sent again
+                // without anything happening twice (RFC 9114 Section
+                // 4.1.1). It goes back to the budget and out on the next
+                // connection, timed from there: what is measured is a
+                // request the server answered, not one it turned away.
+                *started -= 1;
+            } else if reset.is_some() || status == 0 {
+                // Every response begins with a HEADERS frame carrying
+                // :status (RFC 9114 Section 4.1); a stream that ends without
+                // one never answered the request
                 if narrate() {
-                    eprintln!(
-                        "[fail] stream {id} reset={reset} status={}",
-                        inflight.reader.status()
-                    );
+                    eprintln!("[fail] stream {id} reset={reset:?} status={status}");
                 }
                 stats.errors += 1;
             } else {
-                stats.record_success(inflight.reader.status(), inflight.start);
+                stats.record_success(status, inflight.start);
             }
             quic.retire(id);
+        }
+
+        if let Some(goaway) = conn.goaway {
+            // RFC 9114 Section 5.2: nothing on a stream at or above the id
+            // was processed, so those requests go back to the budget now
+            // rather than waiting to be reset one at a time. The rest will
+            // finish, and once they have the connection is of no further
+            // use: it is closed here rather than left for the server to
+            // close, so the replacement is not waiting on it.
+            let unprocessed: Vec<u64> = conn
+                .streams
+                .iter()
+                .map(|s| s.stream_id)
+                .filter(|&id| id >= goaway)
+                .collect();
+            if narrate() && !unprocessed.is_empty() {
+                eprintln!(
+                    "[goaway] {} requests from stream {goaway} sent again",
+                    unprocessed.len()
+                );
+            }
+            for id in unprocessed {
+                conn.streams.take(id);
+                quic.retire(id);
+                *started -= 1;
+            }
+            if conn.streams.is_empty() {
+                quic.close(0, b"");
+                alive = false;
+            }
         }
 
         flush_unsent(quic, &mut conn.streams)?;

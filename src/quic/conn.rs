@@ -112,8 +112,8 @@ pub enum Event {
     Readable(u64),
     /// The peer opened a unidirectional stream
     Opened(u64),
-    /// A stream ended, whether by FIN or reset
-    Finished { id: u64, reset: bool },
+    /// A stream ended: by FIN, or by a RESET_STREAM with this error code
+    Finished { id: u64, reset: Option<u64> },
     /// The connection is over
     Lost(String),
 }
@@ -1138,7 +1138,11 @@ impl Connection {
                 fin,
                 data,
             } => self.on_stream(id, offset, data, fin)?,
-            Frame::ResetStream { id, final_size, .. } => self.on_reset(id, final_size)?,
+            Frame::ResetStream {
+                id,
+                error,
+                final_size,
+            } => self.on_reset(id, error, final_size)?,
             Frame::StopSending { id, .. } => self.on_stop_sending(id),
             Frame::MaxData(limit) => self.max_data_peer = self.max_data_peer.max(limit),
             Frame::MaxStreamData { id, limit } => self.on_max_stream_data(id, limit),
@@ -1750,7 +1754,7 @@ impl Connection {
                 self.push_readable(id);
             }
             if done {
-                self.events.push_back(Event::Finished { id, reset: false });
+                self.events.push_back(Event::Finished { id, reset: None });
             }
             new
         } else if is_client_initiated(id) && stream_dir(id) == Dir::Bi {
@@ -1790,13 +1794,16 @@ impl Connection {
 
     #[cold]
     #[inline(never)]
-    fn on_reset(&mut self, id: u64, final_size: u64) -> Result<()> {
+    fn on_reset(&mut self, id: u64, error: u64, final_size: u64) -> Result<()> {
         if let Some(i) = self.stream_index(id) {
             if let Some(pair) = self.streams[i].as_mut() {
                 pair.recv.reset(final_size)?;
                 if !pair.finished {
                     pair.finished = true;
-                    self.events.push_back(Event::Finished { id, reset: true });
+                    self.events.push_back(Event::Finished {
+                        id,
+                        reset: Some(error),
+                    });
                 }
             }
         } else if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
@@ -2123,7 +2130,7 @@ mod tests {
                         conn.consume(id, |data| reader.feed(data)).unwrap();
                     }
                     Event::Finished { id, reset } if Some(id) == request => {
-                        assert!(!reset, "the server reset the request stream");
+                        assert!(reset.is_none(), "the server reset the request stream");
                         assert_eq!(reader.status(), 200, "the status nginx answers with");
                         return;
                     }
