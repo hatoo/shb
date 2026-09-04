@@ -427,12 +427,34 @@ fn pump_transmits(
 /// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
 ///
 /// Returns false if the connection is broken.
+/// Give a request the server never started on back to the budget, so the
+/// next fill sends it again as a new request
+///
+/// A counted run may do that as many times as it has requests, plus once for
+/// every request that has completed: a server that turns some away and
+/// answers the rest is never cut off, and one that turns everything away
+/// ends the run with errors rather than sending for ever. A timed run ends
+/// on the clock either way.
+fn send_again(budget: Budget, stats: &mut Stats, started: &mut u64, retried: &mut u64) {
+    if budget
+        .expected_requests()
+        .is_none_or(|n| *retried < n + stats.completed)
+    {
+        *retried += 1;
+        *started -= 1;
+    } else {
+        stats.errors += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn drive(
     conn: &mut Conn,
     stats: &mut Stats,
     request: &[u8],
     parallel: usize,
     started: &mut u64,
+    retried: &mut u64,
     budget: Budget,
     stop: bool,
 ) -> bool {
@@ -525,7 +547,7 @@ fn drive(
                 // 4.1.1). It goes back to the budget and out on the next
                 // connection, timed from there: what is measured is a
                 // request the server answered, not one it turned away.
-                *started -= 1;
+                send_again(budget, stats, started, retried);
             } else if reset.is_some() || status == 0 {
                 // Every response begins with a HEADERS frame carrying
                 // :status (RFC 9114 Section 4.1); a stream that ends without
@@ -562,7 +584,7 @@ fn drive(
             for id in unprocessed {
                 conn.streams.take(id);
                 quic.retire(id);
-                *started -= 1;
+                send_again(budget, stats, started, retried);
             }
             if conn.streams.is_empty() {
                 quic.close(proto::H3_NO_ERROR, b"");
@@ -632,6 +654,8 @@ pub fn run_worker(
         stats.latencies_ns.reserve(n as usize);
     }
     let mut started: u64 = 0;
+    // Requests sent again because the server never started on them
+    let mut retried: u64 = 0;
 
     // Held for its lifetime: the SQE points at it until the run is over
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
@@ -711,6 +735,7 @@ pub fn run_worker(
                     &request,
                     parallel,
                     &mut started,
+                    &mut retried,
                     budget,
                     stop,
                 );
@@ -909,6 +934,7 @@ pub fn run_worker(
                 &request,
                 parallel,
                 &mut started,
+                &mut retried,
                 budget,
                 stop,
             );
