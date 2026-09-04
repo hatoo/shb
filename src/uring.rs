@@ -19,7 +19,23 @@ pub const OP_CONNECT: u64 = 2;
 pub const OP_CONNECT_TIMEOUT: u64 = 3;
 pub const CONN_IDX_BITS: u64 = 20;
 
+/// The generation has the bits the operation kind and the connection index
+/// leave over. Running past that would not overflow - the shift drops the top
+/// bits quietly - it would hand a stale completion the same user_data as a
+/// live one, so a connection would act on a CQE belonging to the one before
+/// it. Neither budget is reachable in a run: the index is a worker's own
+/// connection count, and the generation counts reconnections one at a time.
+pub const GENERATION_BITS: u64 = 64 - 2 - CONN_IDX_BITS;
+
 pub fn user_data(conn_idx: usize, generation: u64, op: u64) -> u64 {
+    debug_assert!(
+        (conn_idx as u64) < 1 << CONN_IDX_BITS,
+        "connection index outgrew its {CONN_IDX_BITS} bits"
+    );
+    debug_assert!(
+        generation < 1 << GENERATION_BITS,
+        "generation outgrew its {GENERATION_BITS} bits"
+    );
     (generation << (2 + CONN_IDX_BITS)) | ((conn_idx as u64) << 2) | op
 }
 
@@ -481,4 +497,38 @@ pub fn push_recv_multi(
         .build()
         .user_data(user_data(conn_idx, generation, OP_RECV));
     push_sqe(submitter, sq, entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three fields share one u64, so each has to come back out of it
+    /// unchanged at the far end of its budget
+    #[test]
+    fn user_data_round_trips_at_the_edges() {
+        let last_idx = (1 << CONN_IDX_BITS) - 1;
+        let last_gen = (1 << GENERATION_BITS) - 1;
+        for (idx, generation, op) in [
+            (0usize, 0u64, OP_SEND),
+            (1, 1, OP_RECV),
+            (last_idx as usize, last_gen, OP_CONNECT),
+            (last_idx as usize, 0, OP_CONNECT_TIMEOUT),
+            (0, last_gen, OP_RECV),
+        ] {
+            let ud = user_data(idx, generation, op);
+            assert_eq!(
+                decode_user_data(ud),
+                (op, idx, generation),
+                "{idx} {generation} {op}"
+            );
+        }
+    }
+
+    /// What the budgets are for: one more of either would land on another
+    /// connection's completions rather than being caught
+    #[test]
+    fn the_fields_fill_the_word_exactly() {
+        assert_eq!(2 + CONN_IDX_BITS + GENERATION_BITS, 64);
+    }
 }
