@@ -124,6 +124,9 @@ fn local_params(connect_timeout: Duration) -> LocalParamsInput {
         initial_max_stream_data: RECEIVE_WINDOW as u64,
         // The control stream and the two QPACK streams, and nothing else
         initial_max_streams_uni: 3,
+        // Binds both sides: the peer closes a connection idle for this long,
+        // and so does shb - which, until the handshake completes, is what
+        // makes a server that never answers a failed connect
         max_idle_timeout_ms: connect_timeout.as_millis() as u64,
     }
 }

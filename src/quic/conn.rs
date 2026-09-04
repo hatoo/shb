@@ -200,6 +200,9 @@ pub struct Connection {
     retire_pending: Vec<u64>,
 
     params: Params,
+    /// The max_idle_timeout shb advertised, which binds it as much as the
+    /// peer's binds the peer
+    local_idle_ms: u64,
     handshake_done: bool,
     connected: bool,
     closed: Option<String>,
@@ -316,6 +319,7 @@ impl Connection {
             retry_token: Vec::new(),
             retried: false,
             params: Params::default(),
+            local_idle_ms: local_params.max_idle_timeout_ms,
             handshake_done: false,
             connected: false,
             closed: None,
@@ -545,7 +549,12 @@ impl Connection {
             }
         }
 
-        Ok(out.len() - start)
+        let wrote = out.len() - start;
+        if wrote > 0 && self.idle_deadline.is_none() {
+            // The first packet out starts the clock on the handshake
+            self.arm_idle(now);
+        }
+        Ok(wrote)
     }
 
     /// Append one packet for `space`, if there is anything to put in it
@@ -903,30 +912,65 @@ impl Connection {
         if self.closed.is_some() {
             return Ok(());
         }
-        self.arm_idle(now);
+        // A stateless reset is shaped like a 1-RTT packet that will not
+        // decrypt, and is told apart by its last sixteen bytes (RFC 9000
+        // Section 10.3.1). Decryption writes over the buffer, so they are
+        // copied out before it is tried.
+        let tail = stateless_reset_tail(datagram);
+        let mut processed = false;
         let mut pos = 0;
         while pos < datagram.len() {
-            let consumed = self.handle_packet(now, &mut datagram[pos..])?;
+            let (consumed, ok) = self.handle_packet(now, &mut datagram[pos..])?;
+            processed |= ok;
             if consumed == 0 {
                 break;
             }
             pos += consumed;
         }
+        if processed {
+            self.arm_idle(now);
+        } else if let Some(tail) = tail
+            && self.is_stateless_reset(&tail)
+        {
+            // The peer has no state for this connection any more; anything
+            // sent to it draws another reset (RFC 9000 Section 10.3)
+            self.lose("the peer sent a stateless reset");
+        }
         Ok(())
     }
 
-    /// Returns how much of the buffer this packet took
-    fn handle_packet(&mut self, now: Instant, buf: &mut [u8]) -> Result<usize> {
+    /// Whether the peer gave us `tail` as the token that ends a stateless
+    /// reset for one of its connection IDs. Compared without an early exit:
+    /// a token guessed a byte at a time would let anyone on the path end
+    /// the connection.
+    #[cold]
+    #[inline(never)]
+    fn is_stateless_reset(&self, tail: &[u8; 16]) -> bool {
+        self.peer_cids
+            .iter()
+            .filter_map(|c| c.token.as_ref())
+            .any(|token| {
+                token
+                    .iter()
+                    .zip(tail)
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+            })
+    }
+
+    /// Returns how much of the buffer this packet took, and whether it was
+    /// decrypted and acted on
+    fn handle_packet(&mut self, now: Instant, buf: &mut [u8]) -> Result<(usize, bool)> {
         let (space, pn_offset, end, retry_scid) =
             match header::decode_header(buf, self.local_cid.len())? {
                 Incoming::VersionNegotiation => {
                     self.lose("the server does not speak QUIC version 1");
-                    return Ok(0);
+                    return Ok((0, false));
                 }
                 Incoming::Retry { scid, token, .. } => {
                     let (scid, token) = (scid, token.to_vec());
                     self.on_retry(scid, &token, buf)?;
-                    return Ok(0);
+                    return Ok((0, false));
                 }
                 Incoming::Long {
                     space,
@@ -942,14 +986,14 @@ impl Connection {
         // an error: it is normal for a Handshake packet to overtake the
         // Initial that carries the keys for it
         let Some(keys) = self.remote_keys(space) else {
-            return Ok(end);
+            return Ok((end, false));
         };
         let (first, pn_len) =
             match unprotect_header(keys.header.as_ref(), &mut buf[..end], pn_offset) {
                 Ok(v) => v,
                 // A packet we cannot unprotect is not worth tearing the
                 // connection down for; the peer will resend
-                Err(_) => return Ok(end),
+                Err(_) => return Ok((end, false)),
             };
         let mut truncated = 0u64;
         for &b in &buf[pn_offset..pn_offset + pn_len] {
@@ -979,12 +1023,12 @@ impl Connection {
         // A generation we do not have is a packet we cannot read, which is not
         // worth tearing the connection down for
         let Some(key) = key else {
-            return Ok(end);
+            return Ok((end, false));
         };
         let (head, body) = buf[..end].split_at_mut(payload_start);
         let plain = match key.decrypt_in_place(pn, head, body) {
             Ok(p) => p.len(),
-            Err(_) => return Ok(end),
+            Err(_) => return Ok((end, false)),
         };
         if generation == Generation::Next {
             self.rotate_keys(pn, phase);
@@ -1044,7 +1088,7 @@ impl Connection {
         }
         self.pto_count = 0;
         self.pto_probes = 0;
-        Ok(end)
+        Ok((end, true))
     }
 
     fn handle_frame(&mut self, space: Space, f: Frame<'_>, now: Instant) -> Result<()> {
@@ -1448,12 +1492,49 @@ impl Connection {
         Ok(())
     }
 
-    fn arm_idle(&mut self, now: Instant) {
-        let ms = self.params.max_idle_timeout_ms;
-        if ms > 0 {
-            self.idle_deadline = Some(now + Duration::from_millis(ms));
-        }
+    /// How long with nothing from the peer before the connection counts as
+    /// gone (RFC 9000 Section 10.1): the smaller of what either side
+    /// advertised, where advertising nothing means no limit, and never less
+    /// than three probe timeouts so that a slow path is not taken for a dead
+    /// one
+    fn idle_timeout(&self) -> Option<Duration> {
+        let ms = match (self.local_idle_ms, self.params.max_idle_timeout_ms) {
+            (0, 0) => return None,
+            (0, peer) => peer,
+            (local, 0) => local,
+            (local, peer) => local.min(peer),
+        };
+        let floor = self
+            .rtt
+            .pto(Duration::from_millis(self.params.max_ack_delay_ms))
+            * 3;
+        Some(Duration::from_millis(ms).max(floor))
     }
+
+    /// Restart the idle timer, or start it
+    ///
+    /// Until the handshake completes the deadline set by the first packet
+    /// out stands, whatever arrives: that is what makes the local idle
+    /// timeout double as the connect timeout. A server too slow to finish
+    /// the handshake in that time is as much a failed connect as one that
+    /// never answers.
+    fn arm_idle(&mut self, now: Instant) {
+        if !self.connected && self.idle_deadline.is_some() {
+            return;
+        }
+        self.idle_deadline = self.idle_timeout().map(|t| now + t);
+    }
+}
+
+/// The last sixteen bytes of a datagram that could be a stateless reset:
+/// one shaped like a short header packet and long enough to carry a token
+/// (RFC 9000 Section 10.3)
+fn stateless_reset_tail(datagram: &[u8]) -> Option<[u8; 16]> {
+    const MIN_RESET: usize = 21;
+    if datagram.len() < MIN_RESET || datagram[0] & 0x80 != 0 {
+        return None;
+    }
+    datagram[datagram.len() - 16..].try_into().ok()
 }
 
 // -------------------------------------------------------------------------
@@ -1702,6 +1783,11 @@ impl Connection {
 
 impl Connection {
     pub fn poll_timeout(&self) -> Option<Instant> {
+        // A connection that is over has nothing left to wait for, and a
+        // deadline left standing here would be serviced again on every pass
+        if self.closed.is_some() {
+            return None;
+        }
         let spaces = [
             &self.spaces[0].sent,
             &self.spaces[1].sent,
@@ -1722,7 +1808,12 @@ impl Connection {
 
     pub fn handle_timeout(&mut self, now: Instant) {
         if self.idle_deadline.is_some_and(|d| now >= d) {
-            self.lose("the connection went idle");
+            self.idle_deadline = None;
+            self.lose(if self.connected {
+                "the connection went idle"
+            } else {
+                "the handshake did not finish within the connect timeout"
+            });
             return;
         }
         if self.loss_deadline.is_some_and(|d| now >= d) {
@@ -2249,6 +2340,97 @@ mod tests {
         new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
         assert_eq!(conn.retire_pending, vec![1], "below the retirement point");
         assert!(!conn.peer_cids.iter().any(|c| c.seq == 1));
+    }
+
+    /// RFC 9000 Section 10.3.1: a datagram that will not decrypt and ends in
+    /// a token the peer gave us is the peer saying it has lost the connection
+    #[test]
+    fn a_stateless_reset_ends_the_connection() {
+        let mut conn = client();
+        with_handshake_cid(&mut conn, &[0; 8]);
+        conn.peer_cids[0].token = Some([7; 16]);
+        let now = Instant::now();
+
+        // Shaped like a 1-RTT packet, ending in something else
+        let mut noise = vec![0x40; 40];
+        conn.handle_datagram(now, &mut noise).unwrap();
+        assert!(conn.closed.is_none(), "undecryptable, so merely dropped");
+
+        let mut reset = vec![0x40; 40];
+        reset[24..].copy_from_slice(&[7; 16]);
+        conn.handle_datagram(now, &mut reset).unwrap();
+        assert!(matches!(
+            conn.poll_event(),
+            Some(Event::Lost(why)) if why.contains("stateless reset")
+        ));
+        assert_eq!(conn.poll_timeout(), None, "nothing left to wait for");
+    }
+
+    /// Until the handshake completes the idle timer is the connect timeout:
+    /// it starts with the first packet out and nothing that arrives moves it
+    #[test]
+    fn the_connect_timeout_starts_with_the_first_send() {
+        let mut conn = client();
+        let now = Instant::now();
+        assert_eq!(
+            conn.poll_timeout(),
+            None,
+            "nothing sent, nothing to wait for"
+        );
+        let mut out = Vec::new();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        assert_eq!(conn.idle_deadline, Some(now + Duration::from_secs(5)));
+
+        conn.arm_idle(now + Duration::from_secs(1));
+        assert_eq!(
+            conn.idle_deadline,
+            Some(now + Duration::from_secs(5)),
+            "a packet during the handshake does not restart it"
+        );
+
+        conn.handle_timeout(now + Duration::from_secs(5));
+        assert!(matches!(
+            conn.poll_event(),
+            Some(Event::Lost(why)) if why.contains("connect timeout")
+        ));
+        assert_eq!(
+            conn.poll_timeout(),
+            None,
+            "or the caller would service the same deadline for ever"
+        );
+    }
+
+    /// RFC 9000 Section 10.1: the smaller of the two advertised timeouts,
+    /// where advertising none means no limit, and never under three PTOs
+    #[test]
+    fn the_idle_timeout_is_the_smaller_of_what_either_side_advertised() {
+        let mut conn = client();
+        conn.connected = true;
+        conn.local_idle_ms = 5_000;
+        conn.params.max_idle_timeout_ms = 2_000;
+        assert_eq!(conn.idle_timeout(), Some(Duration::from_secs(2)));
+        conn.params.max_idle_timeout_ms = 0;
+        assert_eq!(conn.idle_timeout(), Some(Duration::from_secs(5)));
+        conn.local_idle_ms = 0;
+        assert_eq!(conn.idle_timeout(), None);
+        conn.local_idle_ms = 1;
+        let pto = conn
+            .rtt
+            .pto(Duration::from_millis(conn.params.max_ack_delay_ms));
+        assert_eq!(conn.idle_timeout(), Some(pto * 3), "under the floor");
+
+        // Once connected, every packet processed restarts it
+        conn.local_idle_ms = 5_000;
+        let now = Instant::now();
+        conn.arm_idle(now);
+        conn.arm_idle(now + Duration::from_secs(1));
+        // Within a tick: the clock rounds, so two additions and one differ
+        let expected = now + Duration::from_secs(6);
+        let got = conn.idle_deadline.unwrap();
+        let drift = got
+            .saturating_duration_since(expected)
+            .max(expected.saturating_duration_since(got));
+        assert!(drift < Duration::from_micros(1), "{got:?} vs {expected:?}");
     }
 
     #[test]
