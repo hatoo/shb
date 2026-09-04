@@ -7,7 +7,12 @@ pub struct Stats {
     pub bytes_received: u64,
     pub bytes_sent: u64,
     pub latencies_ns: Vec<u64>,
-    pub status_counts: Box<[u64; 600]>,
+    /// One slot per three-digit status. The valid ones are 100 to 599 (RFC
+    /// 9110 Section 15), but every decoder accepts any three digits - a
+    /// CDN's 999 is a real answer a run gets - and a response that counts as
+    /// ok has to be in this table, or it does not sum to what the report says
+    /// completed.
+    pub status_counts: Box<[u64; 1000]>,
 }
 
 impl Default for Stats {
@@ -19,17 +24,17 @@ impl Default for Stats {
             bytes_received: 0,
             bytes_sent: 0,
             latencies_ns: Vec::new(),
-            status_counts: Box::new([0u64; 600]),
+            status_counts: Box::new([0u64; 1000]),
         }
     }
 }
 
 impl Stats {
+    /// `status_code` is three digits, which is what every decoder produces,
+    /// so it is always in the table
     pub fn record_success(&mut self, status_code: u16, request_start: Instant) {
         self.completed += 1;
-        if (status_code as usize) < self.status_counts.len() {
-            self.status_counts[status_code as usize] += 1;
-        }
+        self.status_counts[usize::from(status_code)] += 1;
         self.latencies_ns
             .push(request_start.elapsed().as_nanos() as u64);
     }
@@ -174,14 +179,19 @@ mod tests {
         assert!(stats.latencies_ns.iter().all(|ns| *ns >= 5_000_000));
     }
 
-    /// A status outside the table is counted as a completion but not tallied,
-    /// rather than panicking on the index
+    /// Every three-digit status has a slot, so the table always sums to the
+    /// completed count the report prints next to it. A 999 used to be
+    /// counted as ok and left out of the table.
     #[test]
-    fn an_out_of_range_status_does_not_panic() {
+    fn every_three_digit_status_is_tallied() {
         let mut stats = Stats::default();
-        stats.record_success(999, Instant::now());
-        assert_eq!(stats.completed, 1);
-        assert_eq!(stats.status_counts.iter().sum::<u64>(), 0);
+        for status in [0, 100, 200, 599, 600, 999] {
+            stats.record_success(status, Instant::now());
+        }
+        assert_eq!(stats.completed, 6);
+        assert_eq!(stats.status_counts.iter().sum::<u64>(), stats.completed);
+        assert_eq!(stats.status_counts[999], 1);
+        assert_eq!(stats.status_counts[600], 1);
     }
 
     #[test]
