@@ -63,7 +63,26 @@ const MAX_BATCH_MULTIPLEXED: usize = 32;
 
 /// How long the kernel may linger collecting a batch before returning with
 /// whatever has arrived
-const BATCH_LINGER: u32 = 500;
+///
+/// This is a throughput governor as much as a batching trick. The wait is a
+/// floor, not a deadline: one pass of the loop takes at least this long, so a
+/// run's throughput is what it has in flight divided by it, plus whatever the
+/// server takes. Against a server that is itself the bottleneck that is free -
+/// the wait fits inside the server's own latency and saves the wakeups it
+/// batched away. Against one that answers instantly it is the whole limit:
+/// measured against a server costing 0.05us a request, 500us held a run to
+/// 1.7M requests a second where 10us reached 10M, for 6% more CPU a request.
+/// Which of those a run is in is not something a worker can tell, so it is
+/// [`set_batch_linger`] and the default is the one that suits a real server.
+pub const DEFAULT_BATCH_LINGER: u32 = 500;
+
+static BATCH_LINGER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_BATCH_LINGER);
+
+/// Set before any worker starts; read once per wait, not once per request
+pub fn set_batch_linger(microseconds: u32) {
+    BATCH_LINGER.store(microseconds, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether the kernel supports `min_wait_usec` (IORING_FEAT_MIN_TIMEOUT, 6.12+)
 static MIN_TIMEOUT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -129,7 +148,7 @@ pub fn submit_and_wait_timeout(
         // BATCH_LINGER and return with whatever arrived (still at least one,
         // bounded by max_wait). batch_size only returns > 1 when the kernel
         // supports this.
-        args = args.min_wait_usec(BATCH_LINGER);
+        args = args.min_wait_usec(BATCH_LINGER.load(std::sync::atomic::Ordering::Relaxed));
     }
     match submitter.submit_with_args(want, &args) {
         Ok(_) => Ok(()),

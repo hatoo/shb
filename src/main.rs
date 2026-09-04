@@ -96,6 +96,17 @@ pub struct Args {
     #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
     pub timeout: Option<Duration>,
 
+    /// How long a worker may wait collecting completions, in microseconds
+    ///
+    /// A floor on one pass of the event loop, so a run's throughput is at most
+    /// what it has in flight divided by this. The default suits a server that
+    /// is itself the bottleneck, where the wait fits inside the server's own
+    /// latency and costs nothing. Lower it when the server answers faster than
+    /// shb can ask - it buys throughput and truer latencies for a few percent
+    /// more CPU per request.
+    #[arg(long, value_name = "MICROSECONDS", default_value_t = uring::DEFAULT_BATCH_LINGER, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..=1_000_000))]
+    pub batch_linger: u32,
+
     /// Number of worker threads
     #[arg(short = 't', long, default_value_t = default_threads(), value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub threads: usize,
@@ -159,6 +170,7 @@ fn resolve_body(arg: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    uring::set_batch_linger(args.batch_linger);
     // curl semantics: -d implies POST unless a method was given explicitly
     let method = args
         .method

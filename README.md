@@ -413,8 +413,26 @@ cheap:
   on too many stalls the pipeline; on HTTP/1.1 and HTTP/3 a worker holds out
   for a quarter of its connections, capped at eight, and on HTTP/2 — where
   every stream shares one socket and completions arrive together — for half of
-  `-p`, capped at 32. `min_wait_usec` caps how long the kernel waits for a
-  batch that cannot be filled.
+  `-p`, capped at 32. `min_wait_usec` sets how long the kernel spends
+  collecting one - which is a floor rather than a deadline, so it is also what
+  bounds a run's throughput: what a run has in flight, divided by the wait.
+
+  The default 500us suits a server that is itself the bottleneck, where the
+  wait fits inside the server's own latency and costs nothing while saving the
+  wakeups it batched away. Against a server that answers faster than shb can
+  ask it is the whole limit. Measured against one costing 0.05us a request, at
+  `-t 16 -c 32 -p 32`:
+
+  | `--batch-linger` | requests/sec | p50 | shb CPU per request |
+  |---|---|---|---|
+  | 500 (default) | 1,745,239 | 582us | 0.98us |
+  | 50 | 6,950,725 | 141us | 1.01us |
+  | 10 | 9,963,818 | 92us | 1.04us |
+
+  Against nginx over the same range the throughput barely moves and shb's own
+  CPU doubles, which is why the default is what it is. Lower it when the thing
+  being measured is faster than a wait: it buys throughput, and it stops the
+  wait from showing up in the latencies as though the server had spent it.
 - **HTTP/1.1 responses are scanned, not parsed**: a load generator only needs
   to know where one response ends and the next begins, so the scanner reads the
   status line, `Content-Length`, `Transfer-Encoding` and `Connection`, and
