@@ -75,7 +75,7 @@ impl Conn {
         self.out.clear();
         self.out_off = 0;
         // Bump the generation so CQEs of operations on the old connection are ignored
-        self.generation += 1;
+        self.generation = (self.generation + 1) & uring::GENERATION_MASK;
     }
 
     /// Reset per-request state for the next request

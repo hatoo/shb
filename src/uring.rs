@@ -21,11 +21,17 @@ pub const CONN_IDX_BITS: u64 = 20;
 
 /// The generation has the bits the operation kind and the connection index
 /// leave over. Running past that would not overflow - the shift drops the top
-/// bits quietly - it would hand a stale completion the same user_data as a
-/// live one, so a connection would act on a CQE belonging to the one before
-/// it. Neither budget is reachable in a run: the index is a worker's own
-/// connection count, and the generation counts reconnections one at a time.
+/// bits quietly - and the stored generation would then stop matching what came
+/// back, so every completion would read as stale and the connection would
+/// stall for good. Callers keep it in range with [`GENERATION_MASK`]; the
+/// assertion is what says they still do.
 pub const GENERATION_BITS: u64 = 64 - 2 - CONN_IDX_BITS;
+
+/// Keep a generation inside that budget. It is only ever compared for
+/// equality, never ordered, so it may wrap: two live connections cannot hold
+/// generations 2^42 apart, because a closed connection's completions are
+/// drained in the same pass that closed it.
+pub const GENERATION_MASK: u64 = (1 << GENERATION_BITS) - 1;
 
 pub fn user_data(conn_idx: usize, generation: u64, op: u64) -> u64 {
     debug_assert!(
@@ -530,5 +536,18 @@ mod tests {
     #[test]
     fn the_fields_fill_the_word_exactly() {
         assert_eq!(2 + CONN_IDX_BITS + GENERATION_BITS, 64);
+    }
+
+    /// A generation kept in range with the mask survives the round trip
+    /// however many times it has wrapped, which is what lets the workers
+    /// compare it for equality and never order it
+    #[test]
+    fn a_wrapped_generation_still_matches_itself() {
+        let wrapped = (GENERATION_MASK + 1) & GENERATION_MASK;
+        assert_eq!(wrapped, 0, "one past the end is the beginning");
+        for generation in [0, 1, GENERATION_MASK - 1, GENERATION_MASK] {
+            let ud = user_data(7, generation, OP_RECV);
+            assert_eq!(decode_user_data(ud), (OP_RECV, 7, generation));
+        }
     }
 }

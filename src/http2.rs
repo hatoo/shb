@@ -117,7 +117,7 @@ impl Conn {
         self.tls = None;
         self.streams.clear();
         // Bump the generation so CQEs of operations on the old connection are ignored
-        self.generation += 1;
+        self.generation = (self.generation + 1) & uring::GENERATION_MASK;
     }
 
     /// Count all in-flight requests as errors (used when the connection dies)
