@@ -168,7 +168,16 @@ impl Connection {
     }
 
     /// Queue the client preface, our settings and the connection window bump
+    ///
+    /// In front of anything already queued. The peer may have spoken first:
+    /// TLS 1.3 lets a server send its SETTINGS along with its Finished,
+    /// before the client's Finished has reached it, so over TLS the frames
+    /// that complete the handshake can carry the server preface too, and its
+    /// acknowledgement is queued before this is called. Jetty and AWS's load
+    /// balancer both do this, and both closed the connection when the ACK
+    /// arrived where the preface should be.
     pub fn initiate(&mut self) {
+        let peer_drew = std::mem::take(&mut self.out);
         self.out.extend_from_slice(PREFACE);
         // HEADER_TABLE_SIZE 0 forbids the peer's encoder from indexing, which
         // is what lets the response decoder stay stateless
@@ -185,6 +194,7 @@ impl Connection {
         // The connection window starts at 65535 whatever SETTINGS say, so
         // raise it once rather than trickling updates back
         self.window_update(0, MAX_WINDOW - 65535);
+        self.out.extend_from_slice(&peer_drew);
     }
 
     /// Whether another stream may be opened right now
@@ -705,6 +715,23 @@ mod tests {
         let settings = &out[PREFACE.len()..];
         assert_eq!(settings[3], SETTINGS);
         assert_eq!(&settings[9..15], &[0, 1, 0, 0, 0, 0]);
+    }
+
+    /// Over TLS 1.3 the server's SETTINGS can arrive with the frames that
+    /// finish the handshake, before the preface has been queued; the ACK it
+    /// draws has to follow the preface, not lead it. Jetty and AWS's load
+    /// balancer both send it that early, and both closed the connection.
+    #[test]
+    fn a_peer_that_speaks_first_is_answered_after_the_preface() {
+        let mut c = Connection::new();
+        let mut events = Vec::new();
+        c.feed(&frame(SETTINGS, 0, 0, &[]), &mut events).unwrap();
+        c.initiate();
+        let out = c.take_output().unwrap();
+        assert!(out.starts_with(PREFACE));
+        let ack = &out[out.len() - FRAME_HEADER_LEN..];
+        assert_eq!(ack[3], SETTINGS);
+        assert_eq!(ack[4], FLAG_ACK);
     }
 
     /// The frame header from RFC 9113 Section 4.1, asserted as bytes: a

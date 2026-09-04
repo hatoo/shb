@@ -158,6 +158,14 @@ fn fill_streams(
     let Some(h2) = conn.h2.as_mut() else {
         return;
     };
+    // Nothing leaves a TLS connection until its handshake is done, so a
+    // stream opened before then is timed from before its request could go:
+    // the first flight of every connection carried the handshake in its
+    // latency, and a run at 50 connections reported a p50 of 24 ms against
+    // 77 µs at one. The recv that finishes the handshake opens them instead.
+    if conn.tls.as_ref().is_some_and(TlsSession::is_handshaking) {
+        return;
+    }
     // A body that did not fit the windows when its stream opened leaves as the
     // peer grants credit, which is what has just arrived. That holds after a
     // GOAWAY too: the streams below its line are still going to be answered,
@@ -464,8 +472,10 @@ pub fn run_worker(
                             conn.tls = Some(TlsSession::new(setup)?);
                         }
                         // Prior knowledge: send the client preface + SETTINGS
-                        // and the first requests in a single flush (in TLS mode
-                        // they are buffered until the handshake completes)
+                        // and the first requests in a single flush. In TLS
+                        // mode the preface waits inside the session for the
+                        // handshake, and the requests are not opened until it
+                        // is done.
                         let mut h2 = Connection::new();
                         h2.initiate();
                         conn.h2 = Some(h2);
@@ -597,6 +607,16 @@ pub fn run_worker(
 
             if conn_broken {
                 let conn = &mut conns[conn_idx];
+                // A connection lost before its handshake finished carried no
+                // request, so there is nothing in flight to fail; it is a
+                // connect that did not work out, and counts as one so a
+                // counted run against such a server ends rather than
+                // connecting again for ever
+                if conn.tls.as_ref().is_some_and(TlsSession::is_handshaking) {
+                    stats.errors += 1;
+                    stats.connect_errors += 1;
+                    started += 1;
+                }
                 // Whatever was still in flight is lost with the connection.
                 // A connection that drained after a GOAWAY has nothing in
                 // flight, and may still owe for what it gave back.
