@@ -988,6 +988,99 @@ fn h1_body_larger_than_the_h2_initial_window() {
     assert_all_ok(&report, 6, "200");
 }
 
+/// A server that answers a POST as soon as it has the head, and reads the
+/// body it was told the length of only afterwards, the way nginx answers a
+/// location that returns a fixed status. Whatever follows that body has to be
+/// another request line; a 400 says it was not.
+fn start_eager_server() -> SocketAddr {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut pending = Vec::new();
+                let mut chunk = vec![0u8; 64 * 1024];
+                // Body bytes of the request already answered, still to discard
+                let mut to_skip = 0usize;
+                loop {
+                    let take = to_skip.min(pending.len());
+                    pending.drain(..take);
+                    to_skip -= take;
+                    // Body bytes where a request line should be are refused
+                    // as soon as they are seen, as nginx refuses them: a
+                    // server that waited for the end of the head instead
+                    // would read the rest of the body as one, and answer
+                    // nothing
+                    if to_skip == 0 && pending.len() >= 5 && !pending.starts_with(b"POST ") {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        break;
+                    }
+                    if to_skip == 0
+                        && let Some(end) = pending
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|i| i + 4)
+                    {
+                        let head = String::from_utf8_lossy(&pending[..end]).to_lowercase();
+                        pending.drain(..end);
+                        to_skip = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse().ok())
+                            .unwrap_or(0);
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The response to a request arrives while the request itself is still being
+/// sent, and the next request must still start where this one ends: nginx
+/// used to get the tail of a 10 MB body spliced into the request after it,
+/// answering -c 1 -n 5 with three 200s and two 400s
+#[test]
+fn h1_a_response_before_the_body_is_sent_does_not_corrupt_the_next_request() {
+    let addr = start_eager_server();
+    let url = format!("http://{addr}/");
+    let path = std::env::temp_dir().join("shb-e2e-eager-body.txt");
+    // More than the socket buffers on both sides hold, so the response is on
+    // its way while the send still has most of the body to go
+    std::fs::write(&path, vec![b'a'; 32 << 20]).unwrap();
+    let report = shb_json(&[
+        "--timeout",
+        "5s",
+        "-d",
+        &format!("@{}", path.display()),
+        "-n",
+        "5",
+        "-c",
+        "1",
+        "-t",
+        "1",
+        &url,
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_all_ok(&report, 5, "200");
+}
+
 /// A server that accepts and then says nothing at all
 ///
 /// Without --timeout a run against one of these never ends: there is no error

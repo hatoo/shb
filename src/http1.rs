@@ -33,6 +33,11 @@ struct Conn {
     out_off: usize,
     /// Whether a Send SQE is in flight for `out`
     sending: bool,
+    /// Whether the next request is waiting for that Send to finish. A server
+    /// may answer before it has read the whole request - nginx does for a
+    /// location that returns a fixed status - and the request after it must
+    /// still follow the end of this one on the wire
+    queued: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
     /// Reconnect generation. Incremented on every close; CQEs from an old
@@ -54,6 +59,7 @@ impl Conn {
             out: Vec::new(),
             out_off: 0,
             sending: false,
+            queued: false,
             recv_armed: false,
             generation: 0,
             request_start: Instant::now(),
@@ -80,6 +86,7 @@ impl Conn {
         }
         self.recv_armed = false;
         self.sending = false;
+        self.queued = false;
         self.tls = None;
         self.out.clear();
         self.out_off = 0;
@@ -95,13 +102,22 @@ impl Conn {
 }
 
 /// Queue the request bytes for sending on this connection
+///
+/// TLS appends to the ciphertext behind whatever is in flight. Plaintext
+/// sends read the request where it already is, so starting one is only
+/// rewinding the offset - which must wait while a Send is still working
+/// through the previous copy: rewound under it, the Send CQE would carry on
+/// from the new offset and splice the tail of one request into the head of
+/// the next.
 fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
     match &mut conn.tls {
         Some(tls) => tls.write_plaintext(request),
         None => {
-            // Nothing to copy: a plaintext send reads the request where it
-            // already is, so starting one is only rewinding the offset
-            conn.out_off = 0;
+            if conn.sending {
+                conn.queued = true;
+            } else {
+                conn.out_off = 0;
+            }
             Ok(())
         }
     }
@@ -352,6 +368,12 @@ pub fn run_worker(
                             )?;
                         } else {
                             conn.sending = false;
+                            // The request that finished under this send goes
+                            // out now, from the start
+                            if conn.queued {
+                                conn.queued = false;
+                                conn.out_off = 0;
+                            }
                             // TLS may have produced more ciphertext meanwhile
                             flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                             if !conn.recv_armed {
