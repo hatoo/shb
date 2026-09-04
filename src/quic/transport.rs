@@ -9,6 +9,7 @@ use super::packet::{ConnectionId, MAX_CID_LEN};
 use super::varint::{get_varint, put_varint};
 
 const MAX_IDLE_TIMEOUT: u64 = 0x01;
+const STATELESS_RESET_TOKEN: u64 = 0x02;
 const MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
 const INITIAL_MAX_DATA: u64 = 0x04;
 const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
@@ -18,8 +19,13 @@ const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
 const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
 const ACK_DELAY_EXPONENT: u64 = 0x0a;
 const MAX_ACK_DELAY: u64 = 0x0b;
-const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
+const ACTIVE_CONNECTION_ID_LIMIT_ID: u64 = 0x0e;
 const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
+
+/// How many of the peer's connection IDs shb will hold at once (RFC 9000
+/// Section 18.2). The minimum: a client that never migrates needs one, and
+/// keeps a second only so the peer can rotate the first out from under it.
+pub const ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
 
 /// What the peer will let us do
 #[derive(Debug, Clone)]
@@ -37,6 +43,9 @@ pub struct Params {
     pub max_ack_delay_ms: u64,
     pub active_connection_id_limit: u64,
     pub initial_source_connection_id: Option<ConnectionId>,
+    /// What the peer will end its handshake connection ID with if it loses
+    /// the connection's state (RFC 9000 Section 10.3)
+    pub stateless_reset_token: Option<[u8; 16]>,
 }
 
 impl Default for Params {
@@ -56,6 +65,7 @@ impl Default for Params {
             max_ack_delay_ms: 25,
             active_connection_id_limit: 2,
             initial_source_connection_id: None,
+            stateless_reset_token: None,
         }
     }
 }
@@ -114,7 +124,7 @@ impl Params {
                     }
                     out.max_ack_delay_ms = v;
                 }
-                ACTIVE_CONNECTION_ID_LIMIT => {
+                ACTIVE_CONNECTION_ID_LIMIT_ID => {
                     let v = int()?;
                     if v < 2 {
                         bail!("active_connection_id_limit below the minimum of 2");
@@ -126,6 +136,12 @@ impl Params {
                         bail!("initial_source_connection_id is too long");
                     }
                     out.initial_source_connection_id = Some(ConnectionId::new(value)?);
+                }
+                STATELESS_RESET_TOKEN => {
+                    let Ok(token) = <[u8; 16]>::try_from(value) else {
+                        bail!("stateless_reset_token is not 16 bytes");
+                    };
+                    out.stateless_reset_token = Some(token);
                 }
                 // Everything else is either something we already default to
                 // or something only a server needs
@@ -174,7 +190,7 @@ impl LocalParams {
         // shb acknowledges immediately, so promising anything else would only
         // inflate the peer's probe timeout
         put(MAX_ACK_DELAY, 0);
-        put(ACTIVE_CONNECTION_ID_LIMIT, 2);
+        put(ACTIVE_CONNECTION_ID_LIMIT_ID, ACTIVE_CONNECTION_ID_LIMIT);
         put_varint(&mut out, INITIAL_SOURCE_CONNECTION_ID);
         put_varint(&mut out, self.source_connection_id.len() as u64);
         out.extend_from_slice(self.source_connection_id.as_slice());
@@ -247,12 +263,31 @@ mod tests {
         );
     }
 
+    /// The token is what tells a stateless reset from line noise, so it has
+    /// to survive the parse intact, and a token of the wrong length is not a
+    /// token at all
+    #[test]
+    fn the_stateless_reset_token_is_kept_and_must_be_sixteen_bytes() {
+        let mut buf = Vec::new();
+        put_varint(&mut buf, STATELESS_RESET_TOKEN);
+        put_varint(&mut buf, 16);
+        buf.extend_from_slice(&[0xab; 16]);
+        let p = Params::decode(&buf).unwrap();
+        assert_eq!(p.stateless_reset_token, Some([0xab; 16]));
+
+        let mut short = Vec::new();
+        put_varint(&mut short, STATELESS_RESET_TOKEN);
+        put_varint(&mut short, 15);
+        short.extend_from_slice(&[0xab; 15]);
+        assert!(Params::decode(&short).is_err());
+    }
+
     #[test]
     fn out_of_range_values_are_rejected() {
         assert!(Params::decode(&param(ACK_DELAY_EXPONENT, 21)).is_err());
         assert!(Params::decode(&param(MAX_ACK_DELAY, 1 << 14)).is_err());
         assert!(
-            Params::decode(&param(ACTIVE_CONNECTION_ID_LIMIT, 1)).is_err(),
+            Params::decode(&param(ACTIVE_CONNECTION_ID_LIMIT_ID, 1)).is_err(),
             "RFC 9000 Section 18.2 sets the minimum at 2"
         );
     }

@@ -59,6 +59,9 @@ pub enum SentFrame {
     },
     /// A PING sent purely to make the peer acknowledge something
     Ping,
+    /// A connection ID of the peer's we have stopped using; it has to hear
+    /// so, or it keeps the ID reserved for us (RFC 9000 Section 19.16)
+    RetireConnectionId(u64),
 }
 
 #[derive(Default)]

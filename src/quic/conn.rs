@@ -92,7 +92,7 @@ use super::recovery::{Congestion, Rtt, SentFrame, SentPacket, SentPackets, pto_d
 use super::stream::{
     Dir, RecvStream, SendStream, client_stream_id, is_client_initiated, stream_dir,
 };
-use super::transport::{LocalParams, Params};
+use super::transport::{ACTIVE_CONNECTION_ID_LIMIT, LocalParams, Params};
 
 /// The smallest datagram a client may send while handshaking
 /// (RFC 9000 Section 14.1)
@@ -188,6 +188,16 @@ pub struct Connection {
     local_cid: ConnectionId,
     /// Where to address packets: the peer's chosen connection ID
     peer_cid: ConnectionId,
+    /// Which of `peer_cids` that is
+    peer_cid_seq: u64,
+    /// The connection IDs the peer has issued and not retired
+    /// (RFC 9000 Section 5.1.1). Sequence 0 is the one from its Initial.
+    peer_cids: Vec<PeerCid>,
+    /// Everything the peer issued below this it has since told us to stop
+    /// using (RFC 9000 Section 5.1.2)
+    retire_prior_to: u64,
+    /// RETIRE_CONNECTION_ID frames still to send
+    retire_pending: Vec<u64>,
 
     params: Params,
     handshake_done: bool,
@@ -243,6 +253,14 @@ struct StreamPair {
     queued: bool,
 }
 
+/// A connection ID the peer issued, and the token it would end a stateless
+/// reset for that ID with
+struct PeerCid {
+    seq: u64,
+    cid: ConnectionId,
+    token: Option<[u8; 16]>,
+}
+
 impl Connection {
     pub fn connect(
         config: Arc<rustls::ClientConfig>,
@@ -290,6 +308,10 @@ impl Connection {
             rotate_at: 0,
             local_cid,
             peer_cid: initial_dcid,
+            peer_cid_seq: 0,
+            peer_cids: Vec::new(),
+            retire_prior_to: 0,
+            retire_pending: Vec::new(),
             original_dcid: initial_dcid,
             retry_token: Vec::new(),
             retried: false,
@@ -774,6 +796,16 @@ impl Connection {
             ack_eliciting = true;
         }
 
+        while let Some(&seq) = self.retire_pending.last() {
+            if room(out) < 16 {
+                break;
+            }
+            frame::put_retire_connection_id(out, seq);
+            frames.push(SentFrame::RetireConnectionId(seq));
+            self.retire_pending.pop();
+            ack_eliciting = true;
+        }
+
         if congested {
             return Ok(ack_eliciting);
         }
@@ -966,6 +998,13 @@ impl Connection {
         {
             // The server picks its own connection ID in its first flight
             self.peer_cid = scid;
+            if self.peer_cids.is_empty() {
+                self.peer_cids.push(PeerCid {
+                    seq: 0,
+                    cid: scid,
+                    token: None,
+                });
+            }
         }
 
         let s = &mut self.spaces[space as usize];
@@ -1038,7 +1077,16 @@ impl Connection {
             Frame::DataBlocked(_)
             | Frame::StreamDataBlocked { .. }
             | Frame::StreamsBlocked { .. } => {}
-            Frame::NewConnectionId { .. } | Frame::RetireConnectionId(_) => {}
+            Frame::NewConnectionId {
+                seq,
+                retire_prior_to,
+                cid,
+                reset_token,
+            } => self.on_new_connection_id(seq, retire_prior_to, cid, reset_token)?,
+            // The peer retiring ours: it has only ever had the one, and a peer
+            // that retires the ID it is addressing us by has nothing left to
+            // address us by, so there is nothing to act on
+            Frame::RetireConnectionId(_) => {}
             Frame::PathChallenge(data) => self.on_path_challenge(data)?,
             Frame::PathResponse(_) => {}
             Frame::Close { error, reason, app } => self.on_close(error, reason, app),
@@ -1058,6 +1106,70 @@ impl Connection {
         // RFC 9001 Section 4.9.2: the handshake keys are no longer needed and
         // holding them only risks using them
         self.discard_space(Space::Handshake);
+    }
+
+    /// Take a connection ID the peer has issued, and move to it if it retires
+    /// the one in use (RFC 9000 Sections 5.1.2 and 19.15)
+    ///
+    /// A server rotates its connection IDs to keep an observer from linking
+    /// a client's packets over time. A client that never migrates has no use
+    /// for the spares, but a peer that says "stop using that one" and is not
+    /// obeyed stops answering.
+    #[cold]
+    #[inline(never)]
+    fn on_new_connection_id(
+        &mut self,
+        seq: u64,
+        retire_prior_to: u64,
+        cid: &[u8],
+        token: &[u8],
+    ) -> Result<()> {
+        if cid.is_empty() {
+            bail!("NEW_CONNECTION_ID with a zero-length connection ID");
+        }
+        if retire_prior_to > seq {
+            bail!("NEW_CONNECTION_ID retires its own sequence number");
+        }
+        let token = <[u8; 16]>::try_from(token).ok();
+        if seq < self.retire_prior_to {
+            // Issued and withdrawn by frames that crossed on the wire; the
+            // peer still needs to hear it was retired
+            self.retire_pending.push(seq);
+            self.needs_send = true;
+            return Ok(());
+        }
+        if self.peer_cids.iter().any(|c| c.seq == seq) {
+            return Ok(());
+        }
+        if retire_prior_to > self.retire_prior_to {
+            self.retire_prior_to = retire_prior_to;
+            let mut i = 0;
+            while i < self.peer_cids.len() {
+                if self.peer_cids[i].seq < retire_prior_to {
+                    self.retire_pending.push(self.peer_cids.remove(i).seq);
+                } else {
+                    i += 1;
+                }
+            }
+            self.needs_send = true;
+        }
+        // The peer may only issue as many as shb said it would hold. One that
+        // issues more is not worth closing over: the extra ID is simply not
+        // kept, and the frame that retires the ones in use brings its own.
+        if (self.peer_cids.len() as u64) < ACTIVE_CONNECTION_ID_LIMIT {
+            self.peer_cids.push(PeerCid {
+                seq,
+                cid: ConnectionId::new(cid)?,
+                token,
+            });
+        }
+        if self.peer_cid_seq < self.retire_prior_to
+            && let Some(next) = self.peer_cids.iter().min_by_key(|c| c.seq)
+        {
+            self.peer_cid = next.cid;
+            self.peer_cid_seq = next.seq;
+        }
+        Ok(())
     }
 
     #[cold]
@@ -1131,6 +1243,12 @@ impl Connection {
             self.params = Params::decode(raw)?;
             self.max_data_peer = self.params.initial_max_data;
             self.max_streams_bidi = self.params.initial_max_streams_bidi;
+            // The handshake connection ID's reset token travels in the
+            // transport parameters rather than in a frame (RFC 9000
+            // Section 18.2)
+            if let Some(first) = self.peer_cids.iter_mut().find(|c| c.seq == 0) {
+                first.token = self.params.stateless_reset_token;
+            }
         }
         self.pump_tls()?;
         Ok(())
@@ -1247,7 +1365,7 @@ impl Connection {
         match f {
             // A PING is only there to draw an acknowledgement, and CRYPTO is
             // released by the handshake advancing rather than by this
-            SentFrame::Ping | SentFrame::Crypto { .. } => {}
+            SentFrame::Ping | SentFrame::Crypto { .. } | SentFrame::RetireConnectionId(_) => {}
             SentFrame::Stream {
                 id, offset, len, ..
             } => {
@@ -1261,6 +1379,7 @@ impl Connection {
     fn on_frame_lost(&mut self, space: Space, f: SentFrame) {
         match f {
             SentFrame::Ping => {}
+            SentFrame::RetireConnectionId(seq) => self.retire_pending.push(seq),
             SentFrame::Crypto { offset, len } => {
                 // Rewind to the lost run. Anything after it goes out again
                 // too, which costs a little bandwidth once and avoids
@@ -2057,6 +2176,89 @@ mod tests {
             "above the changeover it is the peer updating again"
         );
     }
+    /// Pretend the server's Initial has arrived with this connection ID
+    fn with_handshake_cid(conn: &mut Connection, cid: &[u8]) {
+        let cid = ConnectionId::new(cid).unwrap();
+        conn.peer_cid = cid;
+        conn.peer_cids.push(PeerCid {
+            seq: 0,
+            cid,
+            token: None,
+        });
+    }
+
+    fn new_cid(conn: &mut Connection, seq: u64, retire_prior_to: u64, cid: &[u8]) -> Result<()> {
+        conn.handle_frame(
+            Space::Data,
+            Frame::NewConnectionId {
+                seq,
+                retire_prior_to,
+                cid,
+                reset_token: &[seq as u8; 16],
+            },
+            Instant::now(),
+        )
+    }
+
+    /// RFC 9000 Section 5.1.2: once the peer retires the connection ID in
+    /// use, packets go to the next one it issued, and it is told which ones
+    /// were let go
+    #[test]
+    fn retiring_the_connection_id_in_use_moves_to_the_next_one() {
+        let mut conn = client();
+        with_handshake_cid(&mut conn, &[0; 8]);
+        new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
+        assert_eq!(conn.peer_cid.as_slice(), &[0; 8], "a spare is not a move");
+        assert_eq!(conn.peer_cids[1].token, Some([1; 16]));
+
+        new_cid(&mut conn, 2, 2, &[2; 8]).unwrap();
+        assert_eq!(conn.peer_cid.as_slice(), &[2; 8]);
+        assert_eq!(conn.peer_cid_seq, 2);
+        let mut retired = conn.retire_pending.clone();
+        retired.sort_unstable();
+        assert_eq!(retired, vec![0, 1]);
+        assert_eq!(conn.peer_cids.len(), 1, "the retired ones are gone");
+
+        // The frames go out, and one lost goes out again
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let sent: Vec<_> = frame::Iter::new(&out).map(|f| f.unwrap()).collect();
+        assert!(sent.contains(&Frame::RetireConnectionId(0)), "{sent:?}");
+        assert!(sent.contains(&Frame::RetireConnectionId(1)), "{sent:?}");
+        assert!(conn.retire_pending.is_empty());
+        conn.on_frame_lost(Space::Data, SentFrame::RetireConnectionId(1));
+        assert_eq!(conn.retire_pending, vec![1]);
+    }
+
+    /// shb advertises room for two, so a third is not kept; one issued below
+    /// the retirement point is retired straight back
+    #[test]
+    fn connection_ids_past_the_advertised_limit_are_not_kept() {
+        let mut conn = client();
+        with_handshake_cid(&mut conn, &[0; 8]);
+        new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
+        new_cid(&mut conn, 2, 0, &[2; 8]).unwrap();
+        assert_eq!(conn.peer_cids.len(), 2);
+        assert_eq!(conn.peer_cid.as_slice(), &[0; 8]);
+
+        new_cid(&mut conn, 3, 2, &[3; 8]).unwrap();
+        assert_eq!(conn.peer_cid.as_slice(), &[3; 8], "2 was never kept");
+        conn.retire_pending.clear();
+        new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
+        assert_eq!(conn.retire_pending, vec![1], "below the retirement point");
+        assert!(!conn.peer_cids.iter().any(|c| c.seq == 1));
+    }
+
+    #[test]
+    fn a_malformed_new_connection_id_is_a_protocol_error() {
+        let mut conn = client();
+        with_handshake_cid(&mut conn, &[0; 8]);
+        assert!(new_cid(&mut conn, 1, 0, &[]).is_err(), "zero length");
+        assert!(new_cid(&mut conn, 1, 2, &[1; 8]).is_err(), "retires itself");
+    }
+
     #[test]
     fn the_retry_from_the_rfc_authenticates_and_a_tampered_one_does_not() {
         // RFC 9001 Appendix A.4, which exists so an implementation can check

@@ -437,6 +437,11 @@ pub fn put_max_streams(out: &mut Vec<u8>, uni: bool, limit: u64) {
     put_varint(out, limit);
 }
 
+pub fn put_retire_connection_id(out: &mut Vec<u8>, seq: u64) {
+    put_varint(out, RETIRE_CONNECTION_ID);
+    put_varint(out, seq);
+}
+
 pub fn put_path_response(out: &mut Vec<u8>, data: &[u8]) {
     put_varint(out, PATH_RESPONSE);
     out.extend_from_slice(data);
@@ -648,6 +653,13 @@ mod tests {
             }
         );
         assert_eq!(f[1], Frame::Ping, "the frame after it must still parse");
+    }
+
+    #[test]
+    fn retire_connection_id_round_trips() {
+        let mut out = Vec::new();
+        put_retire_connection_id(&mut out, 3);
+        assert_eq!(frames(&out), vec![Frame::RetireConnectionId(3)]);
     }
 
     #[test]
