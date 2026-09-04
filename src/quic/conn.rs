@@ -250,7 +250,7 @@ pub struct Connection {
     connected: bool,
     closed: Option<String>,
     /// A CONNECTION_CLOSE we still owe the peer
-    close_pending: Option<(u64, Vec<u8>)>,
+    close_pending: Option<Close>,
 
     /// Connection-level flow control
     max_data_local: u64,
@@ -298,6 +298,15 @@ pub struct Connection {
     needs_send: bool,
     /// A PATH_CHALLENGE the peer sent that we owe an answer to
     path_response: Option<[u8; 8]>,
+}
+
+/// What a CONNECTION_CLOSE still to be sent will say
+struct Close {
+    code: u64,
+    reason: Vec<u8>,
+    /// An application close (RFC 9000 Section 19.19, type 0x1d) rather than
+    /// a transport one; only 1-RTT packets may carry it
+    app: bool,
 }
 
 struct StreamPair {
@@ -846,13 +855,14 @@ impl Connection {
         // the handshake has not yet proved who is reading it. nginx logged
         // "quic frame type 0x1d is not allowed in packet with flags 0xc0"
         // for every connection a run ended while it was still handshaking.
+        // A transport close carries its code in any space.
         if space == self.highest_space()
-            && let Some((code, reason)) = self.close_pending.take()
+            && let Some(close) = self.close_pending.take()
         {
-            if space == Space::Data {
-                frame::put_close(out, code, &reason);
-            } else {
-                frame::put_transport_close(out, frame::APPLICATION_ERROR);
+            match (space, close.app) {
+                (Space::Data, true) => frame::put_close(out, close.code, &close.reason),
+                (_, true) => frame::put_transport_close(out, frame::APPLICATION_ERROR),
+                (_, false) => frame::put_transport_close(out, close.code),
             }
             return Ok(Filled {
                 ack_eliciting: false,
@@ -1476,10 +1486,25 @@ impl Connection {
         let s = &mut self.spaces[space as usize];
         s.crypto_in.push(offset, data, false)?;
         let tls = &mut self.tls;
-        let n = s.crypto_in.consume(|ordered| {
+        let n = match s.crypto_in.consume(|ordered| {
             tls.read_hs(ordered)
                 .map_err(|e| anyhow::anyhow!("TLS handshake: {e}"))
-        })?;
+        }) {
+            Ok(n) => n,
+            Err(e) => {
+                // RFC 9001 Section 4.8: a TLS alert is a CONNECTION_CLOSE
+                // with 0x100 plus the alert's code, so a server offering
+                // no ALPN is told no_application_protocol rather than
+                // left with a client that fell silent
+                const INTERNAL_ERROR: u64 = 0x50;
+                let alert = self
+                    .tls
+                    .alert()
+                    .map_or(INTERNAL_ERROR, |a| u8::from(a) as u64);
+                self.close_transport(0x100 + alert, &format!("{e:#}"));
+                return Ok(());
+            }
+        };
         if n == 0 {
             return Ok(());
         }
@@ -2344,8 +2369,25 @@ impl Connection {
     /// Ask for a CONNECTION_CLOSE on the next packet
     pub fn close(&mut self, code: u64, reason: &[u8]) {
         if self.closed.is_none() {
-            self.close_pending = Some((code, reason.to_vec()));
+            self.close_pending = Some(Close {
+                code,
+                reason: reason.to_vec(),
+                app: true,
+            });
             self.closed = Some("closed locally".to_string());
+        }
+    }
+
+    /// End the connection over a transport error of the peer's, saying so
+    /// in a CONNECTION_CLOSE and to the worker
+    fn close_transport(&mut self, code: u64, why: &str) {
+        if self.closed.is_none() {
+            self.close_pending = Some(Close {
+                code,
+                reason: Vec::new(),
+                app: false,
+            });
+            self.lose(why);
         }
     }
 }
@@ -3565,6 +3607,39 @@ mod tests {
         conn.on_stream(id, 0, b"answered", true).unwrap();
         conn.retire(id, 0x10c);
         assert!(conn.stream_mut(id).is_none());
+    }
+
+    /// RFC 9001 Section 4.8: a handshake rustls rejects ends in a
+    /// CONNECTION_CLOSE carrying 0x100 plus the TLS alert, in the space the
+    /// handshake was in, rather than in a socket that goes quiet
+    #[test]
+    fn a_tls_failure_is_a_connection_close_with_the_alert() {
+        let mut conn = client();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        conn.poll_transmit(now, &mut out, None).unwrap();
+        // What arrives is shaped like a ServerHello and is not one
+        let mut garbage = vec![0x02, 0x00, 0x00, 0x30, 0x03, 0x03];
+        garbage.extend_from_slice(&[0x5a; 48]);
+        conn.on_crypto(Space::Initial, 0, &garbage).unwrap();
+        assert!(matches!(
+            conn.poll_event(),
+            Some(Event::Lost(why)) if why.contains("TLS handshake")
+        ));
+
+        out.clear();
+        let mut frames = Vec::new();
+        conn.fill_payload(Space::Initial, now, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        let sent: Vec<_> = frame::Iter::new(&out).map(|f| f.unwrap()).collect();
+        let [Frame::Close { error, app, .. }] = sent[..] else {
+            panic!("expected one CONNECTION_CLOSE, got {sent:?}");
+        };
+        assert!(!app, "a transport close, in an Initial");
+        assert!(
+            (0x100..0x200).contains(&error),
+            "0x100 plus the alert, got {error:#x}"
+        );
     }
 
     /// RFC 9000 Section 10.1.2: a PING before the effective idle timeout
