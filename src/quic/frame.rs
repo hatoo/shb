@@ -35,6 +35,10 @@ pub const CONNECTION_CLOSE_QUIC: u64 = 0x1c;
 pub const CONNECTION_CLOSE_APP: u64 = 0x1d;
 pub const HANDSHAKE_DONE: u64 = 0x1e;
 
+/// The transport error code that stands in for an application close while
+/// the handshake is still on (RFC 9000 Section 20.1)
+pub const APPLICATION_ERROR: u64 = 0x0c;
+
 /// The STREAM type bits (RFC 9000 Section 19.8)
 const STREAM_FIN: u64 = 0x01;
 const STREAM_LEN: u64 = 0x02;
@@ -447,13 +451,24 @@ pub fn put_path_response(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
+/// An application close, which only a 0-RTT or 1-RTT packet may carry
+/// (RFC 9000 Section 12.4)
 pub fn put_close(out: &mut Vec<u8>, error: u64, reason: &[u8]) {
-    // Always an application close: the transport-level one has to name the
-    // frame type that caused it, and shb never closes for that reason
     put_varint(out, CONNECTION_CLOSE_APP);
     put_varint(out, error);
     put_varint(out, reason.len() as u64);
     out.extend_from_slice(reason);
+}
+
+/// A transport close. shb never closes over a frame the peer sent, so the
+/// frame type is always "none"; what it does need this for is closing while
+/// the handshake is still on, when RFC 9000 Section 10.2.3 says an
+/// application close has to be sent as APPLICATION_ERROR with no reason.
+pub fn put_transport_close(out: &mut Vec<u8>, error: u64) {
+    put_varint(out, CONNECTION_CLOSE_QUIC);
+    put_varint(out, error);
+    put_varint(out, PADDING);
+    put_varint(out, 0);
 }
 
 /// An ACK covering `ranges`, which must be sorted largest first and not touch
@@ -609,6 +624,23 @@ mod tests {
                 reason: b"done",
             }]
         );
+    }
+
+    #[test]
+    fn a_transport_close_round_trips_with_no_reason() {
+        let mut out = Vec::new();
+        put_transport_close(&mut out, APPLICATION_ERROR);
+        out.push(PING as u8);
+        let f = frames(&out);
+        assert_eq!(
+            f[0],
+            Frame::Close {
+                app: false,
+                error: APPLICATION_ERROR,
+                reason: b"",
+            }
+        );
+        assert_eq!(f[1], Frame::Ping, "the frame type field was written");
     }
 
     /// The transport-level close has an extra field the application one does

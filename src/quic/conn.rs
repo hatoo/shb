@@ -498,6 +498,19 @@ impl Connection {
         }
     }
 
+    /// The furthest the handshake has got: a client only ever holds keys
+    /// for a space the server has already used, so this is also the highest
+    /// space the server can read
+    fn highest_space(&self) -> Space {
+        if self.one_rtt_local.is_some() {
+            Space::Data
+        } else if self.spaces[Space::Handshake as usize].keys.is_some() {
+            Space::Handshake
+        } else {
+            Space::Initial
+        }
+    }
+
     /// Build one datagram's worth of packets into `out`
     ///
     /// Returns how many bytes were written. Packets from different spaces are
@@ -724,15 +737,31 @@ impl Connection {
             ack_largest = largest;
         }
 
-        if let Some(data) = self.path_response.take()
+        // Only 1-RTT packets may carry a PATH_RESPONSE (RFC 9000 Section
+        // 12.5), and a challenge can only have arrived in one
+        if space == Space::Data
+            && let Some(data) = self.path_response.take()
             && room(out) > 9
         {
             frame::put_path_response(out, &data);
             ack_eliciting = true;
         }
 
-        if let Some((code, reason)) = self.close_pending.take() {
-            frame::put_close(out, code, &reason);
+        // A close goes in the highest space we have keys for, which is the
+        // highest the peer is sure to have too. Below 1-RTT it cannot be an
+        // application close: RFC 9000 Section 10.2.3 has it sent as the
+        // transport error APPLICATION_ERROR with the reason left out, since
+        // the handshake has not yet proved who is reading it. nginx logged
+        // "quic frame type 0x1d is not allowed in packet with flags 0xc0"
+        // for every connection a run ended while it was still handshaking.
+        if space == self.highest_space()
+            && let Some((code, reason)) = self.close_pending.take()
+        {
+            if space == Space::Data {
+                frame::put_close(out, code, &reason);
+            } else {
+                frame::put_transport_close(out, frame::APPLICATION_ERROR);
+            }
             return Ok(Filled {
                 ack_eliciting: false,
                 ack_largest,
@@ -2340,6 +2369,33 @@ mod tests {
         new_cid(&mut conn, 1, 0, &[1; 8]).unwrap();
         assert_eq!(conn.retire_pending, vec![1], "below the retirement point");
         assert!(!conn.peer_cids.iter().any(|c| c.seq == 1));
+    }
+
+    /// RFC 9000 Section 10.2.3: a run ending while a connection is still
+    /// handshaking closes it in an Initial or Handshake packet, where the
+    /// application close is not allowed and stands in as APPLICATION_ERROR
+    #[test]
+    fn a_close_before_the_handshake_is_a_transport_close() {
+        let mut conn = client();
+        let now = Instant::now();
+        conn.close(0x100, b"done");
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        // Not in a space the handshake has not reached
+        conn.fill_payload(Space::Data, now, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        assert!(conn.close_pending.is_some(), "1-RTT has no keys yet");
+        conn.fill_payload(Space::Initial, now, &mut out, 1200, &mut frames, false)
+            .unwrap();
+        let sent: Vec<_> = frame::Iter::new(&out).map(|f| f.unwrap()).collect();
+        assert_eq!(
+            sent,
+            vec![Frame::Close {
+                app: false,
+                error: frame::APPLICATION_ERROR,
+                reason: b"",
+            }]
+        );
     }
 
     /// RFC 9000 Section 10.3.1: a datagram that will not decrypt and ends in
