@@ -18,6 +18,11 @@ pub fn status_value(s: &[u8], huffman: bool) -> Result<u16> {
         }
         return Ok((s[0] - b'0') as u16 * 100 + (s[1] - b'0') as u16 * 10 + (s[2] - b'0') as u16);
     }
+    // Three digit codes occupy 15..=18 bits. Bound the input before shifting
+    // into the accumulator, including on malformed peer input.
+    if !(2..=3).contains(&s.len()) {
+        bail!("malformed Huffman :status length");
+    }
     let mut bits: u32 = 0;
     let mut nbits: u32 = 0;
     let mut digits = [0u8; 3];
@@ -38,7 +43,9 @@ pub fn status_value(s: &[u8], huffman: bool) -> Result<u16> {
             bits &= (1u32 << nbits) - 1;
         }
     }
-    if n != 3 {
+    // RFC 7541 Section 5.2: padding is at most seven bits and must be the
+    // prefix of EOS (all ones). Extra symbols are not padding.
+    if n != 3 || nbits > 7 || bits != (1u32 << nbits) - 1 {
         bail!("malformed :status");
     }
     Ok(
@@ -80,6 +87,21 @@ mod tests {
         assert_eq!(status_value(b"503", false).unwrap(), 503);
         assert!(status_value(b"20", false).is_err(), "too short");
         assert!(status_value(b"2x0", false).is_err(), "not a digit");
+    }
+
+    #[test]
+    fn huffman_padding_and_extra_symbols_are_rejected() {
+        assert_eq!(status_value(&[0x10, 0x01], true).unwrap(), 200);
+        for bytes in [
+            &b""[..],
+            &[0x10],
+            &[0x10, 0x00],       // zero padding
+            &[0x10, 0x01, 0xff], // more than seven padding bits
+            &[0x10, 0x00, 0x0f], // a fourth digit
+            &[0x10, 0x01, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            assert!(status_value(bytes, true).is_err(), "{bytes:?}");
+        }
     }
 
     /// The table is two runs, and the boundary between them is where a wrong

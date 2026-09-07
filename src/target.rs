@@ -38,7 +38,7 @@ pub struct Target {
 
 /// Connection-specific headers are meaningless (and mostly forbidden) in
 /// HTTP/2 and HTTP/3; filter them like curl does
-pub fn is_connection_specific(name: &str) -> bool {
+fn is_connection_specific(name: &str) -> bool {
     [
         "connection",
         "keep-alive",
@@ -50,6 +50,28 @@ pub fn is_connection_specific(name: &str) -> bool {
     .any(|h| name.eq_ignore_ascii_case(h))
 }
 
+/// Prepare HTTP/2 and HTTP/3 fields once, before the request loop (RFC 9113
+/// Section 8.2.2 and RFC 9114 Section 4.2). Connection can nominate arbitrary
+/// fields; TE is the exception, but only with the value "trailers".
+pub fn multiplexed_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, value)| {
+            if name.eq_ignore_ascii_case("te") {
+                return value.eq_ignore_ascii_case("trailers");
+            }
+            !is_connection_specific(name)
+                && !headers.iter().any(|(field, options)| {
+                    field.eq_ignore_ascii_case("connection")
+                        && options.split(',').any(|option| {
+                            option.trim_matches([' ', '\t']).eq_ignore_ascii_case(name)
+                        })
+                })
+        })
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect()
+}
+
 pub fn parse_target(
     url: &str,
     method: &str,
@@ -57,6 +79,15 @@ pub fn parse_target(
     body: Option<&[u8]>,
     disable_keepalive: bool,
 ) -> Result<Target> {
+    // CONNECT needs a tunnel, an authority-form target in HTTP/1.1, and no
+    // :scheme or :path in HTTP/2 and HTTP/3. None of our workers implements
+    // tunnels, so fail at startup instead of emitting an invalid request.
+    if method == "CONNECT" {
+        bail!("CONNECT tunnels are not supported");
+    }
+    if method == "TRACE" && body.is_some_and(|body| !body.is_empty()) {
+        bail!("TRACE requests must not contain a body (RFC 9110 Section 9.3.8)");
+    }
     let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -67,9 +98,16 @@ pub fn parse_target(
     // The fragment is the client's own business and never goes on the wire
     // (RFC 9110 Section 7.1)
     let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
-    let (authority, path) = match rest.find('/') {
+    let (authority, path) = match rest.find(['/', '?']) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
+    };
+    // An empty URI path becomes "/", while its query is preserved (RFC 9112
+    // Section 3.2.1). A slash inside the query does not end the authority.
+    let path = if path.starts_with('?') {
+        format!("/{path}")
+    } else {
+        path.to_string()
     };
     if authority.is_empty() {
         bail!("missing host in URL");
@@ -104,13 +142,20 @@ pub fn parse_target(
         let (name, value) = header
             .split_once(':')
             .with_context(|| format!("invalid header (expected \"Name: Value\"): {header}"))?;
-        let name = name.trim();
+        let name = name.trim_matches([' ', '\t']);
         // Whitespace around a value is not part of it (RFC 9110 Section
         // 5.5), and a trailing space that HTTP/1.1 would shrug off makes an
         // HTTP/2 or HTTP/3 field malformed (RFC 9113 Section 8.2.1)
-        let value = value.trim();
+        let value = value.trim_matches([' ', '\t']);
         if name.is_empty() {
             bail!("invalid header (empty name): {header}");
+        }
+        // Validate before Host/Content-Length are moved or normalized.
+        if !is_token(name) {
+            bail!("invalid header name: {name:?}");
+        }
+        if !is_field_value(value) {
+            bail!("invalid header value for {name:?}");
         }
         // Like curl, -H "Host: ..." replaces the Host header / :authority
         if name.eq_ignore_ascii_case("host") {
@@ -143,14 +188,14 @@ pub fn parse_target(
     let body: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
     frame_body(method, &mut headers, &body)?;
 
-    let request_bytes = encode_request(method, path, &authority, &headers, &body)?;
+    let request_bytes = encode_request(method, &path, &authority, &headers, &body)?;
 
     Ok(Target {
         addr,
         tls,
         host: host_for_lookup.to_string(),
         authority,
-        path: path.to_string(),
+        path,
         method: method.to_string(),
         headers,
         body,
@@ -175,6 +220,18 @@ pub fn parse_target(
 fn frame_body(method: &str, headers: &mut Vec<(String, String)>, body: &[u8]) -> Result<()> {
     let mut content_length_given = false;
     for (name, value) in headers.iter() {
+        if name.eq_ignore_ascii_case("te")
+            && value.split(',').any(|coding| {
+                coding
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .trim_matches([' ', '\t'])
+                    .eq_ignore_ascii_case("chunked")
+            })
+        {
+            bail!("TE must not contain chunked (RFC 9112 Section 7.4)");
+        }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             bail!("Transfer-Encoding is not supported: the body is sent with a Content-Length");
         }
@@ -265,6 +322,20 @@ fn encode_request(
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
+    // TE applies only to this connection (RFC 9110 Section 10.1.4). Keep
+    // this HTTP/1.1-only field out of the shared HTTP/2 and HTTP/3 headers.
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("te"))
+        && !headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|option| option.trim_matches([' ', '\t']).eq_ignore_ascii_case("te"))
+        })
+    {
+        out.extend_from_slice(b"Connection: TE\r\n");
+    }
     if !body.is_empty() {
         out.extend_from_slice(b"Content-Length: ");
         out.extend_from_slice(body.len().to_string().as_bytes());
@@ -298,6 +369,87 @@ mod tests {
             req(&[], "GET", None),
             "GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:8111\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn query_without_a_path_is_not_part_of_the_authority() {
+        for (suffix, expected) in [
+            ("?q=1", "/?q=1"),
+            ("?next=/a?b#c", "/?next=/a?b"),
+            ("?", "/?"),
+        ] {
+            for authority in ["127.0.0.1", "127.0.0.1:8080", "[::1]:8080"] {
+                let t = target(&format!("http://{authority}{suffix}"));
+                assert_eq!(t.authority, authority);
+                assert_eq!(t.path, expected);
+                assert!(
+                    t.request_bytes
+                        .starts_with(format!("GET {expected} HTTP/1.1\r\n").as_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_tunnels_and_trace_content_fail_at_startup() {
+        assert!(err_for("CONNECT", &[]).contains("tunnels"));
+        assert!(parse_target("http://127.0.0.1/", "TRACE", &[], Some(b"body"), false).is_err());
+        assert!(parse_target("http://127.0.0.1/", "TRACE", &[], Some(b""), false).is_ok());
+    }
+
+    #[test]
+    fn only_http_whitespace_is_trimmed_from_fields() {
+        for field in [
+            "X-A: value\r",
+            "X-A: \nvalue",
+            "X-A: value\u{000b}",
+            "Content-Length: 0\r",
+            "Host: example.com\n",
+            "X-A\r: value",
+        ] {
+            assert!(err_for("GET", &[field]).contains("header"), "{field:?}");
+        }
+        // Non-ASCII bytes are field content, not HTTP optional whitespace.
+        assert!(
+            req(&["X-A: \u{00a0}value\u{00a0}"], "GET", None)
+                .contains("X-A: \u{00a0}value\u{00a0}\r\n")
+        );
+    }
+
+    #[test]
+    fn multiplexed_requests_remove_connection_fields_and_restrict_te() {
+        let headers = [
+            ("Connection", "keep-alive, X-Hop"),
+            ("cOnNeCtIoN", "X-Other, TE"),
+            ("Keep-Alive", "timeout=5"),
+            ("Proxy-Connection", "keep-alive"),
+            ("Upgrade", "h2c"),
+            ("Transfer-Encoding", "chunked"),
+            ("x-hop", "secret"),
+            ("X-Other", "secret"),
+            ("TE", "gzip"),
+            ("TE", "trailers, gzip"),
+            ("TE", "trailers"),
+            ("X-End", "keep"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(
+            multiplexed_headers(&headers),
+            vec![
+                ("te".to_string(), "trailers".to_string()),
+                ("x-end".to_string(), "keep".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn http1_te_is_connection_scoped_and_never_advertises_chunked() {
+        assert!(req(&["TE: trailers"], "GET", None).contains("Connection: TE\r\n"));
+        let request = req(&["TE: trailers", "Connection: keep-alive, te"], "GET", None);
+        assert_eq!(request.matches("Connection:").count(), 1);
+        for value in ["chunked", "gzip, CHUNKED", "chunked;q=0.5"] {
+            assert!(err_for("GET", &[&format!("TE: {value}")]).contains("chunked"));
+        }
     }
 
     #[test]

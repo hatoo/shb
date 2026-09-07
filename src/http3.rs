@@ -119,13 +119,7 @@ fn probe_gso(addr: &std::net::SocketAddr) -> bool {
 ///
 /// Encoded once; nothing in it depends on the stream or the connection.
 fn build_field_section(target: &Target) -> Vec<u8> {
-    let headers: Vec<(String, String)> = target
-        .headers
-        .iter()
-        .filter(|(name, _)| !crate::target::is_connection_specific(name))
-        // Field names must be lower-case in HTTP/3, like HTTP/2
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .collect();
+    let headers = crate::target::multiplexed_headers(&target.headers);
     qpack::encode_request(
         &target.method,
         "https",

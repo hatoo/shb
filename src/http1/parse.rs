@@ -210,6 +210,16 @@ impl Parser {
                     let avail = (buf.len() - pos) as u64;
                     let take = n.min(avail);
                     pos += take as usize;
+                    let left = n - take;
+                    if left < 2 && take != 0 {
+                        // Validate only the terminator bytes in this receive,
+                        // including a receive split between CR and LF.
+                        let end = (2 - left) as usize;
+                        let len = take.min(end as u64) as usize;
+                        if buf[pos - len..pos] != b"\r\n"[end - len..end] {
+                            bail!("invalid chunk terminator");
+                        }
+                    }
                     if take < n {
                         self.state = State::Body(Body::Chunk(n - take));
                         return Ok((pos, done));
@@ -308,7 +318,7 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
             // HTTP/1.1 keeps the connection unless told otherwise; HTTP/1.0
             // closes it unless told otherwise (RFC 9112 Section 9.3)
             let keep_alive = if http_1_0 {
-                keep_alive_token && !close
+                keep_alive_token && !close && !te_present
             } else {
                 !close
             };
@@ -339,7 +349,9 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
                 // Repeated fields concatenate, so the last one decides whether
                 // chunked is the final coding
                 te_present = true;
-                te_chunked = ci_ends_with_chunked(trim_ows(&line[18..]));
+                if let Some(chunked) = final_coding(&line[18..])? {
+                    te_chunked = chunked;
+                }
             }
             _ => {}
         }
@@ -444,14 +456,41 @@ fn ci_prefix(line: &[u8], name: &[u8]) -> bool {
             .all(|(a, b)| a | 0x20 == *b)
 }
 
-/// Whether a Transfer-Encoding value ends in "chunked", which is the only
-/// position the token may appear in (RFC 9112 Section 6.1)
-fn ci_ends_with_chunked(value: &[u8]) -> bool {
-    let tail = match value.len().checked_sub(7) {
-        Some(i) => &value[i..],
-        None => return false,
-    };
-    tail.iter().zip(b"chunked").all(|(a, b)| a | 0x20 == *b)
+/// Find the last nonempty coding, honoring quoted commas in parameters.
+/// Empty list elements are ignored (RFC 9110 Section 5.6.1.2), including
+/// across repeated field lines. Compare whole tokens, not suffixes.
+fn final_coding(value: &[u8]) -> Result<Option<bool>> {
+    let value = trim_ows(value);
+    if ci_eq(value, b"chunked") {
+        return Ok(Some(true));
+    }
+    let mut last = None;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, &byte) in value.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && byte == b',' {
+            let coding = trim_ows(&value[start..i]);
+            if !coding.is_empty() {
+                last = Some(ci_eq(coding, b"chunked"));
+            }
+            start = i + 1;
+        }
+    }
+    if quoted {
+        bail!("unterminated Transfer-Encoding parameter");
+    }
+    let coding = trim_ows(&value[start..]);
+    if !coding.is_empty() {
+        last = Some(ci_eq(coding, b"chunked"));
+    }
+    Ok(last)
 }
 
 #[cfg(test)]
@@ -500,6 +539,58 @@ mod tests {
             resp("HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n5\nhello\n6\n world\n0\n\n");
         assert_eq!(p.feed(&data).unwrap(), 1);
         assert_eq!(p.status(), 200);
+    }
+
+    #[test]
+    fn malformed_chunk_terminators_are_rejected_at_every_split() {
+        for ending in [b"XX", b"\rX", b"X\n"] {
+            let mut data = resp("HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n1\na");
+            data.extend_from_slice(ending);
+            data.extend_from_slice(b"0\r\n\r\n");
+            for split in 0..=data.len() {
+                let mut p = Parser::new();
+                let result = p.feed(&data[..split]).and_then(|_| p.feed(&data[split..]));
+                assert!(result.is_err(), "{ending:?}, split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_coding_is_a_whole_token_and_quoted_commas_are_not_separators() {
+        for coding in [
+            "xchunked",
+            "gzip; note=\"a,chunked\"",
+            "gzip; note=\"a\\\",chunked\"",
+            "chunked, gzip",
+        ] {
+            let mut p = Parser::new();
+            let data = resp(&format!(
+                "HTTP/1.1 200 OK\nTransfer-Encoding: {coding}\n\n0\n\n"
+            ));
+            assert_eq!(p.feed(&data).unwrap(), 0, "{coding}");
+            assert!(p.mark_eof());
+        }
+        for coding in [
+            "gzip, Chunked, ",
+            ",chunked,,",
+            "gzip; note=\"a,b\", chunked",
+            "chunked\nTransfer-Encoding: ,",
+        ] {
+            let mut p = Parser::new();
+            let data = resp(&format!(
+                "HTTP/1.1 200 OK\nTransfer-Encoding: {coding}\n\n0\n\n"
+            ));
+            assert_eq!(p.feed(&data).unwrap(), 1, "{coding}");
+        }
+    }
+
+    #[test]
+    fn http10_transfer_encoding_cannot_keep_the_connection_alive() {
+        let mut p = Parser::new();
+        let data =
+            resp("HTTP/1.0 200 OK\nConnection: keep-alive\nTransfer-Encoding: chunked\n\n0\n\n");
+        assert_eq!(p.feed(&data).unwrap(), 1);
+        assert!(!p.keep_alive());
     }
 
     #[test]

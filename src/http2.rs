@@ -31,13 +31,7 @@ use io_uring::{Submitter, cqueue, squeue, types};
 /// They are encoded once and then memcpy'd per request; nothing in them
 /// depends on the stream or the connection.
 fn build_header_block(target: &Target) -> Vec<u8> {
-    let headers: Vec<(String, String)> = target
-        .headers
-        .iter()
-        .filter(|(name, _)| !crate::target::is_connection_specific(name))
-        // HTTP/2 requires lower-case field names (RFC 9113 Section 8.2.1)
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .collect();
+    let headers = crate::target::multiplexed_headers(&target.headers);
     hpack::encode_request(
         &target.method,
         if target.tls { "https" } else { "http" },
