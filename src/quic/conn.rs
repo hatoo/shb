@@ -172,13 +172,6 @@ pub struct Connection {
     /// Frame lists from packets that are no longer in flight, kept for the
     /// next packets to fill. One a packet is what a client sends most of.
     spare_frames: Vec<Vec<SentFrame>>,
-    /// Somewhere to put a packet's plaintext while its frames are read
-    ///
-    /// The frames borrow the bytes and handling them touches `self`, so the
-    /// payload cannot stay in the datagram buffer. Kept here rather than made
-    /// fresh each time: a copy is one memcpy, an allocation is a trip through
-    /// the allocator for every packet that arrives.
-    payload: Vec<u8>,
     /// The Destination Connection ID of our first Initial, which is what a
     /// Retry's integrity tag is computed over
     original_dcid: ConnectionId,
@@ -372,7 +365,6 @@ impl Connection {
             ack_ranges: Vec::new(),
             acked: Vec::new(),
             spare_frames: Vec::new(),
-            payload: Vec::with_capacity(MAX_DATAGRAM),
             rotate_at: 0,
             local_cid,
             peer_cid: initial_dcid,
@@ -1257,27 +1249,13 @@ impl Connection {
 
         let mut ack_eliciting = false;
         let payload_range = payload_start..payload_start + plain;
-        // The borrow of `buf` has to end before the frames touch `self`, so
-        // the plaintext moves into a buffer of our own - taken out and put
-        // back so that handling a frame can still reach the rest of `self`
-        let mut payload = std::mem::take(&mut self.payload);
-        payload.clear();
-        payload.extend_from_slice(&buf[payload_range]);
-        let mut outcome = Ok(());
-        for f in frame::Iter::new(&payload) {
-            match f.and_then(|f| {
-                ack_eliciting |= f.ack_eliciting();
-                self.handle_frame(space, f, now)
-            }) {
-                Ok(()) => {}
-                Err(e) => {
-                    outcome = Err(e);
-                    break;
-                }
-            }
+        // The caller owns buf independently of self. Frame handlers consume
+        // borrowed data synchronously, so read the decrypted packet in place.
+        for f in frame::Iter::new(&buf[payload_range]) {
+            let f = f?;
+            ack_eliciting |= f.ack_eliciting();
+            self.handle_frame(space, f, now)?;
         }
-        self.payload = payload;
-        outcome?;
         self.spaces[space as usize]
             .ack
             .record(pn, ack_eliciting, now);
