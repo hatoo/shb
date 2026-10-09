@@ -997,14 +997,14 @@ impl Connection {
         // count against the connection's limit (RFC 9000 Section 4.1). Leaving
         // them out let the total drift below what the peer was counting.
         for i in 0..self.local_uni.len() {
-            let cap = self.max_data_peer.saturating_sub(self.data_sent) as usize;
-            let avail = room(out).min(cap + 16);
+            let credit = self.max_data_peer.saturating_sub(self.data_sent);
+            let avail = room(out);
             if avail < 16 {
                 break;
             }
             let (id, ref mut send) = self.local_uni[i];
             let mut sent_len = 0;
-            if let Some((offset, data, fin)) = send.next_send(avail - 16) {
+            if let Some((offset, data, fin)) = send.next_send(avail - 16, credit) {
                 let len = data.len();
                 frame::put_stream(out, id, offset, fin, data);
                 sent_len = send.on_sent(offset, len, fin);
@@ -1039,15 +1039,9 @@ impl Connection {
                 continue;
             };
             pair.queued = false;
-            let cap = self.max_data_peer.saturating_sub(self.data_sent) as usize;
-            let avail = avail.min(cap + 16);
-            if avail < 16 {
-                // Out of connection-level credit, so no stream can move
-                self.queue_send(id);
-                break;
-            }
+            let credit = self.max_data_peer.saturating_sub(self.data_sent);
             let mut sent_len = 0;
-            if let Some((offset, data, fin)) = pair.send.next_send(avail - 16) {
+            if let Some((offset, data, fin)) = pair.send.next_send(avail - 16, credit) {
                 let len = data.len();
                 frame::put_stream(out, id, offset, fin, data);
                 // What counts against the window is what is new
@@ -2396,6 +2390,205 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Retransmitted offsets already consumed MAX_DATA. A lost request or
+    /// control stream must still progress when the connection window is full.
+    fn credit_limited_stream(uni: bool) -> (Connection, u64) {
+        let mut conn = client();
+        conn.max_data_peer = 6;
+        let id = if uni {
+            let mut send = SendStream::new(100);
+            assert_eq!(send.write(b"abcdefNEW"), 9);
+            send.finish();
+            conn.local_uni.push((2, send));
+            2
+        } else {
+            conn.max_streams_bidi = 1;
+            conn.params.initial_max_stream_data_bidi_remote = 100;
+            let (id, n) = conn.send_oneshot(b"abcdefNEW").unwrap();
+            assert_eq!(n, 9);
+            id
+        };
+        (conn, id)
+    }
+
+    fn retransmission_at_connection_limit(uni: bool) {
+        let (mut conn, id) = credit_limited_stream(uni);
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert_eq!(conn.data_sent, 6);
+        assert_eq!(
+            frames,
+            vec![SentFrame::Stream {
+                id,
+                offset: 0,
+                len: 6,
+                fin: false
+            }]
+        );
+        conn.on_frame_lost(Space::Data, frames[0]);
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![SentFrame::Stream {
+                id,
+                offset: 0,
+                len: 6,
+                fin: false
+            }]
+        );
+        assert_eq!(conn.data_sent, 6, "retransmission spends no new credit");
+        assert_eq!(
+            frame::Iter::new(&out).next().unwrap().unwrap(),
+            Frame::Stream {
+                id,
+                offset: 0,
+                data: b"abcdef",
+                fin: false
+            }
+        );
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert!(frames.is_empty(), "fresh bytes still require credit");
+        assert!(out.is_empty());
+        assert_eq!(conn.data_sent, 6);
+    }
+
+    #[test]
+    fn bidi_retransmission_works_at_connection_limit() {
+        retransmission_at_connection_limit(false);
+    }
+
+    #[test]
+    fn uni_retransmission_works_at_connection_limit() {
+        retransmission_at_connection_limit(true);
+    }
+
+    #[test]
+    fn lost_stream_ranges_obey_packet_room_and_preserve_small_credit() {
+        for uni in [false, true] {
+            let (mut conn, id) = credit_limited_stream(uni);
+            let mut out = Vec::new();
+            let mut frames = Vec::new();
+            conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+                .unwrap();
+            conn.on_frame_lost(Space::Data, frames[0]);
+            conn.handle_frame(Space::Data, Frame::MaxData(7), Instant::now())
+                .unwrap();
+            // The prefix stands for bytes already in the packet. Budget is
+            // relative to start, not to the beginning of the output buffer.
+            for (budget, offset, len, total, fin) in [
+                (16, 0, 0, 6, false),
+                (19, 0, 3, 6, false),
+                (1200, 3, 3, 6, false),
+                (1200, 6, 1, 7, false),
+                (1200, 0, 0, 7, false),
+            ] {
+                out.clear();
+                out.extend_from_slice(&[0xaa; 10]);
+                frames.clear();
+                conn.fill_data_payload(&mut out, budget, 10, &mut frames, false)
+                    .unwrap();
+                assert!(out.len() - 10 <= budget);
+                assert_eq!(conn.data_sent, total);
+                if len == 0 {
+                    assert!(frames.is_empty());
+                    assert_eq!(out.len(), 10);
+                } else {
+                    assert_eq!(
+                        frames,
+                        vec![SentFrame::Stream {
+                            id,
+                            offset,
+                            len,
+                            fin
+                        }]
+                    );
+                }
+            }
+            conn.handle_frame(Space::Data, Frame::MaxData(9), Instant::now())
+                .unwrap();
+            out.clear();
+            frames.clear();
+            conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+                .unwrap();
+            assert_eq!(
+                frames,
+                vec![SentFrame::Stream {
+                    id,
+                    offset: 7,
+                    len: 2,
+                    fin: true
+                }]
+            );
+            assert_eq!(conn.data_sent, 9);
+            conn.on_frame_lost(Space::Data, frames[0]);
+            out.clear();
+            frames.clear();
+            conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+                .unwrap();
+            assert_eq!(
+                frames,
+                vec![SentFrame::Stream {
+                    id,
+                    offset: 7,
+                    len: 2,
+                    fin: false
+                }]
+            );
+            out.clear();
+            frames.clear();
+            conn.fill_data_payload(&mut out, 16, 0, &mut frames, false)
+                .unwrap();
+            assert_eq!(
+                frames,
+                vec![SentFrame::Stream {
+                    id,
+                    offset: 9,
+                    len: 0,
+                    fin: true
+                }]
+            );
+            assert_eq!(conn.data_sent, 9);
+        }
+    }
+
+    #[test]
+    fn a_credit_blocked_stream_does_not_hide_a_later_retransmission() {
+        let mut conn = client();
+        conn.max_streams_bidi = 2;
+        conn.params.initial_max_stream_data_bidi_remote = 100;
+        conn.max_data_peer = 6;
+        let (lost, _) = conn.send_oneshot(b"abcdef").unwrap();
+        let mut out = Vec::new();
+        let mut frames = Vec::new();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        let (blocked, _) = conn.send_oneshot(b"NEW").unwrap();
+        conn.on_frame_lost(Space::Data, frames[0]);
+        out.clear();
+        frames.clear();
+        conn.fill_data_payload(&mut out, 1200, 0, &mut frames, false)
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![SentFrame::Stream {
+                id: lost,
+                offset: 0,
+                len: 6,
+                fin: false
+            }]
+        );
+        assert!(conn.send_queue.contains(&blocked));
+        assert_eq!(conn.data_sent, 6);
     }
 
     /// An ACK frame has to be remembered by what it acknowledged, or nothing
