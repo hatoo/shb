@@ -164,15 +164,13 @@ impl SentPackets {
     /// Move the packets the peer has acknowledged out of flight and into
     /// `acked`, which the caller reuses rather than allocating one a time
     pub fn drain_acked(&mut self, ranges: &[(u64, u64)], acked: &mut Vec<SentPacket>) {
-        let mut i = 0;
-        while i < self.packets.len() {
-            let n = self.packets[i].number;
-            if ranges.iter().any(|&(lo, hi)| n >= lo && n <= hi) {
-                acked.push(self.packets.remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        // Compact retained packets once. Removing each acknowledged packet
+        // separately shifts the rest of a large flight over and over.
+        acked.extend(self.packets.extract_if(.., |p| {
+            ranges
+                .iter()
+                .any(|&(lo, hi)| p.number >= lo && p.number <= hi)
+        }));
         if let Some(max) = acked.iter().map(|p| p.number).max() {
             self.largest_acked = Some(match self.largest_acked {
                 Some(prev) => prev.max(max),
@@ -193,25 +191,24 @@ impl SentPackets {
         };
         let mut lost = Vec::new();
         let mut next_deadline: Option<Instant> = None;
-        let mut i = 0;
-        while i < self.packets.len() {
-            let p = &self.packets[i];
+        // Extraction preserves both flight and loss order, including the
+        // consecutive packet runs used to detect persistent congestion.
+        lost.extend(self.packets.extract_if(.., |p| {
             if p.number > largest_acked {
-                i += 1;
-                continue;
+                return false;
             }
             let by_reorder = largest_acked >= p.number + REORDER_THRESHOLD;
             let deadline = p.time_sent + loss_delay;
             if by_reorder || deadline <= now {
-                lost.push(self.packets.remove(i));
+                true
             } else {
                 next_deadline = Some(match next_deadline {
                     Some(d) => d.min(deadline),
                     None => deadline,
                 });
-                i += 1;
+                false
             }
-        }
+        }));
         (lost, next_deadline)
     }
 
@@ -377,6 +374,9 @@ pub fn pto_deadline(
     }
     best
 }
+
+#[cfg(test)]
+mod compaction_tests;
 
 #[cfg(test)]
 mod tests {
