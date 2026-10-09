@@ -379,15 +379,24 @@ impl RecvStream {
 
     /// Move anything that has become contiguous out of `pending`
     fn drain_pending(&mut self) {
-        while let Some((offset, _)) = self.pending.first() {
-            let head = self.read_offset + self.ready.len() as u64;
+        let mut head = self.read_offset + self.ready.len() as u64;
+        let mut consumed = 0;
+        for (offset, data) in &self.pending {
             if *offset > head {
                 break;
             }
-            let (offset, data) = self.pending.remove(0);
-            let skip = (head - offset) as usize;
-            if skip < data.len() {
-                self.ready.extend_from_slice(&data[skip..]);
+            head = head.max(*offset + data.len() as u64);
+            consumed += 1;
+        }
+        if consumed > 0 {
+            // Find the prefix first so each payload is freed just after it
+            // is copied. Drain shifts the retained suffix once; removing
+            // index zero for every fragment would copy it quadratically.
+            for (offset, data) in self.pending.drain(..consumed) {
+                let skip = (self.read_offset + self.ready.len() as u64 - offset) as usize;
+                if skip < data.len() {
+                    self.ready.extend_from_slice(&data[skip..]);
+                }
             }
         }
     }
@@ -434,6 +443,9 @@ impl RecvStream {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod reassembly_tests;
 
 #[cfg(test)]
 mod tests {

@@ -29,6 +29,9 @@ mod tls;
 #[cfg(test)]
 #[path = "../tests/support/credit_recovery.rs"]
 mod credit_recovery;
+#[cfg(test)]
+#[path = "../tests/support/response_reassembly.rs"]
+mod response_reassembly;
 mod uring;
 
 use std::time::Duration;
