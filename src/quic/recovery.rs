@@ -144,6 +144,10 @@ impl Rtt {
 pub struct SentPackets {
     /// Ascending by packet number, which is the order they were sent in
     packets: Vec<SentPacket>,
+    /// Sum of the sizes of ack-eliciting packets still in `packets`. Keep it
+    /// here so checking the congestion window does not scan the whole flight
+    /// for every outgoing datagram. Only `push` and `remove` change the set.
+    bytes_in_flight: usize,
     pub largest_acked: Option<u64>,
     /// When the most recent ack-eliciting packet went out, for the PTO timer
     pub last_ack_eliciting: Option<Instant>,
@@ -152,9 +156,18 @@ pub struct SentPackets {
 impl SentPackets {
     pub fn push(&mut self, packet: SentPacket) {
         if packet.ack_eliciting {
+            self.bytes_in_flight += packet.size;
             self.last_ack_eliciting = Some(packet.time_sent);
         }
         self.packets.push(packet);
+    }
+
+    fn remove(&mut self, index: usize) -> SentPacket {
+        let packet = self.packets.remove(index);
+        if packet.ack_eliciting {
+            self.bytes_in_flight -= packet.size;
+        }
+        packet
     }
 
     pub fn any_ack_eliciting(&self) -> bool {
@@ -168,7 +181,7 @@ impl SentPackets {
         while i < self.packets.len() {
             let n = self.packets[i].number;
             if ranges.iter().any(|&(lo, hi)| n >= lo && n <= hi) {
-                acked.push(self.packets.remove(i));
+                acked.push(self.remove(i));
             } else {
                 i += 1;
             }
@@ -203,7 +216,7 @@ impl SentPackets {
             let by_reorder = largest_acked >= p.number + REORDER_THRESHOLD;
             let deadline = p.time_sent + loss_delay;
             if by_reorder || deadline <= now {
-                lost.push(self.packets.remove(i));
+                lost.push(self.remove(i));
             } else {
                 next_deadline = Some(match next_deadline {
                     Some(d) => d.min(deadline),
@@ -226,11 +239,7 @@ impl SentPackets {
     /// the count. The request in flight at that moment was never sent, and the
     /// run waited on it for ever.
     pub fn bytes_in_flight(&self) -> usize {
-        self.packets
-            .iter()
-            .filter(|p| p.ack_eliciting)
-            .map(|p| p.size)
-            .sum()
+        self.bytes_in_flight
     }
 }
 
@@ -377,6 +386,9 @@ pub fn pto_deadline(
     }
     best
 }
+
+#[cfg(test)]
+mod accounting_tests;
 
 #[cfg(test)]
 mod tests {

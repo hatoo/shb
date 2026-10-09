@@ -3112,6 +3112,49 @@ mod tests {
             Some(initial_keys(&[9; 8], rustls::Side::Client).unwrap());
     }
 
+    #[test]
+    fn discarding_a_space_releases_only_its_congestion_bytes() {
+        let mut conn = client();
+        let now = Instant::now();
+        for (index, space) in conn.spaces.iter_mut().enumerate() {
+            for (number, ack_eliciting) in [(0, true), (1, false)] {
+                space.sent.push(SentPacket {
+                    ack_largest: None,
+                    number,
+                    time_sent: now,
+                    size: (index + 1) * 1200,
+                    ack_eliciting,
+                    frames: Vec::new(),
+                });
+            }
+        }
+        conn.congestion.window = 6000;
+        let total = |conn: &Connection| {
+            conn.spaces
+                .iter()
+                .map(|space| space.sent.bytes_in_flight())
+                .sum()
+        };
+        assert_eq!(total(&conn), 7200);
+        assert!(!conn.congestion.can_send(total(&conn)));
+        conn.discard_space(Space::Initial);
+        assert_eq!(total(&conn), 6000);
+        assert!(!conn.congestion.can_send(total(&conn)));
+        assert_eq!(conn.spaces[0].sent.last_ack_eliciting, None);
+        conn.discard_space(Space::Handshake);
+        assert_eq!(total(&conn), 3600);
+        assert!(conn.congestion.can_send(total(&conn)));
+        assert!(conn.spaces[2].sent.any_ack_eliciting());
+        conn.discard_space(Space::Initial);
+        assert_eq!(
+            total(&conn),
+            3600,
+            "repeated discard cannot debit data space"
+        );
+        conn.discard_space(Space::Data);
+        assert_eq!(total(&conn), 0);
+    }
+
     /// RFC 9001 Section 4.9.1: the Initial keys go with the first Handshake
     /// packet sent, not before. Until then the server's Initial still gets
     /// acknowledged, and a second one can still be read.
