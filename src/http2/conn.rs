@@ -96,6 +96,9 @@ struct OpenStream {
     sent: usize,
     /// What this stream's flow-control window still allows
     window: i64,
+    /// The request has not yet sent END_STREAM. Kept explicitly so an early
+    /// response or reset can retire it without needing the request body.
+    body_pending: bool,
 }
 
 pub struct Connection {
@@ -118,6 +121,9 @@ pub struct Connection {
     /// Retiring by count would take the slot of whichever stream happens to be
     /// open instead, and that stream's own end would then be dropped.
     open: H2Ring<OpenStream>,
+    /// Open streams that still need to send request DATA. Responses can keep
+    /// streams open long after every body has left.
+    pending_bodies: usize,
     /// The peer's SETTINGS_MAX_CONCURRENT_STREAMS
     max_concurrent: u32,
     /// Whether `max_concurrent` is still the assumption rather than the
@@ -159,6 +165,7 @@ impl Connection {
             header_end_stream: false,
             next_id: 1,
             open: H2Ring::new(),
+            pending_bodies: 0,
             max_concurrent: ASSUMED_MAX_CONCURRENT,
             max_concurrent_assumed: true,
             send_window: 65535,
@@ -272,10 +279,11 @@ impl Connection {
                 id,
                 sent: 0,
                 window: self.peer_initial_window as i64,
+                body_pending: !body.is_empty(),
             },
         );
-        if !body.is_empty() {
-            self.write_body(self.open.slot_count() - 1, body);
+        if !body.is_empty() && !self.write_body(self.open.slot_count() - 1, body) {
+            self.pending_bodies += 1;
         }
         Some(id)
     }
@@ -287,32 +295,43 @@ impl Connection {
     /// started at all, and nothing ever started it later: the run stopped with
     /// no error and no end.
     pub fn pump_bodies(&mut self, body: &[u8]) {
-        if body.is_empty() {
+        if body.is_empty() || self.pending_bodies == 0 || self.send_window <= 0 {
             return;
         }
         for pos in 0..self.open.slot_count() {
-            self.write_body(pos, body);
+            if self
+                .open
+                .slot(pos)
+                .is_some_and(|s| s.body_pending && s.window > 0)
+                && self.write_body(pos, body)
+            {
+                self.pending_bodies -= 1;
+            }
+            if self.send_window <= 0 {
+                break;
+            }
         }
     }
 
     /// Write what the connection window, the stream's window and the frame
     /// size between them allow. END_STREAM rides on the frame that finishes
     /// the body, so a body that leaves in pieces still ends exactly once.
-    fn write_body(&mut self, pos: usize, body: &[u8]) {
+    /// Returns true when this call sends END_STREAM.
+    fn write_body(&mut self, pos: usize, body: &[u8]) -> bool {
         let max = self.peer_max_frame as usize;
         loop {
             // A hole: the stream in this slot has already finished
             let Some(s) = self.open.slot(pos) else {
-                return;
+                return false;
             };
             let (id, sent, stream_window) = (s.id, s.sent, s.window);
             if sent >= body.len() {
-                return;
+                return false;
             }
             let allowed = self.send_window.min(stream_window).max(0) as usize;
             let n = (body.len() - sent).min(max).min(allowed);
             if n == 0 {
-                return;
+                return false;
             }
             let flags = if sent + n == body.len() {
                 FLAG_END_STREAM
@@ -322,11 +341,15 @@ impl Connection {
             self.frame_header(n, DATA, flags, id);
             self.out.extend_from_slice(&body[sent..sent + n]);
             let Some(s) = self.open.slot_mut(pos) else {
-                return;
+                return false;
             };
             s.sent += n;
             s.window -= n as i64;
             self.send_window -= n as i64;
+            if flags & FLAG_END_STREAM != 0 {
+                s.body_pending = false;
+                return true;
+            }
         }
     }
 
@@ -672,7 +695,7 @@ impl Connection {
             .map(|s| s.id)
             .collect();
         for id in unprocessed {
-            self.open.take(id as u64);
+            self.finish_stream(id);
             events.push(Event::Unprocessed { stream_id: id });
         }
         events.push(Event::Goaway);
@@ -717,7 +740,13 @@ impl Connection {
     /// finished, which is ordinary: RST_STREAM routinely follows a response
     /// the peer has already ended.
     fn finish_stream(&mut self, stream: u32) -> bool {
-        self.open.take(stream as u64).is_some()
+        let Some(s) = self.open.take(stream as u64) else {
+            return false;
+        };
+        if s.body_pending {
+            self.pending_bodies -= 1;
+        }
+        true
     }
 }
 
@@ -726,10 +755,13 @@ fn bad(what: &str) -> anyhow::Error {
 }
 
 #[cfg(test)]
+mod body_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    pub(super) fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u32;
         let mut v = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
         v.extend_from_slice(&stream.to_be_bytes());
@@ -746,7 +778,7 @@ mod tests {
     }
 
     /// Both prefaces exchanged: ours out, the peer's empty SETTINGS in
-    fn connected() -> Connection {
+    pub(super) fn connected() -> Connection {
         let mut c = preface_sent();
         c.feed(&frame(SETTINGS, 0, 0, &[]), &mut Vec::new())
             .unwrap();
