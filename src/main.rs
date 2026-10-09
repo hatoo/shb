@@ -21,6 +21,9 @@ mod inflight;
 mod quic;
 mod report;
 mod shutdown;
+#[cfg(test)]
+#[path = "../tests/support/stalled_server.rs"]
+mod stalled_server;
 mod stats;
 mod status;
 mod target;

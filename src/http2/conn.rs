@@ -1407,6 +1407,100 @@ mod tests {
             "the connection window is still empty"
         );
     }
+
+    #[test]
+    fn sparse_streams_keep_body_order_and_flow_control() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        let first = c.start_stream(&[0x82], b"").unwrap();
+        for _ in 0..512 {
+            let id = c.start_stream(&[0x82], b"").unwrap();
+            assert!(c.finish_stream(id));
+            c.take_output();
+        }
+        assert!(c.open.slot_count() <= 128);
+        // Keep two bodies blocked, then grant one body's worth of connection
+        // credit. Packing must preserve the older stream's scheduling priority.
+        c.send_window = 0;
+        let body = b"body";
+        let second = c.start_stream(&[0x82], body).unwrap();
+        let third = c.start_stream(&[0x82], body).unwrap();
+        c.open.get_mut(first as u64).unwrap().sent = body.len();
+        c.take_output();
+        c.feed(
+            &frame(WINDOW_UPDATE, 0, 0, &4_u32.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        c.pump_bodies(body);
+        let out = c.take_output().unwrap();
+        assert_eq!(data_sent(&out, second), (4, true));
+        assert_eq!(data_sent(&out, third), (0, false));
+        assert!(c.finish_stream(second));
+        // SETTINGS changes every surviving stream's window through iter_mut.
+        let mut settings = SETTINGS_INITIAL_WINDOW_SIZE.to_be_bytes().to_vec();
+        settings.extend_from_slice(&0_u32.to_be_bytes());
+        c.feed(&frame(SETTINGS, 0, 0, &settings), &mut events)
+            .unwrap();
+        c.take_output();
+        c.feed(
+            &frame(WINDOW_UPDATE, 0, 0, &4_u32.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        c.pump_bodies(body);
+        assert!(c.take_output().is_none());
+        c.feed(
+            &frame(WINDOW_UPDATE, 0, third, &4_u32.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        c.pump_bodies(body);
+        assert_eq!(data_sent(&c.take_output().unwrap(), third), (4, true));
+        c.pump_bodies(body);
+        assert!(c.take_output().is_none(), "END_STREAM sent only once");
+    }
+
+    #[test]
+    fn sparse_streams_retire_once_on_reset_and_goaway() {
+        let mut c = connected();
+        let mut events = Vec::new();
+        let first = c.start_stream(&[0x82], b"").unwrap();
+        let mut last = 0;
+        for _ in 0..512 {
+            last = c.start_stream(&[0x82], b"").unwrap();
+            assert!(c.finish_stream(last));
+            c.take_output();
+        }
+        let second = c.start_stream(&[0x82], b"").unwrap();
+        let third = c.start_stream(&[0x82], b"").unwrap();
+        c.feed(&frame(RST_STREAM, 0, last, &[0; 4]), &mut events)
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "a late reset cannot retire another request"
+        );
+        let mut payload = second.to_be_bytes().to_vec();
+        payload.extend_from_slice(&[0; 4]);
+        c.feed(&frame(GOAWAY, 0, 0, &payload), &mut events).unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Unprocessed { stream_id }, Event::Goaway] if *stream_id == third)
+        );
+        events.clear();
+        c.feed(&frame(RST_STREAM, 0, second, &[0; 4]), &mut events)
+            .unwrap();
+        c.feed(&frame(RST_STREAM, 0, second, &[0; 4]), &mut events)
+            .unwrap();
+        c.feed(
+            &frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, first, &[0x88]),
+            &mut events,
+        )
+        .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Reset { stream_id }, Event::Status { .. }, Event::End { .. }] if *stream_id == second)
+        );
+        assert!(c.open.is_empty());
+    }
     #[test]
     fn no_more_streams_are_opened_than_a_silent_peer_is_likely_to_take() {
         // The first flight goes out with the client preface, a round trip

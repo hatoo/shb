@@ -798,6 +798,54 @@ pub fn run_worker(
 mod tests {
     use super::*;
 
+    #[test]
+    fn sparse_requests_preserve_timestamps_samples_and_failure_counts() {
+        let mut conn = Conn::new();
+        let mut stats = Stats::default();
+        let mut started = open(&mut conn, [1]);
+        let first_start = conn.streams.get_mut(1).unwrap().start;
+        for n in 1..=1_024 {
+            let id = 2 * n + 1;
+            started += open(&mut conn, [id]);
+            process_events(&mut conn, &answered(id), &mut stats, &mut started);
+            process_events(&mut conn, &answered(id), &mut stats, &mut started);
+        }
+        assert!(conn.streams.slot_count() <= 128);
+        assert_eq!(conn.streams.get_mut(1).unwrap().start, first_start);
+        assert_eq!(stats.latencies_ns.len(), 1_024);
+        assert_eq!(
+            (stats.completed, stats.errors, stats.status_counts[200]),
+            (1_024, 0, 1_024)
+        );
+        started += open(&mut conn, [2_051, 2_053, 2_055]);
+        process_events(
+            &mut conn,
+            &[
+                Event::Reset { stream_id: 2_051 },
+                Event::Unprocessed { stream_id: 2_053 },
+                Event::Goaway,
+            ],
+            &mut stats,
+            &mut started,
+        );
+        assert_eq!(
+            started, 1_027,
+            "one unprocessed request returns to the budget"
+        );
+        conn.fail_inflight(&mut stats);
+        assert_eq!(stats.errors, 3, "one reset and two pending requests fail");
+        assert_eq!(
+            stats.latencies_ns.len(),
+            1_024,
+            "errors add no success samples"
+        );
+        conn.close();
+        started += open(&mut conn, [1]);
+        process_events(&mut conn, &answered(1), &mut stats, &mut started);
+        assert_eq!(stats.completed, 1_025);
+        assert_eq!(stats.latencies_ns.len(), 1_025);
+    }
+
     fn open(conn: &mut Conn, ids: impl IntoIterator<Item = u32>) -> u64 {
         let mut started = 0;
         for id in ids {
