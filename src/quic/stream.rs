@@ -123,27 +123,31 @@ impl SendStream {
         self.limit = self.limit.max(limit);
     }
 
-    /// The next run of data to put in a packet: retransmissions first, since
-    /// the peer is already waiting on them
     /// Whether `next_send` would produce anything, without borrowing the data
     pub fn has_pending(&self) -> bool {
         !self.reset
             && (!self.lost.is_empty() || self.buf.len() > self.sent || (self.fin && !self.fin_sent))
     }
 
-    pub fn next_send(&self, max: usize) -> Option<(u64, &[u8], bool)> {
+    /// Retransmissions use packet room but no new connection credit. Only
+    /// previously unsent bytes are limited by `credit` (RFC 9000 Section 4.1).
+    pub fn next_send(&self, max: usize, credit: u64) -> Option<(u64, &[u8], bool)> {
         if self.reset {
             return None;
         }
         if let Some(&(start, end)) = self.lost.first() {
-            let end = end.min(start + max);
+            if max == 0 {
+                return None;
+            }
+            let end = start + (end - start).min(max);
             return Some((
                 self.base_offset + start as u64,
                 &self.buf[start..end],
                 false,
             ));
         }
-        let end = self.buf.len().min(self.sent + max);
+        let max = (max as u64).min(credit) as usize;
+        let end = self.sent + (self.buf.len() - self.sent).min(max);
         if end > self.sent {
             let fin = self.fin && end == self.buf.len();
             return Some((
@@ -254,7 +258,11 @@ impl SendStream {
             return;
         }
         let start = offset.saturating_sub(self.base_offset) as usize;
-        let end = (start + len).min(self.buf.len());
+        // The prefix might have been acknowledged since this packet was
+        // sent. Clip the original absolute end as well as the start, or a
+        // late loss can incorrectly classify fresh bytes as retransmissions.
+        let end = (offset + len as u64 - self.base_offset).min(self.sent.min(self.buf.len()) as u64)
+            as usize;
         if end > start {
             self.lost.push((start, end));
             self.lost.sort_unstable();
@@ -441,10 +449,10 @@ mod tests {
         assert_eq!(s.write(b"GET / HTTP/3 request.."), 22);
         s.finish();
 
-        assert_eq!(s.next_send(0), None);
+        assert_eq!(s.next_send(0, u64::MAX), None);
         assert!(s.has_pending());
 
-        let (offset, data, fin) = s.next_send(1200).expect("the data is still owed");
+        let (offset, data, fin) = s.next_send(1200, u64::MAX).expect("the data is still owed");
         assert_eq!((offset, data.len(), fin), (0, 22, true));
     }
 
@@ -455,7 +463,7 @@ mod tests {
         s.finish();
         // As if a zero-length frame had gone out at the end of the buffer
         s.on_sent(22, 0, true);
-        let (offset, data, _) = s.next_send(1200).expect("the body is still owed");
+        let (offset, data, _) = s.next_send(1200, u64::MAX).expect("the body is still owed");
         assert_eq!((offset, data.len()), (0, 22));
     }
     use super::*;
@@ -580,16 +588,16 @@ mod tests {
         let mut s = SendStream::new(100);
         s.write(b"abcdef");
         s.finish();
-        let (off, data, fin) = s.next_send(4).unwrap();
+        let (off, data, fin) = s.next_send(4, u64::MAX).unwrap();
         assert_eq!((off, data, fin), (0, &b"abcd"[..], false));
         s.on_sent(off, data.len(), fin);
-        let (off, data, fin) = s.next_send(4).unwrap();
+        let (off, data, fin) = s.next_send(4, u64::MAX).unwrap();
         assert_eq!((off, data, fin), (4, &b"ef"[..], true));
         s.on_sent(off, data.len(), fin);
-        assert!(s.next_send(4).is_none(), "nothing left to send");
+        assert!(s.next_send(4, u64::MAX).is_none(), "nothing left to send");
         s.on_acked(0, 6, true);
         assert!(
-            s.next_send(4).is_none(),
+            s.next_send(4, u64::MAX).is_none(),
             "and nothing comes back after the ack"
         );
     }
@@ -599,10 +607,10 @@ mod tests {
     fn an_empty_stream_sends_its_fin() {
         let mut s = SendStream::new(100);
         s.finish();
-        let (off, data, fin) = s.next_send(1200).unwrap();
+        let (off, data, fin) = s.next_send(1200, u64::MAX).unwrap();
         assert_eq!((off, data.len(), fin), (0, 0, true));
         s.on_sent(off, 0, true);
-        assert!(s.next_send(1200).is_none());
+        assert!(s.next_send(1200, u64::MAX).is_none());
     }
 
     /// Lost data goes out again before anything new, because the peer is
@@ -611,20 +619,90 @@ mod tests {
     fn retransmissions_come_first() {
         let mut s = SendStream::new(100);
         s.write(b"aaaabbbb");
-        let (off, data, fin) = s.next_send(4).unwrap();
+        let (off, data, fin) = s.next_send(4, u64::MAX).unwrap();
         s.on_sent(off, data.len(), fin);
-        let (off2, data2, fin2) = s.next_send(4).unwrap();
+        let (off2, data2, fin2) = s.next_send(4, u64::MAX).unwrap();
         s.on_sent(off2, data2.len(), fin2);
-        assert!(s.next_send(4).is_none());
+        assert!(s.next_send(4, u64::MAX).is_none());
 
         s.on_lost(0, 4, false);
-        let (off, data, _) = s.next_send(4).unwrap();
+        let (off, data, _) = s.next_send(4, u64::MAX).unwrap();
         assert_eq!((off, data), (0, &b"aaaa"[..]), "the lost run, not new data");
         assert_eq!(
             s.on_sent(off, data.len(), false),
             0,
             "offsets the peer has accounted for already"
         );
+    }
+
+    #[test]
+    fn late_loss_clips_both_ends_to_previously_sent_bytes() {
+        let mut s = SendStream::new(100);
+        s.write(b"abcdefNEW");
+        assert_eq!(s.on_sent(0, 6, false), 6);
+        s.on_acked(0, 3, false);
+        // A copy of the original packet is declared lost after a shorter
+        // retransmission has already acknowledged its prefix.
+        s.on_lost(0, 6, false);
+        let (off, data, fin) = s.next_send(100, u64::MAX).unwrap();
+        assert_eq!((off, data, fin), (3, &b"def"[..], false));
+        assert_eq!(s.on_sent(off, data.len(), fin), 0);
+        assert_eq!(s.next_send(100, 0), None, "NEW needs fresh credit");
+        assert_eq!(s.next_send(100, 1), Some((6, &b"N"[..], false)));
+    }
+
+    #[test]
+    fn retransmission_room_and_fresh_credit_are_independent() {
+        for credit in [0, 1, 3, 100, u64::MAX] {
+            let mut s = SendStream::new(100);
+            s.write(b"abcdefNEW");
+            s.finish();
+            assert_eq!(s.on_sent(0, 6, false), 6);
+            s.on_lost(0, 6, false);
+            assert!(s.next_send(0, credit).is_none(), "no empty retries");
+            for (off, want) in [(0, &b"abc"[..]), (3, &b"def"[..])] {
+                let (offset, data, fin) = s.next_send(3, credit).unwrap();
+                assert_eq!((offset, data, fin), (off, want, false));
+                assert_eq!(s.on_sent(offset, data.len(), fin), 0);
+            }
+            let fresh = s.next_send(usize::MAX, credit);
+            let len = credit.min(3) as usize;
+            assert_eq!(fresh, (len > 0).then_some((6, &b"NEW"[..len], len == 3)));
+        }
+    }
+
+    #[test]
+    fn duplicate_loss_and_late_acks_never_spend_new_credit() {
+        let mut s = SendStream::new(100);
+        s.write(b"abcdefNEW");
+        s.on_sent(0, 6, false);
+        s.on_lost(0, 6, false);
+        s.on_lost(0, 6, false);
+        let (offset, data, fin) = s.next_send(3, 0).unwrap();
+        assert_eq!(s.on_sent(offset, data.len(), fin), 0);
+        s.on_acked(0, 3, false);
+        s.on_acked(0, 3, false);
+        s.on_acked(3, 3, false);
+        // Loss of either old copy after both ACKs cannot resurrect the data.
+        s.on_lost(0, 6, false);
+        assert_eq!(s.next_send(1200, 0), None);
+        assert_eq!(s.next_send(1200, 1), Some((6, &b"N"[..], false)));
+    }
+
+    #[test]
+    fn fin_only_needs_no_connection_credit() {
+        let mut s = SendStream::new(100);
+        s.write(b"abc");
+        s.finish();
+        s.on_sent(0, 3, true);
+        s.on_lost(0, 3, true);
+        let (off, data, fin) = s.next_send(3, 0).unwrap();
+        assert_eq!((off, data, fin), (0, &b"abc"[..], false));
+        assert_eq!(s.on_sent(off, data.len(), fin), 0);
+        assert_eq!(s.next_send(0, 0), Some((3, &b""[..], true)));
+        assert_eq!(s.on_sent(3, 0, true), 0);
+        s.on_acked(0, 3, true);
+        assert!(s.is_settled());
     }
 
     /// Only bytes at offsets never sent before count against the
@@ -634,9 +712,9 @@ mod tests {
         let mut s = SendStream::new(100);
         s.write(b"aaaabbbbcc");
         s.finish();
-        let (off, data, fin) = s.next_send(4).unwrap();
+        let (off, data, fin) = s.next_send(4, u64::MAX).unwrap();
         assert_eq!(s.on_sent(off, data.len(), fin), 4);
-        let (off, data, fin) = s.next_send(100).unwrap();
+        let (off, data, fin) = s.next_send(100, u64::MAX).unwrap();
         assert_eq!((off, data.len(), fin), (4, 6, true));
         assert_eq!(s.on_sent(off, data.len(), fin), 6);
         assert_eq!(s.on_sent(10, 0, true), 0, "a bare FIN carries nothing");
@@ -647,11 +725,11 @@ mod tests {
     fn a_lost_fin_is_sent_again() {
         let mut s = SendStream::new(100);
         s.finish();
-        let (off, _, _) = s.next_send(10).unwrap();
+        let (off, _, _) = s.next_send(10, u64::MAX).unwrap();
         s.on_sent(off, 0, true);
-        assert!(s.next_send(10).is_none());
+        assert!(s.next_send(10, u64::MAX).is_none());
         s.on_lost(0, 0, true);
-        let (_, _, fin) = s.next_send(10).unwrap();
+        let (_, _, fin) = s.next_send(10, u64::MAX).unwrap();
         assert!(fin);
     }
 
@@ -664,14 +742,17 @@ mod tests {
         let mut s = SendStream::new(1000);
         s.write(&[b'x'; 40]);
         s.finish();
-        let (off, data, fin) = s.next_send(10).unwrap();
+        let (off, data, fin) = s.next_send(10, u64::MAX).unwrap();
         s.on_sent(off, data.len(), fin);
         assert_eq!(s.reset(), 10, "the final size is what went out");
         assert!(!s.has_pending());
-        assert!(s.next_send(1000).is_none());
+        assert!(s.next_send(1000, u64::MAX).is_none());
         assert_eq!(s.write(b"more"), 0, "nothing more is taken");
         s.on_lost(0, 10, false);
-        assert!(s.next_send(1000).is_none(), "and nothing is sent again");
+        assert!(
+            s.next_send(1000, u64::MAX).is_none(),
+            "and nothing is sent again"
+        );
         assert!(s.is_reset());
     }
 
@@ -679,12 +760,12 @@ mod tests {
     fn acknowledged_data_is_released() {
         let mut s = SendStream::new(1000);
         s.write(&[b'x'; 500]);
-        let (off, data, fin) = s.next_send(500).unwrap();
+        let (off, data, fin) = s.next_send(500, u64::MAX).unwrap();
         s.on_sent(off, data.len(), fin);
         s.on_acked(0, 200, false);
         // The released prefix must not be resent, and the rest still can be
         s.on_lost(200, 300, false);
-        let (off, data, _) = s.next_send(1000).unwrap();
+        let (off, data, _) = s.next_send(1000, u64::MAX).unwrap();
         assert_eq!(off, 200);
         assert_eq!(data.len(), 300);
     }
@@ -696,7 +777,7 @@ mod tests {
         s.write(b"abcdef");
         s.on_acked(0, 3, false);
         s.on_acked(0, 3, false);
-        let (off, data, _) = s.next_send(100).unwrap();
+        let (off, data, _) = s.next_send(100, u64::MAX).unwrap();
         assert_eq!((off, data), (3, &b"def"[..]));
     }
 }

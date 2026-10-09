@@ -25,6 +25,10 @@ mod stats;
 mod status;
 mod target;
 mod tls;
+
+#[cfg(test)]
+#[path = "../tests/support/credit_recovery.rs"]
+mod credit_recovery;
 mod uring;
 
 use std::time::Duration;
