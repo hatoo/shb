@@ -68,26 +68,67 @@ pub struct LatencySummary {
     pub percentiles: [f64; 9],
 }
 
-/// Sorts in place rather than on a copy: every latency of the run is held, so
-/// at the point this is called a copy is the largest allocation the process
-/// would ever make, and it is only wanted to be sorted.
+/// Selects exact percentile ranks in place; large unordered samples do not need
+/// a full sort or copy. The sample multiset is preserved, but its order is
+/// unspecified.
 pub fn latency_summary(latencies_ns: &mut [u64]) -> Option<LatencySummary> {
     if latencies_ns.is_empty() {
         return None;
     }
     let lat = latencies_ns;
-    lat.sort_unstable();
-    // Same index formula as oha: floor(p/100 * len), clamped to the last element
-    let pct = |p: f64| -> f64 {
-        let idx = ((p / 100.0 * lat.len() as f64) as usize).min(lat.len() - 1);
-        lat[idx] as f64 / 1e9
+    let len = lat.len();
+    let mean = lat.iter().sum::<u64>() as f64 / len as f64 / 1e9;
+    // Same index formula as oha: floor(p/100 * len), clamped to the last element.
+    let ranks = PERCENTILES.map(|p| ((p / 100.0 * len as f64) as usize).min(len - 1));
+
+    // Sorting is cheaper for small inputs. Preserve the linear ordered-input
+    // path too: selection would repeatedly partition those same samples.
+    if len <= 1024 {
+        lat.sort_unstable();
+    }
+    let (min, max) = if len <= 1024 || lat.is_sorted() {
+        (lat[0], lat[len - 1])
+    } else if lat.is_sorted_by(|a, b| a >= b) {
+        return Some(LatencySummary {
+            min: lat[len - 1] as f64 / 1e9,
+            mean,
+            max: lat[0] as f64 / 1e9,
+            percentiles: ranks.map(|rank| lat[len - 1 - rank] as f64 / 1e9),
+        });
+    } else {
+        select_ranks(lat, &ranks, 0);
+        // Everything outside these boundary partitions lies between the
+        // lowest and highest selected percentiles.
+        (
+            *lat[..=ranks[0]].iter().min().unwrap(),
+            *lat[ranks[ranks.len() - 1]..].iter().max().unwrap(),
+        )
     };
     Some(LatencySummary {
-        min: lat[0] as f64 / 1e9,
-        mean: lat.iter().sum::<u64>() as f64 / lat.len() as f64 / 1e9,
-        max: lat[lat.len() - 1] as f64 / 1e9,
-        percentiles: PERCENTILES.map(pct),
+        min: min as f64 / 1e9,
+        mean,
+        max: max as f64 / 1e9,
+        percentiles: ranks.map(|rank| lat[rank] as f64 / 1e9),
     })
+}
+
+/// Place each requested order statistic at its original index. Ranks are
+/// nondecreasing; selecting near the partition midpoint limits repeated scans.
+fn select_ranks(samples: &mut [u64], ranks: &[usize], offset: usize) {
+    if ranks.is_empty() {
+        return;
+    }
+    let middle = offset + samples.len() / 2;
+    let split = ranks
+        .partition_point(|&rank| rank < middle)
+        .min(ranks.len() - 1);
+    let rank = ranks[split];
+    let (lower, _, upper) = samples.select_nth_unstable(rank - offset);
+    // Coincident ranks all refer to this pivot; neither child includes it.
+    let lower_end = ranks.partition_point(|&r| r < rank);
+    let upper_start = ranks.partition_point(|&r| r <= rank);
+    select_ranks(lower, &ranks[..lower_end], offset);
+    select_ranks(upper, &ranks[upper_start..], rank + 1);
 }
 
 #[cfg(test)]
@@ -98,6 +139,118 @@ mod tests {
 
     fn ms(values: &[u64]) -> Vec<u64> {
         values.iter().map(|v| v * 1_000_000).collect()
+    }
+
+    fn assert_matches_sort(mut samples: Vec<u64>) {
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let got = latency_summary(&mut samples);
+        if sorted.is_empty() {
+            assert!(got.is_none());
+            assert!(samples.is_empty());
+            return;
+        }
+        let got = got.unwrap();
+        let len = sorted.len();
+        assert_eq!(got.min.to_bits(), (sorted[0] as f64 / 1e9).to_bits());
+        assert_eq!(got.max.to_bits(), (sorted[len - 1] as f64 / 1e9).to_bits());
+        assert_eq!(
+            got.mean.to_bits(),
+            (sorted.iter().sum::<u64>() as f64 / len as f64 / 1e9).to_bits()
+        );
+        for (p, actual) in PERCENTILES.iter().zip(got.percentiles) {
+            let idx = ((p / 100.0 * len as f64) as usize).min(len - 1);
+            assert_eq!(
+                actual.to_bits(),
+                (sorted[idx] as f64 / 1e9).to_bits(),
+                "p{p} of {len} samples"
+            );
+        }
+        // A second report of the same samples must agree too.
+        let again = latency_summary(&mut samples).unwrap();
+        assert_eq!(again.min.to_bits(), got.min.to_bits());
+        assert_eq!(again.mean.to_bits(), got.mean.to_bits());
+        assert_eq!(again.max.to_bits(), got.max.to_bits());
+        assert_eq!(
+            again.percentiles.map(f64::to_bits),
+            got.percentiles.map(f64::to_bits)
+        );
+        samples.sort_unstable();
+        assert_eq!(samples, sorted, "every sample must be retained exactly");
+    }
+
+    #[test]
+    fn selection_matches_sort_for_all_small_ternary_inputs() {
+        // Exhaustively cover ties, coincident ranks, and every ordering.
+        for len in 0..=8u32 {
+            for mut code in 0..3usize.pow(len) {
+                let samples: Vec<_> = (0..len)
+                    .map(|_| {
+                        let value = (code % 3) as u64;
+                        code /= 3;
+                        value
+                    })
+                    .collect();
+                if !samples.is_empty() {
+                    // Exercise selection itself even below the sort cutoff.
+                    let mut selected = samples.clone();
+                    let mut sorted = samples.clone();
+                    sorted.sort_unstable();
+                    let ranks = PERCENTILES.map(|p| {
+                        ((p / 100.0 * samples.len() as f64) as usize).min(samples.len() - 1)
+                    });
+                    select_ranks(&mut selected, &ranks, 0);
+                    for rank in ranks {
+                        assert_eq!(selected[rank], sorted[rank]);
+                    }
+                    selected.sort_unstable();
+                    assert_eq!(selected, sorted);
+                }
+                assert_matches_sort(samples);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_matches_sort_at_percentile_boundaries() {
+        for len in (1..=130).chain([999, 1000, 1001, 1023, 1024, 1025, 9999, 10_000, 10_001]) {
+            assert_matches_sort(vec![0; len]);
+            assert_matches_sort(vec![123_456_789; len]);
+            assert_matches_sort((0..len as u64).collect());
+            assert_matches_sort((0..len as u64).rev().collect());
+            let mut skewed = vec![42; len];
+            skewed[len / 2] = 1_000_000_000_000;
+            skewed[len - 1] = 0;
+            assert_matches_sort(skewed);
+        }
+    }
+
+    #[test]
+    fn selection_matches_sort_for_seeded_large_inputs() {
+        for seed in [1u64, 0xc73, 0x0123_4567_89ab_cdef] {
+            let mut state = seed;
+            for len in [32, 1024, 65_537, 1_000_000] {
+                let samples: Vec<_> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state % 1_000_000_000
+                    })
+                    .collect();
+                assert_matches_sort(samples.iter().map(|v| v % 11).collect());
+                assert_matches_sort(samples);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_preserves_large_values_and_integer_mean() {
+        // Stay within the existing u64 sum contract, including its boundary.
+        assert_matches_sort(vec![u64::MAX]);
+        assert_matches_sort(vec![0, u64::MAX, 0, 0]);
+        assert_matches_sort(vec![u64::MAX / 2, 0, u64::MAX / 2, 1]);
+        assert_matches_sort(vec![1 << 53, (1 << 53) + 1, (1 << 53) + 3, 0]);
     }
 
     #[test]
