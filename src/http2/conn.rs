@@ -384,27 +384,40 @@ impl Connection {
     }
 
     /// Consume received bytes, appending what happened to `events`
-    pub fn feed(&mut self, data: &[u8], events: &mut Vec<Event>) -> Result<()> {
-        if self.pending.is_empty() {
-            // Fast path: read frames straight out of the receive buffer and
-            // keep only a trailing partial frame
-            let used = self.run(data, events)?;
-            if used < data.len() {
-                self.pending.extend_from_slice(&data[used..]);
+    pub fn feed(&mut self, mut data: &[u8], events: &mut Vec<Event>) -> Result<()> {
+        if !self.pending.is_empty() {
+            let mut buf = std::mem::take(&mut self.pending);
+            // Complete only the carried frame. Appending the whole receive
+            // here would copy every following frame too, even though those
+            // can be read directly from the receive buffer.
+            if buf.len() < FRAME_HEADER_LEN {
+                let n = (FRAME_HEADER_LEN - buf.len()).min(data.len());
+                buf.extend_from_slice(&data[..n]);
+                data = &data[n..];
             }
-            return Ok(());
-        }
-        let mut buf = std::mem::take(&mut self.pending);
-        buf.extend_from_slice(data);
-        let used = self.run(&buf, events);
-        match used {
-            Ok(used) => {
-                buf.drain(..used);
+            if buf.len() >= FRAME_HEADER_LEN {
+                let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+                let n = (FRAME_HEADER_LEN + len - buf.len()).min(data.len());
+                buf.extend_from_slice(&data[..n]);
+                data = &data[n..];
+            }
+            // Run even an incomplete frame: the parser rejects an HTTP/1
+            // answer at five bytes and an invalid preface at nine bytes.
+            let used = self.run(&buf, events)?;
+            if used == 0 {
                 self.pending = buf;
-                Ok(())
+                return Ok(());
             }
-            Err(e) => Err(e),
+            debug_assert_eq!(used, buf.len());
+            buf.clear();
+            self.pending = buf;
         }
+        // Read whole frames directly and retain only a trailing fragment.
+        let used = self.run(data, events)?;
+        if used < data.len() {
+            self.pending.extend_from_slice(&data[used..]);
+        }
+        Ok(())
     }
 
     /// Read as many whole frames from `buf` as possible, returning how many
@@ -724,6 +737,10 @@ impl Connection {
 fn bad(what: &str) -> anyhow::Error {
     anyhow::anyhow!("malformed frame: {what}")
 }
+
+#[cfg(test)]
+#[path = "conn/feed_tests.rs"]
+mod feed_tests;
 
 #[cfg(test)]
 mod tests {

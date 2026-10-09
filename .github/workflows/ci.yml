@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +39,12 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release
+
+      - name: HTTP/2 fragmentation with an independent peer
+        run: |
+          python3 -m venv /tmp/shb-h2-peer
+          /tmp/shb-h2-peer/bin/pip install h2==4.3.0 hpack==4.1.0 hyperframe==6.1.0
+          /tmp/shb-h2-peer/bin/python tests/support/h2-fragmentation-check.py --shb target/release/shb
 
       # Multishot recv and provided buffer rings need kernel 6.0; the setup
       # flags and completion batching degrade gracefully without 6.6 and 6.12.
