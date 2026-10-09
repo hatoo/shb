@@ -130,6 +130,7 @@ pub fn encode_request(
 }
 
 /// Read an integer in HPACK's prefix encoding, advancing `pos`
+#[inline(always)]
 fn decode_int(buf: &[u8], pos: &mut usize, prefix_bits: u8) -> Result<u32> {
     let max = (1u32 << prefix_bits) - 1;
     let first = *buf.get(*pos).ok_or_else(short)? as u32 & max;
@@ -137,7 +138,13 @@ fn decode_int(buf: &[u8], pos: &mut usize, prefix_bits: u8) -> Result<u32> {
     if first < max {
         return Ok(first);
     }
-    let mut value = max;
+    decode_int_tail(buf, pos, max)
+}
+
+/// Extended integers are separate from the common one-byte prefix.
+#[cold]
+#[inline(never)]
+fn decode_int_tail(buf: &[u8], pos: &mut usize, mut value: u32) -> Result<u32> {
     let mut shift = 0;
     loop {
         let byte = *buf.get(*pos).ok_or_else(short)?;

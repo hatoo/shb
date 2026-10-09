@@ -2,6 +2,8 @@
 	auto_https off
 	servers {
 		protocols h1 h2 h2c h3
+		# Allow the interop suite's four 8 KB request headers, including on HTTP/2.
+		max_header_size 64KiB
 	}
 }
 
