@@ -7,7 +7,8 @@
 //! writing it. Packets are built straight into the caller's datagram buffer,
 //! so a datagram costs no allocation. And streams live in a ring indexed by
 //! stream number rather than a hash map, because a client opens them in order
-//! and finishes them in nearly the same order.
+//! and finishes them in nearly the same order. When a delayed stream leaves
+//! many completed holes behind it, the table packs them away with explicit ids.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -92,6 +93,7 @@ use super::recovery::{Congestion, Rtt, SentFrame, SentPacket, SentPackets, pto_d
 use super::stream::{
     Dir, RecvStream, SendStream, client_stream_id, is_client_initiated, stream_dir,
 };
+use super::stream_table::StreamTable;
 use super::transport::{ACTIVE_CONNECTION_ID_LIMIT, LocalParams, Params};
 
 /// The smallest datagram a client may send while handshaking
@@ -257,14 +259,14 @@ pub struct Connection {
     next_bidi: u64,
     next_uni: u64,
 
-    /// Client-initiated bidirectional streams, indexed by number from `base`
-    streams: VecDeque<Option<StreamPair>>,
+    /// Client-initiated bidirectional streams, including retired sends still
+    /// awaiting acknowledgement. Only settled pairs leave the table.
+    streams: StreamTable<StreamPair>,
     /// Streams with something to send, in the order they became ready. A
     /// request is written once and then only waits, so walking every open
     /// stream to build each packet is work proportional to the streams in
     /// flight; this keeps it proportional to the streams that have data.
     send_queue: VecDeque<u64>,
-    base_stream: u64,
     /// Peer-opened unidirectional streams, few and long-lived
     peer_uni: Vec<(u64, RecvStream)>,
     /// Our own unidirectional streams
@@ -401,9 +403,8 @@ impl Connection {
             max_streams_bidi: 0,
             next_bidi: 0,
             next_uni: 0,
-            streams: VecDeque::new(),
+            streams: StreamTable::new(),
             send_queue: VecDeque::new(),
-            base_stream: 0,
             peer_uni: Vec::new(),
             local_uni: Vec::new(),
             rtt: Rtt::default(),
@@ -1032,10 +1033,7 @@ impl Connection {
             let Some(id) = self.send_queue.pop_front() else {
                 break;
             };
-            let Some(i) = self.stream_index(id) else {
-                continue;
-            };
-            let Some(pair) = self.streams[i].as_mut() else {
+            let Some(pair) = self.streams.get_mut(id) else {
                 continue;
             };
             pair.queued = false;
@@ -1055,11 +1053,7 @@ impl Connection {
                 ack_eliciting = true;
             }
             self.data_sent += sent_len as u64;
-            if self
-                .stream_index(id)
-                .and_then(|i| self.streams[i].as_ref())
-                .is_some_and(|p| p.send.has_pending())
-            {
+            if self.streams.get(id).is_some_and(|p| p.send.has_pending()) {
                 self.queue_send(id);
             }
         }
@@ -1918,22 +1912,8 @@ fn stateless_reset_tail(datagram: &[u8]) -> Option<[u8; 16]> {
 // -------------------------------------------------------------------------
 
 impl Connection {
-    /// Client-initiated bidirectional streams are numbered 0, 4, 8..., so the
-    /// stream number is the index into the ring once the base is taken off.
-    /// No hashing, and the memory is reused as streams retire.
-    fn stream_index(&self, id: u64) -> Option<usize> {
-        if !is_client_initiated(id) || stream_dir(id) != Dir::Bi {
-            return None;
-        }
-        let n = id / 4;
-        n.checked_sub(self.base_stream)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.streams.len())
-    }
-
     fn stream_mut(&mut self, id: u64) -> Option<&mut StreamPair> {
-        let i = self.stream_index(id)?;
-        self.streams[i].as_mut()
+        self.streams.get_mut(id)
     }
 
     /// The send half of a stream, wherever it lives
@@ -1943,8 +1923,8 @@ impl Connection {
     /// for the connection - but everything that writes, finishes,
     /// acknowledges or resends is indifferent to which it has.
     fn send_mut(&mut self, id: u64) -> Option<&mut SendStream> {
-        if let Some(i) = self.stream_index(id) {
-            return self.streams[i].as_mut().map(|pair| &mut pair.send);
+        if is_client_initiated(id) && stream_dir(id) == Dir::Bi {
+            return self.streams.get_mut(id).map(|pair| &mut pair.send);
         }
         self.local_uni
             .iter_mut()
@@ -1956,10 +1936,7 @@ impl Connection {
     /// written, a stream is finished, a loss puts bytes back, or a raised
     /// limit unblocks one.
     fn queue_send(&mut self, id: u64) {
-        let Some(i) = self.stream_index(id) else {
-            return;
-        };
-        let Some(pair) = self.streams[i].as_mut() else {
+        let Some(pair) = self.streams.get_mut(id) else {
             return;
         };
         if pair.queued {
@@ -1979,13 +1956,16 @@ impl Connection {
         self.unanswered += 1;
         let limit = self.params.initial_max_stream_data_bidi_remote;
         let (send_buf, recv_buf) = self.spare_bufs.pop().unwrap_or_default();
-        self.streams.push_back(Some(StreamPair {
-            send: SendStream::with_buf(limit, send_buf),
-            recv: RecvStream::with_buf(self.stream_window, recv_buf),
-            finished: false,
-            retired: false,
-            queued: false,
-        }));
+        self.streams.push(
+            id,
+            StreamPair {
+                send: SendStream::with_buf(limit, send_buf),
+                recv: RecvStream::with_buf(self.stream_window, recv_buf),
+                finished: false,
+                retired: false,
+                queued: false,
+            },
+        );
         Some(id)
     }
 
@@ -2011,7 +1991,7 @@ impl Connection {
     pub fn send_oneshot(&mut self, data: &[u8]) -> Option<(u64, usize)> {
         let id = self.open_bi()?;
         self.needs_send = true;
-        let pair = self.streams.back_mut()?.as_mut()?;
+        let pair = self.streams.back_mut()?;
         let n = pair.send.write(data);
         if n == data.len() {
             pair.send.finish();
@@ -2039,8 +2019,8 @@ impl Connection {
 
     /// The receive half of a stream, wherever it lives
     fn recv_mut(&mut self, id: u64) -> Option<&mut RecvStream> {
-        if let Some(i) = self.stream_index(id) {
-            return self.streams[i].as_mut().map(|pair| &mut pair.recv);
+        if is_client_initiated(id) && stream_dir(id) == Dir::Bi {
+            return self.streams.get_mut(id).map(|pair| &mut pair.recv);
         }
         self.peer_uni
             .iter_mut()
@@ -2099,10 +2079,7 @@ impl Connection {
     /// `cancel`, as curl does. Either way the stream stays until the peer
     /// has acknowledged everything, and nothing more is reported about it.
     pub fn retire(&mut self, id: u64, cancel: u64) {
-        let Some(i) = self.stream_index(id) else {
-            return;
-        };
-        let Some(pair) = self.streams[i].as_mut() else {
+        let Some(pair) = self.streams.get_mut(id) else {
             return;
         };
         // Given up on before it was answered, as after a GOAWAY
@@ -2128,35 +2105,28 @@ impl Connection {
         // which is what bounds it: the cap is only there for a peer that
         // allows an unreasonable number.
         const SPARES: usize = 256;
-        let Some(i) = self.stream_index(id) else {
-            return;
-        };
-        if !self.streams[i]
-            .as_ref()
+        if !self
+            .streams
+            .get(id)
             .is_some_and(|pair| pair.retired && pair.send.is_settled())
         {
             return;
         }
-        if let Some(mut pair) = self.streams[i].take()
+        if let Some(mut pair) = self.streams.take(id)
             && self.spare_bufs.len() < SPARES
         {
             self.spare_bufs
                 .push((pair.send.take_buf(), pair.recv.take_buf()));
         }
-        // Trim the front so the ring does not grow for the life of the run
-        while matches!(self.streams.front(), Some(None)) {
-            self.streams.pop_front();
-            self.base_stream += 1;
-        }
     }
 
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
-        let new = if let Some(i) = self.stream_index(id) {
-            let Some(pair) = self.streams[i].as_mut().filter(|p| !p.retired) else {
+        let new = if let Some(pair) = self.streams.get_mut(id) {
+            if pair.retired {
                 // Already retired; the peer is answering a stream we stopped
                 // caring about, which is not an error
                 return Ok(());
-            };
+            }
             let new = pair.recv.push(offset, data, fin)?;
             let readable = pair.recv.has_data();
             let done = pair.recv.is_finished() && !pair.finished;
@@ -2172,7 +2142,7 @@ impl Connection {
             }
             new
         } else if is_client_initiated(id) && stream_dir(id) == Dir::Bi {
-            // Below the ring's base: a stream we opened, finished and retired.
+            // Removed from the table: a stream we opened, finished and retired.
             // Data for one of those is ordinary - a retransmission, or a frame
             // that crossed the response - and dropping it is right. Only an id
             // we have never handed out is a protocol violation.
@@ -2210,17 +2180,15 @@ impl Connection {
     #[cold]
     #[inline(never)]
     fn on_reset(&mut self, id: u64, error: u64, final_size: u64) -> Result<()> {
-        if let Some(i) = self.stream_index(id) {
-            if let Some(pair) = self.streams[i].as_mut() {
-                pair.recv.reset(final_size)?;
-                if !pair.finished {
-                    pair.finished = true;
-                    self.unanswered -= 1;
-                    self.events.push_back(Event::Finished {
-                        id,
-                        reset: Some(error),
-                    });
-                }
+        if let Some(pair) = self.streams.get_mut(id) {
+            pair.recv.reset(final_size)?;
+            if !pair.finished {
+                pair.finished = true;
+                self.unanswered -= 1;
+                self.events.push_back(Event::Finished {
+                    id,
+                    reset: Some(error),
+                });
             }
         } else if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
             recv.reset(final_size)?;
@@ -2371,6 +2339,10 @@ impl Connection {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "conn/retention_tests.rs"]
+mod retention_tests;
 
 #[cfg(test)]
 mod tests {

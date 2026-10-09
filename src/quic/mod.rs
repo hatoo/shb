@@ -14,5 +14,6 @@ pub mod header;
 pub mod packet;
 pub mod recovery;
 pub mod stream;
+mod stream_table;
 pub mod transport;
 pub mod varint;
