@@ -18,6 +18,9 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::any;
 
+#[path = "support/h2_timeout.rs"]
+mod h2_timeout;
+
 /// Status code by method so tests can verify the method actually reached the
 /// server. A request carrying an `X-Echo` header must send a matching body,
 /// and vice versa, so a single 200/201/... response proves both arrived.
