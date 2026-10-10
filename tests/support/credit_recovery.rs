@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 const BODY_LEN: usize = 8_007;
 
-struct Server {
-    addr: SocketAddr,
-    completed: Arc<AtomicUsize>,
+pub struct Server {
+    pub addr: SocketAddr,
+    pub completed: Arc<AtomicUsize>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -23,7 +23,7 @@ impl Drop for Server {
     }
 }
 
-fn server() -> Server {
+pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
     let (tx, rx) = std::sync::mpsc::channel();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let completed = Arc::new(AtomicUsize::new(0));
@@ -51,7 +51,7 @@ fn server() -> Server {
             let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             let mut transport = quinn::TransportConfig::default();
             transport.receive_window(quinn::VarInt::from_u32(4096));
-            transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024));
+            transport.stream_receive_window(quinn::VarInt::from_u32(stream_window));
             config.transport_config(Arc::new(transport));
             let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
             tx.send(endpoint.local_addr().unwrap()).unwrap();
@@ -75,23 +75,27 @@ fn server() -> Server {
                                     return;
                                 };
                                 let mut received = Vec::new();
-                                loop {
-                                    match stream.recv_data().await {
-                                        Ok(Some(mut chunk)) => {
-                                            use bytes::Buf;
-                                            while chunk.has_remaining() {
-                                                let data = chunk.chunk();
-                                                received.extend_from_slice(data);
-                                                let len = data.len();
-                                                chunk.advance(len);
+                                if stop_body {
+                                    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+                                } else {
+                                    loop {
+                                        match stream.recv_data().await {
+                                            Ok(Some(mut chunk)) => {
+                                                use bytes::Buf;
+                                                while chunk.has_remaining() {
+                                                    let data = chunk.chunk();
+                                                    received.extend_from_slice(data);
+                                                    let len = data.len();
+                                                    chunk.advance(len);
+                                                }
                                             }
+                                            Ok(None) => break,
+                                            Err(_) => return,
                                         }
-                                        Ok(None) => break,
-                                        Err(_) => return,
                                     }
                                 }
                                 let valid = request.method() == http::Method::POST
-                                    && received == vec![b'x'; BODY_LEN];
+                                    && (stop_body || received == vec![b'x'; body_len]);
                                 let status = if valid { 200 } else { 400 };
                                 if stream
                                     .send_response(
@@ -210,14 +214,15 @@ fn relay(upstream: SocketAddr, late_duplicate: bool) -> Relay {
     }
 }
 
-fn exercise(late_duplicate: bool) {
-    let server = server();
+#[cfg(test)]
+fn exercise(late_duplicate: bool, body_len: usize, stream_window: u32, parallel: usize) {
+    let server = server(body_len, stream_window, false);
     let relay = relay(server.addr, late_duplicate);
     let target = crate::target::parse_target(
         &format!("https://{}/", relay.addr),
         "POST",
         &[],
-        Some(&vec![b'x'; BODY_LEN]),
+        Some(&vec![b'x'; body_len]),
         false,
     )
     .unwrap();
@@ -228,7 +233,7 @@ fn exercise(late_duplicate: bool) {
         crate::budget::Budget::Requests(8),
         timeout,
         Some(timeout),
-        1,
+        parallel,
     )
     .unwrap();
     assert_eq!(relay.dropped.load(Ordering::SeqCst), 1);
@@ -248,10 +253,50 @@ fn exercise(late_duplicate: bool) {
 
 #[test]
 fn h3_recovers_a_lost_prefix_with_a_small_connection_window() {
-    exercise(false);
+    exercise(false, BODY_LEN, 16 * 1024, 1);
 }
 
 #[test]
 fn h3_recovers_before_a_late_duplicate_of_the_lost_prefix() {
-    exercise(true);
+    exercise(true, BODY_LEN, 16 * 1024, 1);
+}
+
+#[test]
+fn h3_flushes_bodies_larger_than_both_windows_after_packet_loss() {
+    exercise(false, 65_543, 2048, 4);
+}
+
+#[test]
+fn h3_flushes_blocked_bodies_with_reordering_and_late_duplicates() {
+    exercise(true, 65_543, 2048, 4);
+}
+
+#[test]
+fn h3_counts_early_responses_after_the_peer_stops_blocked_bodies() {
+    let server = server(65_543, 2048, true);
+    let target = crate::target::parse_target(
+        &format!("https://{}/", server.addr),
+        "POST",
+        &[],
+        Some(&vec![b'x'; 65_543]),
+        false,
+    )
+    .unwrap();
+    let stats = crate::http3::run_worker(
+        &target,
+        1,
+        crate::budget::Budget::Requests(32),
+        Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        4,
+    )
+    .unwrap();
+    assert_eq!(
+        (stats.completed, stats.errors, stats.connect_errors),
+        (32, 0, 0)
+    );
+    assert_eq!(stats.latencies_ns.len(), 32);
+    assert_eq!(stats.status_counts[200], 32);
+    assert_eq!(stats.status_counts.iter().sum::<u64>(), 32);
+    assert_eq!(server.completed.load(Ordering::SeqCst), 32);
 }
