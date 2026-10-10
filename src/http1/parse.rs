@@ -40,11 +40,13 @@ enum State {
 }
 
 pub struct Parser {
-    /// Bytes of an incomplete message carried over from earlier receives.
+    /// Bytes of one incomplete line carried over from earlier receives.
     /// Empty in the common case, which lets [`Parser::feed`] parse straight
     /// out of the receive buffer with no copy at all.
     pending: Vec<u8>,
     state: State,
+    /// Framing metadata is needed only while a header block is incomplete.
+    partial_head: Option<Head>,
     /// Status code of the response being read, which is the last completed
     /// one for as long as the caller only asks after one completes
     status: u16,
@@ -66,6 +68,7 @@ impl Parser {
         Parser {
             pending: Vec::new(),
             state: State::Head,
+            partial_head: None,
             status: 0,
             keep_alive: true,
             head_request: false,
@@ -75,6 +78,7 @@ impl Parser {
     /// Forget any partially received message (called when reconnecting)
     pub fn reset(&mut self) {
         self.pending.clear();
+        self.partial_head = None;
         self.state = State::Head;
         self.status = 0;
         self.keep_alive = true;
@@ -116,18 +120,24 @@ impl Parser {
             }
             return Ok(done);
         }
-        // Take the buffer out so `run` can borrow it while holding `&mut self`
-        let mut buf = std::mem::take(&mut self.pending);
-        buf.extend_from_slice(data);
-        let result = self.run(&buf);
-        match result {
-            Ok((used, done)) => {
-                buf.drain(..used);
-                self.pending = buf;
-                Ok(done)
-            }
-            Err(e) => Err(e),
-        }
+        // `run` consumes every complete line, so pending contains just one
+        // unfinished status, header, chunk-size or trailer line. Search only
+        // the newly received bytes: a long line must not be rescanned on every
+        // receive. Append only through its newline, then parse the rest of
+        // this receive in place (including any response body).
+        let Some(nl) = memchr(b'\n', data) else {
+            self.pending.extend_from_slice(data);
+            return Ok(0);
+        };
+        let mut line = std::mem::take(&mut self.pending);
+        line.extend_from_slice(&data[..=nl]);
+        let (used, done) = self.run(&line)?;
+        debug_assert_eq!(used, line.len());
+        line.clear();
+        self.pending = line;
+        let (used, more) = self.run(&data[nl + 1..])?;
+        self.pending.extend_from_slice(&data[nl + 1 + used..]);
+        Ok(done + more)
     }
 
     /// Signal that the peer closed the connection
@@ -150,16 +160,23 @@ impl Parser {
         loop {
             match self.state {
                 State::Head => {
-                    let Some((len, status, body, keep_alive)) = scan_head(&buf[pos..])? else {
+                    let (used, complete) = scan_head(&buf[pos..], &mut self.partial_head)?;
+                    pos += used;
+                    let Some(ResponseHead {
+                        status,
+                        body,
+                        keep_alive,
+                    }) = complete
+                    else {
                         return Ok((pos, done));
                     };
-                    pos += len;
                     if crate::is_informational(status) {
                         if status == 101 {
                             // The connection stops being HTTP/1.1 here, and a
                             // load generator has nothing to switch to
                             bail!("unexpected 101 Switching Protocols");
                         }
+                        self.state = State::Head;
                         // An interim response carries no body and does not
                         // finish the message: keep reading for the final one
                         // (RFC 9110 Section 15.2)
@@ -255,74 +272,106 @@ fn no_body_status(status: u16) -> bool {
     status == 204 || status == 304
 }
 
-/// Scan a status line and header block
-///
-/// Returns None when `buf` does not hold the whole block yet, otherwise the
-/// length of the block, the status code, how the body is framed, and whether
-/// the connection may be reused.
-fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
-    let Some(nl) = memchr(b'\n', buf) else {
-        return Ok(None);
+/// Metadata from complete header lines. No header bytes are needed again once
+/// their framing and connection tokens have been read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Head {
+    content_length: Option<u64>,
+    status: u16,
+    http_1_0: bool,
+    te_present: bool,
+    te_chunked: bool,
+    close: bool,
+    keep_alive_token: bool,
+}
+
+struct ResponseHead {
+    status: u16,
+    body: Body,
+    keep_alive: bool,
+}
+
+/// Consume complete lines, keeping metadata across receives. The unconsumed
+/// suffix is at most one incomplete line. Publish status/connection semantics
+/// only once the entire header block is complete, just as for a single receive.
+fn scan_head(buf: &[u8], partial: &mut Option<Head>) -> Result<(usize, Option<ResponseHead>)> {
+    let (mut head, mut pos) = if let Some(head) = partial.take() {
+        (head, 0)
+    } else {
+        let Some(nl) = memchr(b'\n', buf) else {
+            return Ok((0, None));
+        };
+        // "HTTP/1.1 200 OK": HTTP-version SP status-code SP reason-phrase, the
+        // version being "HTTP/1." and one digit (RFC 9112 Section 4), so the
+        // status code is always at the same offset. The line runs at least to
+        // the end of the code, and the newline found above says it is all here.
+        if nl < 12 || !buf.starts_with(b"HTTP/1.") {
+            bail!("not an HTTP/1.x response");
+        }
+        let http_1_0 = match buf[7] {
+            b'0' => true,
+            b'1' => false,
+            // "HTTP/1.9", or a two-digit minor that happened to start with a 1
+            _ => bail!("unsupported HTTP version"),
+        };
+        if buf[8] != b' ' {
+            bail!("malformed status line");
+        }
+        let status = parse_status(&buf[9..12])?;
+        // A space and the reason phrase follow, but some servers send the code
+        // and the line ending alone, and that is readable; a fourth digit is not
+        match buf[12] {
+            b' ' | b'\r' | b'\n' => {}
+            _ => bail!("malformed status line"),
+        }
+        (
+            Head {
+                content_length: None,
+                status,
+                http_1_0,
+                te_present: false,
+                te_chunked: false,
+                close: false,
+                keep_alive_token: false,
+            },
+            nl + 1,
+        )
     };
-    // "HTTP/1.1 200 OK": HTTP-version SP status-code SP reason-phrase, the
-    // version being "HTTP/1." and one digit (RFC 9112 Section 4), so the
-    // status code is always at the same offset. The line runs at least to
-    // the end of the code, and the newline found above says it is all here.
-    if nl < 12 || !buf.starts_with(b"HTTP/1.") {
-        bail!("not an HTTP/1.x response");
-    }
-    let http_1_0 = match buf[7] {
-        b'0' => true,
-        b'1' => false,
-        // "HTTP/1.9", or a two-digit minor that happened to start with a 1
-        _ => bail!("unsupported HTTP version"),
-    };
-    if buf[8] != b' ' {
-        bail!("malformed status line");
-    }
-    let status = parse_status(&buf[9..12])?;
-    // A space and the reason phrase follow, but some servers send the code
-    // and the line ending alone, and that is readable; a fourth digit is not
-    match buf[12] {
-        b' ' | b'\r' | b'\n' => {}
-        _ => bail!("malformed status line"),
-    }
-    let mut pos = nl + 1;
-    let mut content_length: Option<u64> = None;
-    let mut te_present = false;
-    let mut te_chunked = false;
-    let mut close = false;
-    let mut keep_alive_token = false;
     loop {
         let Some(rel) = memchr(b'\n', &buf[pos..]) else {
-            return Ok(None);
+            *partial = Some(head);
+            return Ok((pos, None));
         };
         let line = trim_cr(&buf[pos..pos + rel]);
         pos += rel + 1;
         if line.is_empty() {
-            // Transfer-Encoding overrides Content-Length, and when chunked is
-            // not the final coding the body runs to the end of the connection
-            // (RFC 9112 Section 6.3)
-            let body = if te_present {
-                if te_chunked {
+            // Transfer-Encoding overrides Content-Length; its final coding
+            // decides whether the body is chunked or close-delimited.
+            let body = if head.te_present {
+                if head.te_chunked {
                     Body::ChunkSize
                 } else {
                     Body::Eof
                 }
             } else {
-                match content_length {
+                match head.content_length {
                     Some(n) => Body::Exact(n),
                     None => Body::Eof,
                 }
             };
-            // HTTP/1.1 keeps the connection unless told otherwise; HTTP/1.0
-            // closes it unless told otherwise (RFC 9112 Section 9.3)
-            let keep_alive = if http_1_0 {
-                keep_alive_token && !close && !te_present
+            let keep_alive = if head.http_1_0 {
+                head.keep_alive_token && !head.close && !head.te_present
             } else {
-                !close
+                !head.close
             };
-            return Ok(Some((pos, status, body, keep_alive)));
+            return Ok((
+                pos,
+                Some(ResponseHead {
+                    status: head.status,
+                    body,
+                    keep_alive,
+                }),
+            ));
         }
         // One case-insensitive byte decides whether a line is worth reading
         match line[0] | 0x20 {
@@ -330,27 +379,27 @@ fn scan_head(buf: &[u8]) -> Result<Option<(usize, u16, Body, bool)>> {
                 let n = parse_u64(trim_ows(&line[15..]))?;
                 // Repeated fields are only allowed to agree; disagreeing ones
                 // are a framing attack, not a message (RFC 9112 Section 6.3)
-                if content_length.is_some_and(|prev| prev != n) {
+                if head.content_length.is_some_and(|prev| prev != n) {
                     bail!("conflicting Content-Length");
                 }
-                content_length = Some(n);
+                head.content_length = Some(n);
             }
             b'c' if ci_prefix(line, b"connection:") => {
                 for token in line[11..].split(|&b| b == b',') {
                     let token = trim_ows(token);
                     if ci_eq(token, b"close") {
-                        close = true;
+                        head.close = true;
                     } else if ci_eq(token, b"keep-alive") {
-                        keep_alive_token = true;
+                        head.keep_alive_token = true;
                     }
                 }
             }
             b't' if ci_prefix(line, b"transfer-encoding:") => {
                 // Repeated fields concatenate, so the last one decides whether
                 // chunked is the final coding
-                te_present = true;
+                head.te_present = true;
                 if let Some(chunked) = final_coding(&line[18..])? {
-                    te_chunked = chunked;
+                    head.te_chunked = chunked;
                 }
             }
             _ => {}
@@ -883,3 +932,7 @@ mod tests {
         assert_eq!(p.status(), 200);
     }
 }
+
+#[cfg(test)]
+#[path = "parse/incremental_tests.rs"]
+mod incremental_tests;

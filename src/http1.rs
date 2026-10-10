@@ -6,6 +6,10 @@ use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "http1/header_tests.rs"]
+mod header_tests;
+
 use crate::clock::Instant;
 
 use anyhow::{Context, Result, bail};
