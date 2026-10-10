@@ -266,6 +266,15 @@ struct Conn {
 }
 
 impl Conn {
+    /// Requests start once, in increasing stream-id order. The ring keeps
+    /// its oldest live request at slot zero even when later requests finish
+    /// first, so no younger request can time out before this one.
+    fn timed_out(&self, now: Instant, limit: Duration) -> bool {
+        self.streams
+            .slot(0)
+            .is_some_and(|oldest| now.duration_since(oldest.start) >= limit)
+    }
+
     fn new() -> Self {
         Conn {
             fd: -1,
@@ -1086,11 +1095,7 @@ pub fn run_worker(
         // seconds after every request shb gave up on.
         if let Some(limit) = timeout {
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
-                if !conn
-                    .streams
-                    .iter()
-                    .any(|s| now.duration_since(s.start) >= limit)
-                {
+                if !conn.timed_out(now, limit) {
                     continue;
                 }
                 if let Some(quic) = conn.quic.as_mut() {
@@ -1264,6 +1269,10 @@ fn finish_close(
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "http3/timeout_tests.rs"]
+mod timeout_tests;
 
 #[cfg(test)]
 mod tests {
