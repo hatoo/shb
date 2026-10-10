@@ -10,6 +10,10 @@ use std::time::Duration;
 #[path = "http1/header_tests.rs"]
 mod header_tests;
 
+#[cfg(test)]
+#[path = "http1/idle_tests.rs"]
+mod idle_tests;
+
 use crate::clock::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -59,6 +63,10 @@ struct Conn {
     /// in put a handshake on every fiftieth sample of a `-c 50 -n 200` run
     /// over TLS, and p90 at ten times p50.
     unsent: bool,
+    /// A request is still owed. Unlike `deadline`, this also tracks requests
+    /// when --timeout is disabled. An idle socket's late EOF/send error must
+    /// not be charged against another connection's remaining request budget.
+    active: bool,
     /// When the request in flight stops being worth waiting for, if --timeout
     /// was given. None means nothing is outstanding. Unlike the latency it
     /// counts from when the request was decided on, so a connect that never
@@ -80,6 +88,7 @@ impl Conn {
             generation: 0,
             request_start: Instant::now(),
             unsent: true,
+            active: false,
             deadline: None,
         }
     }
@@ -143,8 +152,21 @@ impl Conn {
 
     /// Reset per-request state for the next request
     fn begin_request(&mut self, timeout: Option<Duration>) {
+        self.active = true;
         self.unsent = true;
         self.deadline = timeout.map(|t| Instant::now() + t);
+    }
+
+    fn end_request(&mut self) {
+        self.active = false;
+        self.deadline = None;
+    }
+
+    fn fail_request(&mut self, stats: &mut Stats) {
+        if self.active {
+            stats.errors += 1;
+            self.end_request();
+        }
     }
 
     /// The request's bytes are going to the socket: start its clock
@@ -223,12 +245,15 @@ fn flush(
 /// The stream ended: a close-delimited body completes normally here, and
 /// anything else was cut short
 fn finish_at_eof(conn: &mut Conn, stats: &mut Stats) {
+    if !conn.active {
+        return;
+    }
     if conn.parser.mark_eof() {
         stats.record_success(conn.parser.status(), conn.request_start);
-        conn.deadline = None;
     } else {
         stats.errors += 1;
     }
+    conn.end_request();
 }
 
 fn push_recv_multi(
@@ -343,14 +368,16 @@ pub fn run_worker(
             let now = Instant::now();
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
                 if conn.deadline.is_some_and(|d| now >= d) {
-                    stats.errors += 1;
-                    conn.deadline = None;
+                    conn.fail_request(&mut stats);
                     conn.close();
                     conn.parser.reset();
                     if stop || !budget.may_start(started) {
                         continue;
                     }
                     started += 1;
+                    // The replacement is owed while connecting; the response
+                    // timeout is re-armed by OP_CONNECT as before.
+                    conn.begin_request(None);
                     match uring::start_connect(
                         &submitter,
                         &mut sq,
@@ -422,7 +449,7 @@ pub fn run_worker(
                 }
                 OP_SEND => {
                     if res < 0 {
-                        stats.errors += 1;
+                        conns[conn_idx].fail_request(&mut stats);
                         request_finished = true;
                         keep_conn = false;
                     } else {
@@ -472,7 +499,7 @@ pub fn run_worker(
                             // batch, so just re-arm
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         } else {
-                            stats.errors += 1;
+                            conn.fail_request(&mut stats);
                             request_finished = true;
                             keep_conn = false;
                         }
@@ -525,12 +552,14 @@ pub fn run_worker(
                                 flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                             }
                             Ok(_) => {
-                                stats.record_success(conn.parser.status(), conn.request_start);
+                                if conn.active {
+                                    stats.record_success(conn.parser.status(), conn.request_start);
+                                }
                                 request_finished = true;
                                 keep_conn = conn.parser.keep_alive() && !target.disable_keepalive;
                             }
                             Err(_) => {
-                                stats.errors += 1;
+                                conn.fail_request(&mut stats);
                                 request_finished = true;
                                 keep_conn = false;
                             }
@@ -542,6 +571,7 @@ pub fn run_worker(
 
             if request_finished {
                 let conn = &mut conns[conn_idx];
+                conn.end_request();
                 if !stop && budget.may_start(started) {
                     started += 1;
                     conn.begin_request(timeout);
