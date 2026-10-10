@@ -154,6 +154,25 @@ impl Conn {
         self.streams.clear();
         self.held = 0;
     }
+
+    fn timed_out(&mut self, now: Instant, limit: Duration, may_start: bool) -> bool {
+        if let Some(oldest) = self.streams.slot(0) {
+            self.idle_since = now;
+            // fill_streams timestamps requests once, in increasing stream-id
+            // order. Ring keeps the oldest live request at slot zero, even
+            // after out-of-order completions and compaction. If it has not
+            // expired, no younger request can have expired either.
+            now.duration_since(oldest.start) >= limit
+        } else {
+            // Nothing in flight and something still to send is a wait on
+            // SETTINGS, a handshake, or a refused first flight. An exhausted
+            // budget owes no idle connection a response, and a connection
+            // that has not connected yet has its own connect timeout.
+            self.connected
+                && (self.held > 0 || may_start)
+                && now.duration_since(self.idle_since) >= limit
+        }
+    }
 }
 
 /// Open new streams until the parallelism target or the request budget is hit
@@ -470,24 +489,7 @@ pub fn run_worker(
         if let Some(limit) = timeout {
             let now = Instant::now();
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
-                let wedged = if conn.streams.is_empty() {
-                    // Nothing in flight and something still to send is a
-                    // wait on something other than a response - a SETTINGS
-                    // that allows no streams, a handshake the server never
-                    // finishes, a first flight refused with no room to send
-                    // it again - and the same limit applies to it. Nothing
-                    // is owed a connection that is idle because the run is
-                    // out of requests, or has not connected yet: the
-                    // connect has its own timeout.
-                    conn.connected
-                        && (conn.held > 0 || budget.may_start(started))
-                        && now.duration_since(conn.idle_since) >= limit
-                } else {
-                    conn.idle_since = now;
-                    conn.streams
-                        .iter()
-                        .any(|s| now.duration_since(s.start) >= limit)
-                };
+                let wedged = conn.timed_out(now, limit, budget.may_start(started));
                 if !wedged {
                     continue;
                 }
@@ -834,6 +836,9 @@ pub fn run_worker(
 
     Ok(stats)
 }
+
+#[cfg(test)]
+mod timeout_tests;
 
 #[cfg(test)]
 mod tests {
