@@ -62,3 +62,7 @@ strip = true
 # throughput. --no-default-features falls back to whatever the platform gives.
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
+
+[[example]]
+name = "stats-merge"
+path = "benchmarks/stats-merge.rs"

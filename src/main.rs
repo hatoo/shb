@@ -295,10 +295,7 @@ fn main() -> Result<()> {
     });
     let elapsed = bench_start.elapsed();
 
-    let mut stats = Stats::default();
-    for result in results {
-        stats.merge(result?);
-    }
+    let mut stats = stats::merge_workers(results)?;
 
     if args.json {
         print_json_report(&args, threads, &mut stats, elapsed)?;
