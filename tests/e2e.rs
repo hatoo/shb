@@ -748,8 +748,7 @@ fn start_scripted_h2_server(script: H2Script) -> SocketAddr {
     addr
 }
 
-fn serve_scripted_h2(mut sock: std::net::TcpStream, script: H2Script) {
-    use std::io::{Read, Write};
+fn serve_scripted_h2(mut sock: impl std::io::Read + std::io::Write, script: H2Script) {
     const DATA: u8 = 0x0;
     const HEADERS: u8 = 0x1;
     const RST_STREAM: u8 = 0x3;
@@ -963,6 +962,86 @@ fn h2_resends_the_streams_a_goaway_left_unprocessed() {
         &url,
     ]);
     assert_all_ok(&report, 200, "200");
+}
+
+/// Several slots can close and reconnect in the same CQ batch. Retrying the
+/// streams returned by GOAWAY must still fill and flush each replacement.
+#[test]
+fn h2_concurrent_reconnects_preserve_the_request_budget() {
+    let addr = start_scripted_h2_server(H2Script {
+        streams_per_connection: Some(7),
+        ..H2Script::default()
+    });
+    let url = format!("http://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "32",
+        "-n",
+        "4096",
+        "-c",
+        "16",
+        "-t",
+        "1",
+        "--timeout",
+        "5s",
+        &url,
+    ]);
+    assert_all_ok(&report, 4096, "200");
+    assert_eq!(report["requests"]["connectErrors"], 0);
+}
+
+/// Handshake output is queued before any HTTP/2 streams exist. Reconnects
+/// then repeat that path while other slots are sending requests or responses.
+#[test]
+fn h2_tls_handshakes_and_reconnects_flush_every_slot() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![certified.cert.der().clone()], key.into())
+    .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let config = std::sync::Arc::new(config);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut tls = rustls::ServerConnection::new(config).unwrap();
+                serve_scripted_h2(
+                    rustls::Stream::new(&mut tls, &mut stream),
+                    H2Script {
+                        streams_per_connection: Some(5),
+                        ..H2Script::default()
+                    },
+                );
+            });
+        }
+    });
+    let url = format!("https://{addr}/");
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "8",
+        "-n",
+        "256",
+        "-c",
+        "8",
+        "-t",
+        "1",
+        "--timeout",
+        "5s",
+        &url,
+    ]);
+    assert_all_ok(&report, 256, "200");
+    assert_eq!(report["requests"]["connectErrors"], 0);
 }
 
 /// A GOAWAY does not end the streams below its line, and a request body
