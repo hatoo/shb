@@ -81,10 +81,6 @@ struct Conn {
     out_off: usize,
     /// Whether a Send SQE is in flight for `out`
     sending: bool,
-    /// Output is waiting and has not been submitted yet. Set while completions
-    /// are being drained, cleared by the flush pass after them, so requests
-    /// generated across a whole batch leave in one send rather than one each.
-    needs_flush: bool,
     /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
     /// GOAWAY received: no new streams, reconnect once in-flight streams drain
@@ -117,7 +113,6 @@ impl Conn {
             out: Vec::new(),
             out_off: 0,
             sending: false,
-            needs_flush: false,
             recv_armed: false,
             goaway: false,
             generation: 0,
@@ -256,6 +251,55 @@ fn flush(
     Ok(())
 }
 
+/// Pending connection slots, kept outside Conn so close/reconnect does not
+/// discard a mark. Bits coalesce completions without per-mark allocation.
+/// Scanning these contiguous words also retains connection-index flush order.
+struct PendingFlush {
+    words: Vec<u64>,
+}
+
+impl PendingFlush {
+    fn new(connections: usize) -> Self {
+        Self {
+            words: vec![0; connections.div_ceil(64)],
+        }
+    }
+
+    fn mark(&mut self, conn_idx: usize) {
+        self.words[conn_idx / 64] |= 1 << (conn_idx % 64);
+    }
+
+    fn drain(&mut self, mut flush: impl FnMut(usize) -> Result<()>) -> Result<()> {
+        for (word_idx, word) in self.words.iter_mut().enumerate() {
+            let mut ready = std::mem::take(word);
+            // A dense batch needs no bit search. Keep the ordinary bulk
+            // path as a sequential loop over the whole group of slots.
+            if ready == u64::MAX {
+                for conn_idx in word_idx * 64..(word_idx + 1) * 64 {
+                    flush(conn_idx)?;
+                }
+                continue;
+            }
+            while ready != 0 {
+                let conn_idx = word_idx * 64 + ready.trailing_zeros() as usize;
+                ready &= ready - 1;
+                flush(conn_idx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One flush per marked slot, using the current connection generation.
+fn flush_pending(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conns: &mut [Conn],
+    pending: &mut PendingFlush,
+) -> Result<()> {
+    pending.drain(|conn_idx| flush(submitter, sq, conn_idx, &mut conns[conn_idx]))
+}
+
 /// Turn the connection's events into statistics
 ///
 /// A request is found by its stream number, which is where its slot is.
@@ -360,6 +404,8 @@ pub fn run_worker(
     for _ in 0..connections {
         conns.push(Conn::new());
     }
+    // One bit per slot, reused across batches without allocation.
+    let mut pending_flush = PendingFlush::new(connections);
 
     let mut ring = uring::build_worker_ring(connections)?;
     // Kept alive so that enter can use the registered ring fd; submitter, sq
@@ -531,7 +577,7 @@ pub fn run_worker(
                             budget,
                             stop,
                         );
-                        conn.needs_flush = true;
+                        pending_flush.mark(conn_idx);
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -562,7 +608,7 @@ pub fn run_worker(
                                 h2.recycle(std::mem::take(&mut conn.out));
                             }
                             // More output may have accumulated while sending
-                            conn.needs_flush = true;
+                            pending_flush.mark(conn_idx);
                             if !conn.recv_armed {
                                 // Re-arm if the multishot ended (e.g. due to ENOBUFS)
                                 uring::push_recv_multi(
@@ -673,7 +719,7 @@ pub fn run_worker(
                                 );
                                 // Window updates / ACKs / new request HEADERS
                                 // go out in the flush pass below
-                                conn.needs_flush = true;
+                                pending_flush.mark(conn_idx);
                             }
                         }
                     }
@@ -721,12 +767,7 @@ pub fn run_worker(
         // One send per connection for everything this batch produced. Sending
         // from each completion instead put a request on the wire on its own,
         // and TCP_NODELAY made each one its own segment.
-        for (conn_idx, conn) in conns.iter_mut().enumerate() {
-            if conn.needs_flush {
-                conn.needs_flush = false;
-                flush(&submitter, &mut sq, conn_idx, conn)?;
-            }
-        }
+        flush_pending(&submitter, &mut sq, &mut conns, &mut pending_flush)?;
 
         if stop {
             break;
@@ -891,3 +932,6 @@ mod tests {
         assert_eq!((conn.answered, conn.held), (0, 0));
     }
 }
+
+#[cfg(test)]
+mod flush_tests;
