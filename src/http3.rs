@@ -257,6 +257,9 @@ struct Conn {
     generation: u64,
     /// In-flight requests, up to the configured parallelism
     streams: H3Ring<InFlight>,
+    /// Some request bytes may still need QUIC stream credit. Retirement can
+    /// leave this true until the next flush, but false means there are none.
+    has_unsent: bool,
     give_backs: GiveBacks,
     /// The connection is over and its requests are accounted for, but the
     /// socket stays until the send of its CONNECTION_CLOSE completes, or
@@ -292,6 +295,7 @@ impl Conn {
             recv_armed: false,
             generation: 0,
             streams: H3Ring::new(),
+            has_unsent: false,
             give_backs: GiveBacks::default(),
             closing: None,
         }
@@ -326,6 +330,7 @@ impl Conn {
         self.sending = false;
         self.recv_armed = false;
         self.streams.clear();
+        self.has_unsent = false;
         self.give_backs = GiveBacks::default();
         self.closing = None;
         // Bump the generation so CQEs of operations on the old socket are ignored
@@ -342,6 +347,7 @@ impl Conn {
         }
         stats.errors += self.streams.len() as u64;
         self.streams.clear();
+        self.has_unsent = false;
         // Nothing will be answered on it now, so what was waiting on that
         // is settled the same way
         stats.errors += std::mem::take(&mut self.give_backs.unjudged);
@@ -353,15 +359,21 @@ impl Conn {
 /// A fresh stream has its whole window free and requests are tiny, so this
 /// normally moves nothing; it exists so a peer with a small
 /// `initial_max_stream_data` cannot lose a request.
-fn flush_unsent(quic: &mut Connection, streams: &mut H3Ring<InFlight>) -> Result<()> {
+fn flush_unsent(quic: &mut Connection, streams: &mut H3Ring<InFlight>, has_unsent: &mut bool) {
+    if !*has_unsent {
+        return;
+    }
+    let mut remaining = false;
     for inflight in streams.iter_mut().filter(|s| !s.unsent.is_empty()) {
         let n = quic.write(inflight.stream_id, &inflight.unsent);
         inflight.unsent.drain(..n);
         if inflight.unsent.is_empty() {
             quic.finish(inflight.stream_id);
+        } else {
+            remaining = true;
         }
     }
-    Ok(())
+    *has_unsent = remaining;
 }
 
 /// Open new request streams until the parallelism target or budget is hit
@@ -387,6 +399,9 @@ fn fill_streams(
         let Some((qsid, sent)) = quic.send_oneshot(request) else {
             break;
         };
+        if sent < request.len() {
+            conn.has_unsent = true;
+        }
         conn.streams.push(
             qsid,
             InFlight {
@@ -700,7 +715,7 @@ fn drive(
         conn.give_backs
             .judge(conn.streams.is_empty(), parallel, stats, started);
 
-        flush_unsent(quic, &mut conn.streams)?;
+        flush_unsent(quic, &mut conn.streams, &mut conn.has_unsent);
         // Back where the next pass will find them, with the capacity they grew
         conn.readable = readable;
         conn.finished = finished;
@@ -1273,6 +1288,10 @@ fn finish_close(
 #[cfg(test)]
 #[path = "http3/timeout_tests.rs"]
 mod timeout_tests;
+
+#[cfg(test)]
+#[path = "http3/unsent_tests.rs"]
+mod unsent_tests;
 
 #[cfg(test)]
 mod tests {

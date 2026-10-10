@@ -2372,6 +2372,30 @@ impl Connection {
     }
 }
 
+// The HTTP/3 scheduler tests vary peer credit without a socket or a clock.
+#[cfg(test)]
+impl Connection {
+    pub(crate) fn test_send_limits(&mut self, streams: u64, window: u64) {
+        self.max_streams_bidi = streams;
+        self.params.initial_max_stream_data_bidi_remote = window;
+    }
+
+    pub(crate) fn test_receive_frame(&mut self, frame: Frame<'_>) {
+        self.handle_frame(Space::Data, frame, Instant::now())
+            .unwrap();
+    }
+
+    pub(crate) fn test_buffered_request(&self, id: u64) -> Option<(&[u8], bool)> {
+        let pair = self.streams.get(self.stream_index(id)?)?.as_ref()?;
+        pair.send
+            .next_send(usize::MAX, u64::MAX)
+            .map(|(offset, bytes, fin)| {
+                assert_eq!(offset, 0, "this fixture never transmits packets");
+                (bytes, fin)
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
