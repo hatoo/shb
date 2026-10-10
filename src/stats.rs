@@ -56,6 +56,21 @@ impl Stats {
     }
 }
 
+/// Combine worker results after the benchmark's elapsed time is captured.
+/// A sole worker already owns the complete report; retaining it avoids copying
+/// its samples and status table. Keep sequential merging for multiple workers
+/// so a worker's spare capacity does not change aggregate buffer growth.
+pub fn merge_workers<E>(mut results: Vec<Result<Stats, E>>) -> Result<Stats, E> {
+    if results.len() == 1 {
+        return results.pop().unwrap();
+    }
+    let mut stats = Stats::default();
+    for result in results {
+        stats.merge(result?);
+    }
+    Ok(stats)
+}
+
 /// Percentile sample points, matching oha's latency distribution
 pub const PERCENTILES: [f64; 9] = [10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99];
 
@@ -373,5 +388,94 @@ mod tests {
         assert_eq!(a.status_counts[200], 2);
         assert_eq!(a.status_counts[500], 1);
         assert_eq!(a.latencies_ns.len(), 3);
+    }
+
+    fn assert_same_stats(actual: &Stats, expected: &Stats) {
+        assert_eq!(actual.completed, expected.completed);
+        assert_eq!(actual.errors, expected.errors);
+        assert_eq!(actual.connect_errors, expected.connect_errors);
+        assert_eq!(actual.bytes_received, expected.bytes_received);
+        assert_eq!(actual.bytes_sent, expected.bytes_sent);
+        assert_eq!(actual.latencies_ns, expected.latencies_ns);
+        assert_eq!(actual.status_counts, expected.status_counts);
+    }
+
+    fn worker(id: usize) -> Stats {
+        let mut stats = Stats::default();
+        for i in 0..(id % 4) * 333 {
+            stats.latencies_ns.push([0, 73, 73, u64::MAX][i % 4]);
+            stats.status_counts[(i + id * 17) % 1000] += 1;
+            stats.completed += 1;
+        }
+        stats.errors = id as u64 * 3;
+        stats.connect_errors = id as u64;
+        stats.bytes_received = id as u64 * 197;
+        stats.bytes_sent = id as u64 * 97;
+        stats
+    }
+
+    #[test]
+    fn a_single_worker_retains_its_samples_and_status_table() {
+        for id in 0..4 {
+            let mut input = worker(id);
+            // Include an empty but reserved buffer and spare sample capacity.
+            input.latencies_ns.reserve(4096);
+            let samples_pointer = input.latencies_ns.as_ptr();
+            let capacity = input.latencies_ns.capacity();
+            let status_pointer = input.status_counts.as_ptr();
+            let result = merge_workers(vec![Ok::<_, ()>(input)]).unwrap();
+            assert_same_stats(&result, &worker(id));
+            assert_eq!(result.latencies_ns.as_ptr(), samples_pointer);
+            assert_eq!(result.latencies_ns.capacity(), capacity);
+            assert_eq!(result.status_counts.as_ptr(), status_pointer);
+        }
+    }
+
+    #[test]
+    fn zero_workers_produce_empty_statistics() {
+        let result = merge_workers(Vec::<Result<Stats, ()>>::new()).unwrap();
+        assert_same_stats(&result, &Stats::default());
+        assert_eq!(result.latencies_ns.capacity(), 0);
+    }
+
+    #[test]
+    fn multiple_workers_keep_sequential_merging_and_buffer_growth() {
+        for count in [2, 4, 16] {
+            for first in 0..4 {
+                let mut expected = Stats::default();
+                let mut inputs = Vec::new();
+                for id in first..first + count {
+                    expected.merge(worker(id));
+                    inputs.push(Ok::<_, ()>(worker(id)));
+                }
+                let actual = merge_workers(inputs).unwrap();
+                assert_same_stats(&actual, &expected);
+                assert_eq!(
+                    actual.latencies_ns.capacity(),
+                    expected.latencies_ns.capacity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregation_returns_the_first_worker_error() {
+        for count in [1, 2, 4, 16] {
+            for first_error in 0..count {
+                let results = (0..count)
+                    .map(|id| {
+                        if id >= first_error {
+                            Err(id)
+                        } else {
+                            Ok(worker(id))
+                        }
+                    })
+                    .collect();
+                match merge_workers(results) {
+                    Err(id) => assert_eq!(id, first_error),
+                    Ok(_) => panic!("worker error was lost"),
+                }
+            }
+        }
     }
 }
