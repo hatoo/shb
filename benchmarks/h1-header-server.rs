@@ -1,6 +1,6 @@
 //! Fixed raw HTTP/1 peer for response-header benchmarks.
 //! Build with rustc --edition=2024 -O benchmarks/h1-header-server.rs.
-//! Arguments: bind-address header-bytes fields|line. Emits its port as JSON.
+//! Arguments: bind-address header-bytes fields|line|near|connection. Emits its port as JSON.
 //! Use the same immutable peer binary for both client revisions.
 
 use std::io::{BufRead, BufReader, Write};
@@ -19,8 +19,12 @@ fn main() {
                     );
                 }
             }
-            "line" => {
-                wire.extend_from_slice(b"X-Long: ");
+            "line" | "near" | "connection" => {
+                wire.extend_from_slice(match args[3].as_str() {
+                    "near" => b"Transfer-Encoding-Extension: ",
+                    "connection" => b"Connection: ",
+                    _ => b"X-Long: ",
+                });
                 wire.resize(size.saturating_sub(4).max(wire.len()), b'x');
                 wire.extend_from_slice(b"\r\n");
             }

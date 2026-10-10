@@ -19,6 +19,9 @@ CASES = {
     "fields1k": ("fields", 1024, 65536),
     "fields64k": ("fields", 65536, 16384),
     "fields1m": ("fields", 1048576, 2048),
+    "line64k": ("line", 65536, 16384),
+    "near1m": ("near", 1048576, 2048),
+    "connection1m": ("connection", 1048576, 2048),
     "line1m": ("line", 1048576, 2048),
 }
 

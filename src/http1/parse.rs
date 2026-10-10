@@ -41,12 +41,15 @@ enum State {
 
 pub struct Parser {
     /// Bytes of one incomplete line carried over from earlier receives.
+    /// Irrelevant header lines are discarded once their prefix is known.
     /// Empty in the common case, which lets [`Parser::feed`] parse straight
     /// out of the receive buffer with no copy at all.
     pending: Vec<u8>,
     state: State,
     /// Framing metadata is needed only while a header block is incomplete.
     partial_head: Option<Head>,
+    /// Discard an irrelevant unfinished field through its next LF.
+    skip_line: bool,
     /// Status code of the response being read, which is the last completed
     /// one for as long as the caller only asks after one completes
     status: u16,
@@ -69,6 +72,7 @@ impl Parser {
             pending: Vec::new(),
             state: State::Head,
             partial_head: None,
+            skip_line: false,
             status: 0,
             keep_alive: true,
             head_request: false,
@@ -79,6 +83,7 @@ impl Parser {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.partial_head = None;
+        self.skip_line = false;
         self.state = State::Head;
         self.status = 0;
         self.keep_alive = true;
@@ -109,14 +114,21 @@ impl Parser {
 
     /// Consume received bytes and return how many responses completed
     ///
-    /// Whatever is left over is retained for the next call.
-    pub fn feed(&mut self, data: &[u8]) -> Result<usize> {
+    /// Retain only incomplete lines that may affect response semantics.
+    pub fn feed(&mut self, mut data: &[u8]) -> Result<usize> {
+        if self.skip_line {
+            let Some(nl) = memchr(b'\n', data) else {
+                return Ok(0);
+            };
+            self.skip_line = false;
+            data = &data[nl + 1..];
+        }
         if self.pending.is_empty() {
             // Fast path: parse in place out of the caller's buffer and copy
             // only a trailing partial message, if there is one
             let (used, done) = self.run(data)?;
             if used < data.len() {
-                self.pending.extend_from_slice(&data[used..]);
+                self.retain_partial(&data[used..]);
             }
             return Ok(done);
         }
@@ -126,18 +138,49 @@ impl Parser {
         // receive. Append only through its newline, then parse the rest of
         // this receive in place (including any response body).
         let Some(nl) = memchr(b'\n', data) else {
-            self.pending.extend_from_slice(data);
+            self.retain_partial(data);
             return Ok(0);
         };
-        let mut line = std::mem::take(&mut self.pending);
-        line.extend_from_slice(&data[..=nl]);
-        let (used, done) = self.run(&line)?;
-        debug_assert_eq!(used, line.len());
-        line.clear();
-        self.pending = line;
+        self.retain_partial(&data[..nl]);
+        let done = if self.pending.is_empty() {
+            // The carried name became irrelevant. Its newline has arrived,
+            // so resume at the next field without ever copying its payload.
+            self.skip_line = false;
+            0
+        } else {
+            let mut line = std::mem::take(&mut self.pending);
+            line.extend_from_slice(b"\n");
+            let (used, done) = self.run(&line)?;
+            debug_assert_eq!(used, line.len());
+            line.clear();
+            self.pending = line;
+            done
+        };
         let (used, more) = self.run(&data[nl + 1..])?;
-        self.pending.extend_from_slice(&data[nl + 1 + used..]);
+        if nl + 1 + used < data.len() {
+            self.retain_partial(&data[nl + 1 + used..]);
+        }
         Ok(done + more)
+    }
+
+    /// Decide from at most the longest relevant name (including its colon)
+    /// whether an unfinished header can be skipped. Status, chunk-size and
+    /// trailer lines keep their existing buffering and validation behavior.
+    fn retain_partial(&mut self, data: &[u8]) {
+        const NAME_BYTES: usize = b"transfer-encoding:".len();
+        if self.partial_head.is_some() && self.pending.len() < NAME_BYTES {
+            let mut prefix = [0; NAME_BYTES];
+            let old = self.pending.len();
+            let take = data.len().min(NAME_BYTES - old);
+            prefix[..old].copy_from_slice(&self.pending);
+            prefix[old..old + take].copy_from_slice(&data[..take]);
+            if irrelevant_header(&prefix[..old + take]) {
+                self.skip_line = true;
+                self.pending.clear();
+                return;
+            }
+        }
+        self.pending.extend_from_slice(data);
     }
 
     /// Signal that the peer closed the connection
@@ -404,6 +447,23 @@ fn scan_head(buf: &[u8], partial: &mut Option<Head>) -> Result<(usize, Option<Re
             }
             _ => {}
         }
+    }
+}
+
+/// An empty prefix or a lone CR might still end the head. Every other prefix
+/// is irrelevant once it cannot start one of the three fields we inspect.
+fn irrelevant_header(prefix: &[u8]) -> bool {
+    let Some(first) = prefix.first() else {
+        return false;
+    };
+    let could_match = |name: &[u8]| {
+        let n = prefix.len().min(name.len());
+        ci_eq(&prefix[..n], &name[..n])
+    };
+    match first | 0x20 {
+        b'c' => !could_match(b"content-length:") && !could_match(b"connection:"),
+        b't' => !could_match(b"transfer-encoding:"),
+        _ => prefix != b"\r",
     }
 }
 

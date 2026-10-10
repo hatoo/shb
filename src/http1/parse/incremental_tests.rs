@@ -4,7 +4,7 @@ use super::*;
 mod reference;
 
 /// Compare every receive boundary, including the first error and metadata
-/// visibility before completion. The oracle retains and reparses whole heads.
+/// visibility before completion. The frozen oracle retains every unfinished line.
 fn compare(data: &[u8], ends: &[usize], head: bool) {
     let mut actual = Parser::new();
     let mut expected = reference::Parser::new();
@@ -191,5 +191,169 @@ fn errors_still_arrive_at_the_end_of_the_invalid_line() {
             assert_eq!(p.feed(&[byte]).unwrap(), 0);
         }
         assert!(p.feed(b"\n").is_err());
+    }
+}
+
+#[test]
+fn partial_field_names_match_reference_at_every_split() {
+    let fields: &[&[u8]] = &[
+        b"",
+        b"\r",
+        b"\r\r",
+        b"\rX",
+        b"c",
+        b"t",
+        b"co",
+        b"con",
+        b"Content-Length",
+        b"Content-Lengthx: -1",
+        b"Content-Length : -1",
+        b"Content-Length: 0",
+        b"CONTENT-LENGTH: -1",
+        b"Connection",
+        b"Connectionx: close",
+        b"cOnNeCtIoN: close",
+        b"connection\x1a close",
+        b"Transfer-Encoding",
+        b"Transfer-Encodingx: chunked",
+        b"Transfer-Encoding: chunked",
+        b"transfer-encoding\x1a gzip; x=\"open",
+        b" no-colon",
+        b"\0\xff\xfe",
+        b"Content-Length\r: -1",
+    ];
+    for &field in fields {
+        let mut wire = b"HTTP/1.1 200\nContent-Length: 0\n".to_vec();
+        wire.extend_from_slice(field);
+        wire.extend_from_slice(b"\r\n\r\n0\r\n\r\n");
+        for head in [false, true] {
+            for a in 0..=wire.len() {
+                for b in a..=wire.len() {
+                    compare(&wire, &[a, b], head);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn each_relevant_name_byte_must_match_before_retaining_values() {
+    for field in [
+        b"content-length: 0".as_slice(),
+        b"connection: close",
+        b"transfer-encoding: chunked",
+    ] {
+        for i in 0..=field.iter().position(|&b| b == b':').unwrap() {
+            for byte in [
+                0,
+                b'\r',
+                0x1a,
+                0xff,
+                b' ',
+                b':',
+                field[i].to_ascii_uppercase(),
+            ] {
+                let mut changed = field.to_vec();
+                changed[i] = byte;
+                let mut wire = b"HTTP/1.1 200\nContent-Length: 0\n".to_vec();
+                wire.extend_from_slice(&changed);
+                wire.extend_from_slice(b"\r\n\r\n0\r\n\r\n");
+                for split in 0..=wire.len() {
+                    compare(&wire, &[split], false);
+                }
+                compare(&wire, &(0..=wire.len()).collect::<Vec<_>>(), false);
+            }
+        }
+    }
+}
+
+#[test]
+fn irrelevant_partial_lines_have_bounded_carry() {
+    for name in [
+        b"X-Long: ".as_slice(),
+        b"Connectionx:",
+        b"Transfer-Encodingx:",
+        b"\r\r",
+    ] {
+        let mut p = Parser::new();
+        p.feed(b"HTTP/1.1 200\nContent-Length: 3\n").unwrap();
+        for &byte in name {
+            assert_eq!(p.feed(&[byte]).unwrap(), 0);
+            assert!(p.pending.len() < b"transfer-encoding:".len());
+        }
+        assert!(p.pending.is_empty());
+        let fragment = vec![b'x'; 16384];
+        for _ in 0..256 {
+            assert_eq!(p.feed(&fragment).unwrap(), 0);
+            assert!(p.pending.is_empty());
+            assert!(p.pending.capacity() <= 32);
+        }
+        // An LF that follows a previously discarded CR still ends only this
+        // field, never the head. EOF cannot complete this partial response.
+        assert_eq!(p.feed(b"\r").unwrap(), 0);
+        assert!(!p.mark_eof());
+        assert_eq!(p.feed(b"\nConnection: close\r\n\r").unwrap(), 0);
+        assert_eq!(
+            p.feed(b"\nabcHTTP/1.1 201\nContent-Length: 0\n\n").unwrap(),
+            2
+        );
+        assert_eq!(p.status(), 201);
+        assert!(p.keep_alive());
+        p.reset();
+        assert_eq!(p.feed(b"HTTP/1.1 204\n\n").unwrap(), 1);
+    }
+    // Even when only the ambiguous name was carried, the receive that
+    // finishes a large irrelevant field must not be copied into pending.
+    let mut p = Parser::new();
+    p.feed(b"HTTP/1.1 204\nTransfer-Encod").unwrap();
+    let mut suffix = b"ingx: ".to_vec();
+    suffix.resize(1048576, b'x');
+    suffix.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(p.feed(&suffix).unwrap(), 1);
+    assert!(p.pending.capacity() <= 32);
+}
+
+#[test]
+fn huge_relevant_fields_preserve_validation_and_reuse() {
+    for (prefix, suffix) in [
+        (b"Content-Length: ".as_slice(), b"\r\n\r\n".as_slice()),
+        (b"Connection: ", b", close\r\nContent-Length: 0\r\n\r\n"),
+        (
+            b"Transfer-Encoding: gzip; q=\"",
+            b"\", chunked\r\n\r\n0\r\n\r\n",
+        ),
+        (b"Transfer-Encoding: gzip; q=\"", b"\r\n\r\n"),
+    ] {
+        let mut wire = b"HTTP/1.1 200\r\n".to_vec();
+        wire.extend_from_slice(prefix);
+        wire.extend(std::iter::repeat_n(b'0', 65536));
+        wire.extend_from_slice(suffix);
+        for width in [53, 16384] {
+            compare(
+                &wire,
+                &(0..wire.len()).step_by(width).collect::<Vec<_>>(),
+                false,
+            );
+        }
+    }
+}
+
+#[test]
+fn arbitrary_partial_header_bytes_match_reference() {
+    for mut seed in 1..=256 {
+        let mut wire = b"HTTP/1.1 200\r\nContent-Length: 0\r\n".to_vec();
+        for _ in 0..(random(&mut seed) % 256) {
+            wire.push(random(&mut seed) as u8);
+        }
+        // Test EOF/reset while a line is skipped as well as when terminated.
+        let mut ends = Vec::new();
+        let mut pos = 0;
+        while pos < wire.len() {
+            pos = (pos + 1 + (random(&mut seed) % 19) as usize).min(wire.len());
+            ends.push(pos);
+        }
+        compare(&wire, &ends, false);
+        wire.extend_from_slice(b"\r\n\r\nHTTP/1.1 201\r\nContent-Length: 0\r\n\r\n");
+        compare(&wire, &ends, false);
     }
 }

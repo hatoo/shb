@@ -28,8 +28,8 @@ fn serve(mut stream: impl Read + Write, head: bool) {
             }
         }
         if i == 6 {
-            wire.extend_from_slice(b"X-Long: ");
-            wire.extend(std::iter::repeat_n(b'x', 65536));
+            wire.extend_from_slice(b"Transfer-Encoding-Extension: ");
+            wire.extend(std::iter::repeat_n(b'x', 1048576));
             wire.extend_from_slice(b"\r\n");
         }
         if i == 4 {

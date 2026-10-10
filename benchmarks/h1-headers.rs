@@ -1,5 +1,5 @@
 //! Replay identical response bytes through the production HTTP/1 parser.
-//! Arguments: fields|line header-bytes receive-bytes repetitions.
+//! Arguments: fields|line|near|connection header-bytes receive-bytes repetitions.
 //! Build both revisions with the same harness, dependency artifacts and release
 //! settings. Input construction, warmup and validation are outside measurement.
 //! Callgrind: --collect-atstart=no --toggle-collect=measured_headers, H1_WARMUPS=0.
@@ -54,7 +54,7 @@ fn main() {
     assert_eq!(
         args.len(),
         5,
-        "fields|line header-bytes receive-bytes repetitions"
+        "fields|line|near|connection header-bytes receive-bytes repetitions"
     );
     let pattern = &args[1];
     let header: usize = args[2].parse().unwrap();
@@ -71,8 +71,12 @@ fn main() {
                     );
                 }
             }
-            "line" => {
-                wire.extend_from_slice(b"X-Long: ");
+            "line" | "near" | "connection" => {
+                wire.extend_from_slice(match pattern.as_str() {
+                    "near" => b"Transfer-Encoding-Extension: ",
+                    "connection" => b"Connection: ",
+                    _ => b"X-Long: ",
+                });
                 wire.resize(header.saturating_sub(4).max(wire.len()), b'x');
                 wire.extend_from_slice(b"\r\n");
             }
