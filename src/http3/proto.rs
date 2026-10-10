@@ -96,7 +96,7 @@ impl ResponseReader {
     }
 
     /// Consume stream data
-    pub fn feed(&mut self, data: &[u8]) -> Result<()> {
+    pub fn feed(&mut self, mut data: &[u8]) -> Result<()> {
         if self.pending.is_empty() {
             let used = self.run(data)?;
             if used < data.len() {
@@ -105,16 +105,48 @@ impl ResponseReader {
             return Ok(());
         }
         let mut buf = std::mem::take(&mut self.pending);
-        buf.extend_from_slice(data);
-        let result = self.run(&buf);
-        match result {
-            Ok(used) => {
-                buf.drain(..used);
-                self.pending = buf;
-                Ok(())
-            }
-            Err(e) => Err(e),
+
+        // Complete the type and the first length byte before inspecting the
+        // length's width. A partial frame header needs at most sixteen bytes;
+        // the rest of this receive may be body data that need not be copied.
+        let kind_len = 1usize << (buf[0] >> 6);
+        if !Self::carry_to(&mut buf, &mut data, kind_len + 1) {
+            self.pending = buf;
+            return Ok(());
         }
+        let header_len = kind_len + (1usize << (buf[kind_len] >> 6));
+        if !Self::carry_to(&mut buf, &mut data, header_len) {
+            self.pending = buf;
+            return Ok(());
+        }
+        let (kind, _) = get_varint(&buf).unwrap();
+        if kind == FRAME_HEADERS {
+            let (len, _) = get_varint(&buf[kind_len..]).unwrap();
+            // QPACK still receives the whole field section, with the same
+            // validation and error timing as a contiguous response.
+            if !Self::carry_to(&mut buf, &mut data, header_len + len as usize) {
+                self.pending = buf;
+                return Ok(());
+            }
+        }
+        let used = self.run(&buf)?;
+        debug_assert_eq!(used, buf.len());
+        buf.clear();
+        if !data.is_empty() {
+            let used = self.run(data)?;
+            buf.extend_from_slice(&data[used..]);
+        }
+        self.pending = buf;
+        Ok(())
+    }
+
+    /// Append only the bytes needed to finish this prefix. Never reserve an
+    /// advertised payload length before those bytes have actually arrived.
+    fn carry_to(buf: &mut Vec<u8>, data: &mut &[u8], end: usize) -> bool {
+        let take = end.saturating_sub(buf.len()).min(data.len());
+        buf.extend_from_slice(&data[..take]);
+        *data = &data[take..];
+        buf.len() >= end
     }
 
     fn run(&mut self, buf: &[u8]) -> Result<usize> {
@@ -164,6 +196,10 @@ impl ResponseReader {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proto/response_tests.rs"]
+mod response_tests;
 
 /// Reader for a peer-opened unidirectional stream
 ///

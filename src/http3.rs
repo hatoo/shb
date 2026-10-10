@@ -13,6 +13,10 @@
 pub mod proto;
 pub mod qpack;
 
+#[cfg(test)]
+#[path = "http3/response_accounting_tests.rs"]
+mod response_accounting_tests;
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, RawFd};
