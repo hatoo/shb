@@ -175,6 +175,14 @@ impl Conn {
     }
 }
 
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // The worker drops its ring before its connections, including when
+        // submission/cancellation fails and it exits without normal teardown.
+        self.close();
+    }
+}
+
 /// Open new streams until the parallelism target or the request budget is hit
 ///
 /// Stops early when start_stream refuses (e.g. the peer's
@@ -227,6 +235,46 @@ fn fill_streams(
     if h2.stream_ids_exhausted() {
         conn.goaway = true;
     }
+}
+
+/// Finish kernel access to this socket and its send storage before reusing the
+/// connection. Closing the raw fd or replacing the fixed slot alone does neither.
+fn retire(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+) -> Result<()> {
+    if conn.fd >= 0 {
+        // Fixed-file SQEs resolve their socket at submission. A partial send
+        // or ENOBUFS rearm queued in this batch must still bind to the old slot.
+        sq.sync();
+        while !sq.is_empty() {
+            match submitter.submit() {
+                Ok(0) => bail!("io_uring made no progress before HTTP/2 socket retirement"),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).context("submit before HTTP/2 socket retirement failed"),
+            }
+            sq.sync();
+        }
+        // Synchronous cancellation (Linux 6.0, like RecvMulti) covers sends,
+        // receives and connects on this slot. A canceled connect also ends its
+        // linked timeout. Do not clear out until a blocked Send has stopped
+        // reading it; consuming an SQE alone is not sufficient.
+        let cancel = types::CancelBuilder::fd(types::Fixed(conn_idx as u32)).all();
+        match submitter.register_sync_cancel(Some(Duration::from_secs(1).into()), cancel) {
+            Ok(()) => {}
+            // Operations may already have completed with CQEs still unreaped.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e).context("cancel retired HTTP/2 I/O failed"),
+        }
+        submitter
+            .register_files_update(conn_idx as u32, &[-1])
+            .context("unregister retired HTTP/2 socket failed")?;
+    }
+    conn.close();
+    Ok(())
 }
 
 /// Move pending h2 output into the send buffer and submit it, unless a send
@@ -511,7 +559,7 @@ pub fn run_worker(
                     fail_connect(&mut stats, &mut started, budget);
                 }
                 conn.fail_inflight(&mut stats);
-                conn.close();
+                retire(&submitter, &mut sq, conn_idx, conn)?;
                 if !stop && budget.may_start(started) {
                     match uring::start_connect(
                         &submitter,
@@ -749,7 +797,7 @@ pub fn run_worker(
                 // A connection that drained after a GOAWAY has nothing in
                 // flight, and may still owe for what it gave back.
                 conn.fail_inflight(&mut stats);
-                conn.close();
+                retire(&submitter, &mut sq, conn_idx, conn)?;
                 if !stop && budget.may_start(started) {
                     match uring::start_connect(
                         &submitter,
@@ -807,7 +855,7 @@ pub fn run_worker(
             conn.sending = conn.out_off < conn.out.len();
         }
     }
-    for conn in &mut conns {
+    for (conn_idx, conn) in conns.iter_mut().enumerate() {
         if conn.connected
             && !conn.sending
             // A connection still in its handshake has said nothing to go away from
@@ -835,7 +883,7 @@ pub fn run_worker(
                 }
             }
         }
-        conn.close();
+        retire(&submitter, &mut sq, conn_idx, conn)?;
     }
 
     Ok(stats)
@@ -947,3 +995,6 @@ mod tests {
 
 #[cfg(test)]
 mod flush_tests;
+
+#[cfg(test)]
+mod lifetime_tests;

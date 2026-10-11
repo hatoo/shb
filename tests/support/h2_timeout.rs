@@ -80,7 +80,7 @@ fn check(tls: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let mut peers = Vec::new();
+        let mut requests = Vec::new();
         for first in [true, false] {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -90,23 +90,17 @@ fn check(tls: bool) {
                 .set_write_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             stream.set_nodelay(true).unwrap();
-            // An outstanding multishot recv can retain the old socket until
-            // the client's ring is dropped. Accept the replacement without
-            // waiting for EOF on that socket.
-            let config = config.clone();
-            peers.push(std::thread::spawn(move || {
-                if let Some(config) = config {
-                    let mut session = rustls::ServerConnection::new(config).unwrap();
-                    serve(rustls::Stream::new(&mut session, &mut stream), first)
-                } else {
-                    serve(stream, first)
-                }
-            }));
+            // Require retirement of the timed-out socket before answering
+            // its replacement. A live old multishot receive would pin it
+            // until worker teardown and prevent this run from succeeding.
+            requests.push(if let Some(config) = &config {
+                let mut session = rustls::ServerConnection::new(config.clone()).unwrap();
+                serve(rustls::Stream::new(&mut session, &mut stream), first)
+            } else {
+                serve(stream, first)
+            });
         }
-        peers
-            .into_iter()
-            .map(|peer| peer.join().unwrap())
-            .collect::<Vec<_>>()
+        requests
     });
     let scheme = if tls { "https" } else { "http" };
     let report = super::shb_json(&[
