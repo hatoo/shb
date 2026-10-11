@@ -111,6 +111,8 @@ pub struct TlsSession {
     conn: ClientConnection,
     /// Plaintext rustls would not take yet, offered again on every flush
     pending_plaintext: Vec<u8>,
+    /// Prefix already accepted by rustls; keep the remaining bytes in place
+    pending_pos: usize,
     /// Whether the peer's close_notify has arrived
     peer_closed: bool,
 }
@@ -121,6 +123,7 @@ impl TlsSession {
             conn: ClientConnection::new(setup.config.clone(), setup.server_name.clone())
                 .context("failed to create TLS session")?,
             pending_plaintext: Vec::new(),
+            pending_pos: 0,
             peer_closed: false,
         })
     }
@@ -196,6 +199,19 @@ impl TlsSession {
     /// on every flush and so runs as the handshake completes and as ciphertext
     /// leaves.
     pub fn write_plaintext(&mut self, data: &[u8]) -> Result<()> {
+        // Reclaim a consumed prefix only when an append needs room and at
+        // least half the buffer has been consumed. Each byte moved can then
+        // be charged to a consumed byte, even with frequent small appends.
+        // A large request drained in bounded rustls writes never moves its
+        // remaining suffix after each write.
+        let remaining = self.pending_plaintext.len() - self.pending_pos;
+        if data.len() > self.pending_plaintext.capacity() - self.pending_plaintext.len()
+            && self.pending_pos >= remaining
+        {
+            self.pending_plaintext.copy_within(self.pending_pos.., 0);
+            self.pending_plaintext.truncate(remaining);
+            self.pending_pos = 0;
+        }
         self.pending_plaintext.extend_from_slice(data);
         self.push_plaintext()
     }
@@ -206,12 +222,16 @@ impl TlsSession {
             let n = self
                 .conn
                 .writer()
-                .write(&self.pending_plaintext)
+                .write(&self.pending_plaintext[self.pending_pos..])
                 .context("TLS plaintext write failed")?;
             if n == 0 {
                 break;
             }
-            self.pending_plaintext.drain(..n);
+            self.pending_pos += n;
+            if self.pending_pos == self.pending_plaintext.len() {
+                self.pending_plaintext.clear();
+                self.pending_pos = 0;
+            }
         }
         Ok(())
     }
@@ -230,6 +250,7 @@ impl TlsSession {
     /// come out of the next ciphertext drain like anything else.
     pub fn send_close_notify(&mut self) {
         self.pending_plaintext.clear();
+        self.pending_pos = 0;
         self.conn.send_close_notify();
     }
 
@@ -269,6 +290,10 @@ impl TlsSession {
         self.conn.alpn_protocol()
     }
 }
+
+#[cfg(test)]
+#[path = "tls/backlog_tests.rs"]
+mod backlog_tests;
 
 #[cfg(test)]
 mod tests {
