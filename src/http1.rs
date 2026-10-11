@@ -14,6 +14,10 @@ mod header_tests;
 #[path = "http1/idle_tests.rs"]
 mod idle_tests;
 
+#[cfg(test)]
+#[path = "http1/lifetime_tests.rs"]
+mod lifetime_tests;
+
 use crate::clock::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -104,6 +108,7 @@ impl Conn {
         }
     }
 
+    /// Reset after retire has stopped all kernel access, or after ring teardown.
     fn close(&mut self) {
         if self.fd >= 0 {
             self.send_close_notify();
@@ -176,6 +181,56 @@ impl Conn {
             self.request_start = Instant::now();
         }
     }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // The worker drops its ring before its connections, including when
+        // submission/cancellation fails and it exits without normal teardown.
+        self.close();
+    }
+}
+
+/// Finish kernel access to this socket and its send storage before reusing the
+/// connection. Closing the raw fd or replacing the fixed slot alone does neither.
+fn retire(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+) -> Result<()> {
+    if conn.fd >= 0 {
+        // Fixed-file SQEs resolve their socket at submission. A partial send
+        // or ENOBUFS rearm queued in this batch must still bind to the old slot.
+        sq.sync();
+        while !sq.is_empty() {
+            match submitter.submit() {
+                Ok(0) => bail!("io_uring made no progress before HTTP/1.1 socket retirement"),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).context("submit before HTTP/1.1 socket retirement failed"),
+            }
+            sq.sync();
+        }
+        // Synchronous cancellation (Linux 6.0, like RecvMulti) covers sends,
+        // receives and connects on this slot. A canceled connect also ends its
+        // linked timeout. Do not clear out until a blocked Send has stopped
+        // reading it; consuming an SQE alone is not sufficient.
+        let cancel = types::CancelBuilder::fd(types::Fixed(conn_idx as u32)).all();
+        match submitter.register_sync_cancel(Some(Duration::from_secs(1).into()), cancel) {
+            Ok(()) => {}
+            // Operations may already have completed with CQEs still unreaped.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e).context("cancel retired HTTP/1.1 I/O failed"),
+        }
+        submitter
+            .register_files_update(conn_idx as u32, &[-1])
+            .context("unregister retired HTTP/1.1 socket failed")?;
+    }
+    // Keep sending set through close: a canceled partial TLS record must not
+    // be followed by close_notify, which would splice an alert into ciphertext.
+    conn.close();
+    Ok(())
 }
 
 /// Queue the request bytes for sending on this connection
@@ -308,8 +363,8 @@ pub fn run_worker(
     let mut ring = uring::build_worker_ring(connections)?;
     // Kept alive so that enter can use the registered ring fd; submitter, sq
     // and cq are disjoint borrows, and the ring is not touched from here on
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, connections, &buf_ring)?;
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, connections, &buf_ring)?;
 
     // The sockaddr / Timespec referenced by Connect SQEs must stay at a stable
     // address until completion
@@ -369,7 +424,7 @@ pub fn run_worker(
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
                 if conn.deadline.is_some_and(|d| now >= d) {
                     conn.fail_request(&mut stats);
-                    conn.close();
+                    retire(&submitter, &mut sq, conn_idx, conn)?;
                     conn.parser.reset();
                     if stop || !budget.may_start(started) {
                         continue;
@@ -586,7 +641,7 @@ pub fn run_worker(
                         queue_request(conn, &target.request_bytes)?;
                         flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                     } else {
-                        conn.close();
+                        retire(&submitter, &mut sq, conn_idx, conn)?;
                         conn.parser.reset();
                         match uring::start_connect(
                             &submitter,
@@ -605,7 +660,7 @@ pub fn run_worker(
                         }
                     }
                 } else if !keep_conn {
-                    conn.close();
+                    retire(&submitter, &mut sq, conn_idx, conn)?;
                 }
             }
         }
@@ -615,8 +670,8 @@ pub fn run_worker(
         }
     }
 
-    for conn in &mut conns {
-        conn.close();
+    for (conn_idx, conn) in conns.iter_mut().enumerate() {
+        retire(&submitter, &mut sq, conn_idx, conn)?;
     }
 
     Ok(stats)

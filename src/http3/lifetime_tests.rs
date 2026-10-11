@@ -47,9 +47,10 @@ impl Fixture {
         } else {
             uring::build_worker_ring(1).unwrap()
         };
-        let (mut submitter, _, _) = ring.split();
-        uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+        let (submitter, _, _) = ring.split();
+        let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
         submitter.register_files_update(0, &[conn.fd]).unwrap();
+        drop(submitter);
         Self {
             ring,
             msg,
