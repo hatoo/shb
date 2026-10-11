@@ -24,10 +24,24 @@ impl Drop for Server {
 }
 
 pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
+    server_with_body(vec![b'x'; body_len], stream_window, stop_body)
+}
+
+pub fn server_with_body(body: Vec<u8>, stream_window: u32, stop_body: bool) -> Server {
+    server_with_windows(body, stream_window, 4096, stop_body)
+}
+
+pub fn server_with_windows(
+    body: Vec<u8>,
+    stream_window: u32,
+    connection_window: u32,
+    stop_body: bool,
+) -> Server {
     let (tx, rx) = std::sync::mpsc::channel();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let completed = Arc::new(AtomicUsize::new(0));
     let finished = completed.clone();
+    let expected = Arc::new(body);
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -50,7 +64,7 @@ pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
             let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls)).unwrap();
             let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             let mut transport = quinn::TransportConfig::default();
-            transport.receive_window(quinn::VarInt::from_u32(4096));
+            transport.receive_window(quinn::VarInt::from_u32(connection_window));
             transport.stream_receive_window(quinn::VarInt::from_u32(stream_window));
             config.transport_config(Arc::new(transport));
             let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -58,6 +72,7 @@ pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
             let serve = async {
                 while let Some(incoming) = endpoint.accept().await {
                     let finished = finished.clone();
+                    let expected = expected.clone();
                     tokio::spawn(async move {
                         let Ok(conn) = incoming.await else { return };
                         let Ok(mut conn) = h3::server::Connection::<_, bytes::Bytes>::new(
@@ -69,6 +84,7 @@ pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
                         };
                         while let Ok(Some(resolver)) = conn.accept().await {
                             let finished = finished.clone();
+                            let expected = expected.clone();
                             tokio::spawn(async move {
                                 let Ok((request, mut stream)) = resolver.resolve_request().await
                                 else {
@@ -95,7 +111,7 @@ pub fn server(body_len: usize, stream_window: u32, stop_body: bool) -> Server {
                                     }
                                 }
                                 let valid = request.method() == http::Method::POST
-                                    && (stop_body || received == vec![b'x'; body_len]);
+                                    && (stop_body || received == *expected);
                                 let status = if valid { 200 } else { 400 };
                                 if stream
                                     .send_response(
@@ -216,13 +232,23 @@ fn relay(upstream: SocketAddr, late_duplicate: bool) -> Relay {
 
 #[cfg(test)]
 fn exercise(late_duplicate: bool, body_len: usize, stream_window: u32, parallel: usize) {
-    let server = server(body_len, stream_window, false);
+    exercise_body(
+        late_duplicate,
+        vec![b'x'; body_len],
+        stream_window,
+        parallel,
+    );
+}
+
+#[cfg(test)]
+fn exercise_body(late_duplicate: bool, body: Vec<u8>, stream_window: u32, parallel: usize) {
+    let server = server_with_body(body.clone(), stream_window, false);
     let relay = relay(server.addr, late_duplicate);
     let target = crate::target::parse_target(
         &format!("https://{}/", relay.addr),
         "POST",
         &[],
-        Some(&vec![b'x'; body_len]),
+        Some(&body),
         false,
     )
     .unwrap();
@@ -269,6 +295,60 @@ fn h3_flushes_bodies_larger_than_both_windows_after_packet_loss() {
 #[test]
 fn h3_flushes_blocked_bodies_with_reordering_and_late_duplicates() {
     exercise(true, 65_543, 2048, 4);
+}
+
+/// Each suffix differs, so an incorrect cursor cannot hide behind repeated bytes.
+pub fn patterned_body(len: usize) -> Vec<u8> {
+    let mut state = 0xa73d_c91b_0e62_f845_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+#[test]
+fn h3_preserves_patterned_body_offsets_after_loss_and_reordered_duplicates() {
+    exercise_body(true, patterned_body(65_543), 2048, 8);
+}
+
+#[test]
+fn h3_preserves_patterned_body_offsets_over_many_credit_updates() {
+    exercise_body(false, patterned_body(262_151), 2048, 4);
+}
+
+#[test]
+fn h3_shares_patterned_body_across_many_flow_controlled_streams() {
+    let body = patterned_body(65_543);
+    let server = server_with_windows(body.clone(), 2048, 1 << 24, false);
+    let target = crate::target::parse_target(
+        &format!("https://{}/", server.addr),
+        "POST",
+        &[],
+        Some(&body),
+        false,
+    )
+    .unwrap();
+    let stats = crate::http3::run_worker(
+        &target,
+        1,
+        crate::budget::Budget::Requests(128),
+        Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        64,
+    )
+    .unwrap();
+    assert_eq!(
+        (stats.completed, stats.errors, stats.connect_errors),
+        (128, 0, 0)
+    );
+    assert_eq!(stats.latencies_ns.len(), 128);
+    assert_eq!(stats.status_counts[200], 128);
+    assert_eq!(stats.status_counts.iter().sum::<u64>(), 128);
+    assert_eq!(server.completed.load(Ordering::SeqCst), 128);
 }
 
 #[test]
