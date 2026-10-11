@@ -384,6 +384,18 @@ fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats, started:
     }
 }
 
+/// Failed connection attempts consume an unassigned request so an unreachable
+/// peer cannot keep a counted run open forever. Attempts do not reserve one:
+/// another connection may have opened every remaining request before this
+/// failure arrived. Those live requests still need their responses measured.
+fn fail_connect(stats: &mut Stats, started: &mut u64, budget: Budget) {
+    if budget.may_start(*started) {
+        stats.errors += 1;
+        stats.connect_errors += 1;
+        *started += 1;
+    }
+}
+
 /// Benchmark loop of a single HTTP/2 worker thread
 ///
 /// On http:// speaks h2c with prior knowledge (no Upgrade dance): the client
@@ -496,9 +508,7 @@ pub fn run_worker(
                 if conn.streams.is_empty() && conn.held == 0 {
                     // It carried nothing at all: a connect that did not work
                     // out, which is what it costs the budget
-                    stats.errors += 1;
-                    stats.connect_errors += 1;
-                    started += 1;
+                    fail_connect(&mut stats, &mut started, budget);
                 }
                 conn.fail_inflight(&mut stats);
                 conn.close();
@@ -547,9 +557,7 @@ pub fn run_worker(
                 OP_CONNECT => {
                     if res < 0 {
                         // e.g. ECONNREFUSED, or ECANCELED when the LinkTimeout fired
-                        stats.errors += 1;
-                        stats.connect_errors += 1;
-                        started += 1;
+                        fail_connect(&mut stats, &mut started, budget);
                         conn_broken = true;
                     } else {
                         let conn = &mut conns[conn_idx];
@@ -676,9 +684,7 @@ pub fn run_worker(
                                             h2.initiate();
                                         } else {
                                             warn_once(NO_H2);
-                                            stats.errors += 1;
-                                            stats.connect_errors += 1;
-                                            started += 1;
+                                            fail_connect(&mut stats, &mut started, budget);
                                             conn_broken = true;
                                         }
                                     }
@@ -737,9 +743,7 @@ pub fn run_worker(
                 // counted run against such a server ends rather than
                 // connecting again for ever
                 if conn.tls.as_ref().is_some_and(TlsSession::is_handshaking) {
-                    stats.errors += 1;
-                    stats.connect_errors += 1;
-                    started += 1;
+                    fail_connect(&mut stats, &mut started, budget);
                 }
                 // Whatever was still in flight is lost with the connection.
                 // A connection that drained after a GOAWAY has nothing in
@@ -836,6 +840,9 @@ pub fn run_worker(
 
     Ok(stats)
 }
+
+#[cfg(test)]
+mod budget_tests;
 
 #[cfg(test)]
 mod timeout_tests;
