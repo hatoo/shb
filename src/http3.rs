@@ -1251,8 +1251,41 @@ fn finish_close(
     retired: &mut Vec<Retired>,
     recv_msg: &libc::msghdr,
 ) -> Result<()> {
+    // Fixed-file SQEs resolve their socket at submission, not when queued.
+    // Bind every pending receive/send to the old slot before replacing it,
+    // including a receive rearmed earlier in this completion batch.
+    sq.sync();
+    while !sq.is_empty() {
+        match submitter.submit() {
+            Ok(0) => bail!("io_uring made no progress before socket retirement"),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("submit before socket retirement failed"),
+        }
+        sq.sync();
+    }
+    if conn.recv_armed {
+        // Replacing the slot does not cancel a submitted multishot receive:
+        // it would keep the old socket alive until the entire worker exits.
+        // Synchronous cancellation (6.0, like RecvMsgMulti) bounds retention
+        // without a queue of retired sockets or a second completion identity.
+        let cancel = io_uring::types::CancelBuilder::user_data(uring::user_data(
+            conn_idx,
+            conn.generation,
+            OP_RECV,
+        ));
+        match submitter.register_sync_cancel(Some(CLOSE_GRACE.into()), cancel) {
+            Ok(()) => {}
+            // A terminal CQE may already be queued but not yet reaped.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e).context("cancel retired UDP receive failed"),
+        }
+    }
     conn.close(conn_idx, retired);
     if stop || !budget.may_start(*started) {
+        submitter
+            .register_files_update(conn_idx as u32, &[-1])
+            .context("unregister retired UDP socket failed")?;
         return Ok(());
     }
     conn.fd = uring::make_udp_socket(&target.addr)?;
@@ -1406,3 +1439,7 @@ mod tests {
         assert_eq!((started, stats.errors), (992, 32));
     }
 }
+
+#[cfg(test)]
+#[path = "http3/lifetime_tests.rs"]
+mod lifetime_tests;

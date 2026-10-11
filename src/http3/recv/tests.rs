@@ -324,8 +324,9 @@ fn a_queued_old_generation_keeps_its_template_until_submission_and_recycles_stal
     conn.close(0, &mut retired);
     assert_eq!(conn.generation, 1);
     assert_eq!((&*msg) as *const libc::msghdr, address);
-    // Replace the registered socket before the old SQE is submitted, just as
-    // an immediate reconnect can do. Both generations share the live template.
+    // Deliberately bypass finish_close's submission/cancellation barrier to
+    // exercise the template's lifetime across an unsafe fixed-slot replacement.
+    // Both generations still share the live template.
     let (sender, receiver) = socket_pair("127.0.0.1:0", true);
     conn.fd = receiver.into_raw_fd();
     submitter.register_files_update(0, &[conn.fd]).unwrap();
