@@ -248,6 +248,18 @@ pub fn make_udp_socket(addr: &SocketAddr) -> Result<RawFd> {
     // net.core.{r,w}mem_max); best effort
     let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+    // Optional: the H3 recvmsg path also understands ordinary UDP delivery
+    // when the kernel or socket does not support receive coalescing.
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            libc::IPPROTO_UDP,
+            libc::UDP_GRO,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        );
+    }
     socket
         .connect(&socket2::SockAddr::from(*addr))
         .context("UDP connect failed")?;
@@ -500,6 +512,22 @@ pub fn push_recv_multi(
     generation: u64,
 ) -> Result<()> {
     let entry = opcode::RecvMulti::new(types::Fixed(conn_idx as u32), BUF_GROUP)
+        .build()
+        .user_data(user_data(conn_idx, generation, OP_RECV));
+    push_sqe(submitter, sq, entry)
+}
+
+/// Arm a UDP multishot receive including ancillary data. The immutable
+/// template must stay at a stable address until the SQE is submitted; the H3
+/// worker keeps it until its ring is destroyed, including across reconnects.
+pub fn push_recvmsg_multi(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    generation: u64,
+    msg: &libc::msghdr,
+) -> Result<()> {
+    let entry = opcode::RecvMsgMulti::new(types::Fixed(conn_idx as u32), msg, BUF_GROUP)
         .build()
         .user_data(user_data(conn_idx, generation, OP_RECV));
     push_sqe(submitter, sq, entry)

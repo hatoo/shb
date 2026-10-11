@@ -1310,153 +1310,9 @@ fn h2_says_when_the_server_does_not_negotiate_h2() {
 // Against quinn + h3 with a self-signed certificate.
 // ------------------------------------------------------------------------
 
-/// Bound address of the shared HTTP/3 (QUIC) test server
-fn h3_server_addr() -> SocketAddr {
-    static SERVER: OnceLock<SocketAddr> = OnceLock::new();
-    *SERVER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            rt.block_on(async move {
-                let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-                    .expect("self-signed cert");
-                let cert = certified.cert.der().clone();
-                let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
-                    certified.signing_key.serialize_der(),
-                );
-                let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-                let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-                    .with_safe_default_protocol_versions()
-                    .expect("tls versions")
-                    .with_no_client_auth()
-                    .with_single_cert(vec![cert], key.into())
-                    .expect("server cert");
-                tls.alpn_protocols = vec![b"h3".to_vec()];
-                let quic_config =
-                    quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls))
-                        .expect("quic server config");
-                let mut server_config =
-                    quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_config));
-                // Windows small enough that a large request body cannot go out
-                // in one go: the client has to send what fits, stop, and carry
-                // on as credit arrives. Left at quinn's defaults, which are
-                // megabytes, nothing here would ever block.
-                let mut transport = quinn::TransportConfig::default();
-                transport.receive_window(quinn::VarInt::from_u32(64 * 1024));
-                transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024));
-                server_config.transport_config(std::sync::Arc::new(transport));
-                let endpoint =
-                    quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("addr"))
-                        .expect("quic endpoint");
-                tx.send(endpoint.local_addr().expect("local addr"))
-                    .expect("send addr");
-                while let Some(incoming) = endpoint.accept().await {
-                    tokio::spawn(async move {
-                        let Ok(conn) = incoming.await else { return };
-                        let Ok(mut h3_conn) =
-                            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
-                        else {
-                            return;
-                        };
-                        while let Ok(Some(resolver)) = h3_conn.accept().await {
-                            tokio::spawn(async move {
-                                let Ok((request, mut stream)) = resolver.resolve_request().await
-                                else {
-                                    return;
-                                };
-                                // A response that takes longer than a run is
-                                // willing to wait for
-                                if request.uri().path() == "/slow" {
-                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                }
-                                // Drain the request body for the echo check
-                                let mut req_body = Vec::new();
-                                while let Ok(Some(mut chunk)) = stream.recv_data().await {
-                                    use bytes::Buf;
-                                    while chunk.has_remaining() {
-                                        let c = chunk.chunk().to_vec();
-                                        let n = c.len();
-                                        req_body.extend_from_slice(&c);
-                                        chunk.advance(n);
-                                    }
-                                }
-                                // Same rule as the axum server: a body too
-                                // large to name in a header says how long it
-                                // should be
-                                let want_len = request
-                                    .headers()
-                                    .get("x-body-len")
-                                    .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-                                    .and_then(|v| v.parse::<usize>().ok());
-                                let echo = request
-                                    .headers()
-                                    .get("x-echo")
-                                    .map(|v| v.as_bytes().to_vec());
-                                // Same rule as the axum server: a request that
-                                // names its method proves the method arrived
-                                let expect = request
-                                    .headers()
-                                    .get("x-expect-method")
-                                    .map(|v| v.as_bytes().to_vec());
-                                let (status, body) = match echo {
-                                    _ if want_len == Some(req_body.len()) => {
-                                        (http::StatusCode::OK, "body complete")
-                                    }
-                                    _ if want_len.is_some() => {
-                                        (http::StatusCode::BAD_REQUEST, "body truncated")
-                                    }
-                                    Some(ref e) if *e != req_body => {
-                                        (http::StatusCode::BAD_REQUEST, "")
-                                    }
-                                    None if !req_body.is_empty() => {
-                                        (http::StatusCode::BAD_REQUEST, "")
-                                    }
-                                    _ if expect.is_some() => {
-                                        if expect.as_deref()
-                                            == Some(request.method().as_str().as_bytes())
-                                        {
-                                            (http::StatusCode::OK, "method matched")
-                                        } else {
-                                            (http::StatusCode::CONFLICT, "method mismatch")
-                                        }
-                                    }
-                                    _ => match *request.method() {
-                                        http::Method::GET | http::Method::HEAD => {
-                                            (http::StatusCode::OK, "hello world")
-                                        }
-                                        http::Method::POST => {
-                                            (http::StatusCode::CREATED, "created")
-                                        }
-                                        http::Method::DELETE => (http::StatusCode::NO_CONTENT, ""),
-                                        _ => (http::StatusCode::METHOD_NOT_ALLOWED, ""),
-                                    },
-                                };
-                                let response = http::Response::builder()
-                                    .status(status)
-                                    .body(())
-                                    .expect("response");
-                                if stream.send_response(response).await.is_err() {
-                                    return;
-                                }
-                                if !body.is_empty() {
-                                    let _ = stream
-                                        .send_data(bytes::Bytes::from_static(body.as_bytes()))
-                                        .await;
-                                }
-                                let _ = stream.finish().await;
-                            });
-                        }
-                    });
-                }
-            });
-        });
-        rx.recv().expect("h3 server startup")
-    })
-}
+#[path = "support/h3_server.rs"]
+mod h3_server;
+use h3_server::h3_server_addr;
 
 #[test]
 fn h3_get() {
@@ -2050,4 +1906,85 @@ fn h3_probes_for_a_handshake_flight_that_does_not_arrive() {
         &url,
     ]);
     assert_all_ok(&report, 4, "200");
+}
+
+#[test]
+fn h3_without_kernel_gro_support_preserves_success_and_timeout_accounting() {
+    use std::os::unix::process::CommandExt;
+    let addr = h3_server_addr();
+    for (path, ok, errors, timeout) in [("/", 100, 0, "2s"), ("/slow", 0, 100, "50ms")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shb"));
+        cmd.args([
+            "--http3",
+            "-j",
+            "-n",
+            "100",
+            "-c",
+            "2",
+            "-t",
+            "1",
+            "-p",
+            "32",
+            "--timeout",
+            timeout,
+        ])
+        .arg(format!("https://{addr}{path}"));
+        unsafe {
+            cmd.pre_exec(|| {
+                // seccomp_data: nr at 0, args[1] (level) at 24, args[2]
+                // (option) at 32. Filter only these low 32-bit int arguments.
+                let stmt = |code, k| libc::sock_filter {
+                    code,
+                    jt: 0,
+                    jf: 0,
+                    k,
+                };
+                let jump = |k, jf| libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf,
+                    k,
+                };
+                let mut filter = [
+                    stmt(0x20, 0),
+                    jump(libc::SYS_setsockopt as u32, 5),
+                    stmt(0x20, 24),
+                    jump(libc::IPPROTO_UDP as u32, 3),
+                    stmt(0x20, 32),
+                    jump(libc::UDP_GRO as u32, 1),
+                    stmt(0x06, libc::SECCOMP_RET_ERRNO | libc::ENOPROTOOPT as u32),
+                    stmt(0x06, libc::SECCOMP_RET_ALLOW),
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as _,
+                    filter: filter.as_mut_ptr(),
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER,
+                        0,
+                        &program,
+                    ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = cmd.output().expect("run without UDP_GRO");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["requests"]["total"], 100, "{report}");
+        assert_eq!(report["requests"]["ok"], ok, "{report}");
+        assert_eq!(report["requests"]["errors"], errors, "{report}");
+        assert_eq!(report["requests"]["connectErrors"], 0, "{report}");
+        if ok > 0 {
+            assert_all_ok(&report, ok, "200");
+        }
+    }
 }

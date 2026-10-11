@@ -32,13 +32,20 @@ pub struct BufRing {
     mask: u16,
     /// Local shadow of the tail; publish stores it to the shared area with Release
     tail: u16,
-    /// Contiguous data buffer of entries * RECV_BUF_SIZE bytes (must never reallocate)
+    buffer_size: usize,
+    /// Contiguous data buffer of entries * buffer_size bytes (must never reallocate)
     data: Vec<u8>,
 }
 
 impl BufRing {
     pub fn new(entries: u16) -> Result<Self> {
+        Self::with_buffer_size(entries, RECV_BUF_SIZE)
+    }
+
+    /// Protocol-specific capacity; TCP workers keep their existing 16 KiB buffers.
+    pub fn with_buffer_size(entries: u16, buffer_size: usize) -> Result<Self> {
         assert!(entries.is_power_of_two());
+        assert!(buffer_size > 0 && buffer_size <= u32::MAX as usize);
         let layout = std::alloc::Layout::from_size_align(
             entries as usize * mem::size_of::<types::BufRingEntry>(),
             4096,
@@ -54,7 +61,8 @@ impl BufRing {
             entries,
             mask: entries - 1,
             tail: 0,
-            data: vec![0u8; entries as usize * RECV_BUF_SIZE],
+            buffer_size,
+            data: vec![0u8; entries as usize * buffer_size],
         };
         // Seed the ring with every buffer
         for bid in 0..entries {
@@ -68,8 +76,8 @@ impl BufRing {
         let idx = (self.tail & self.mask) as usize;
         unsafe {
             let entry = &mut *self.ring_ptr.add(idx);
-            entry.set_addr(self.data.as_ptr() as u64 + bid as u64 * RECV_BUF_SIZE as u64);
-            entry.set_len(RECV_BUF_SIZE as u32);
+            entry.set_addr(self.data.as_ptr() as u64 + bid as u64 * self.buffer_size as u64);
+            entry.set_len(self.buffer_size as u32);
             entry.set_bid(bid);
         }
         self.tail = self.tail.wrapping_add(1);
@@ -85,14 +93,16 @@ impl BufRing {
 
     /// Borrow the data of the buffer reported by a CQE
     pub fn data(&self, bid: u16, len: usize) -> &[u8] {
-        let off = bid as usize * RECV_BUF_SIZE;
+        assert!(bid < self.entries && len <= self.buffer_size);
+        let off = bid as usize * self.buffer_size;
         &self.data[off..off + len]
     }
 
     /// Mutably borrow a completed receive buffer before returning it to the
     /// kernel. Useful for protocols such as QUIC which decrypt in place.
     pub fn data_mut(&mut self, bid: u16, len: usize) -> &mut [u8] {
-        let off = bid as usize * RECV_BUF_SIZE;
+        assert!(bid < self.entries && len <= self.buffer_size);
+        let off = bid as usize * self.buffer_size;
         &mut self.data[off..off + len]
     }
 
