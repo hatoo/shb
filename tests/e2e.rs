@@ -1478,6 +1478,35 @@ fn h3_method_is_sent_to_the_server() {
 }
 
 #[test]
+fn h3_refused_connections_preserve_the_exact_request_budget() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let url = format!("https://{}/", socket.local_addr().unwrap());
+    drop(socket);
+    // Cross the completion batch boundary and cover budgets smaller than
+    // the connection count, uneven worker splits, and reconnects.
+    for (requests, connections, threads) in [(1, 8, 1), (129, 129, 1), (257, 32, 3)] {
+        let report = shb_json(&[
+            "--http3",
+            "-n",
+            &requests.to_string(),
+            "-c",
+            &connections.to_string(),
+            "-t",
+            &threads.to_string(),
+            "--connect-timeout",
+            "1s",
+            &url,
+        ]);
+        assert_eq!(report["requests"]["total"], requests, "{report}");
+        assert_eq!(report["requests"]["errors"], requests, "{report}");
+        assert_eq!(report["requests"]["connectErrors"], requests, "{report}");
+        assert_eq!(report["requests"]["ok"], 0, "{report}");
+        assert_eq!(report["statusCodes"], serde_json::json!({}));
+        assert!(report["latencySeconds"].is_null());
+    }
+}
+
+#[test]
 fn h3_custom_header_and_body() {
     let addr = h3_server_addr();
     let url = format!("https://127.0.0.1:{}/", addr.port());
