@@ -341,6 +341,30 @@ pub fn build_worker_ring(connections: usize) -> Result<IoUring> {
     build_ring(entries)
 }
 
+/// Own the thread's registered ring reference. Submitter itself does not
+/// unregister it on drop, so closing IoUring alone can leave the kernel ring
+/// and its operations alive after the worker has freed their buffers.
+pub struct WorkerSubmitter<'ring>(Submitter<'ring>);
+
+impl<'ring> std::ops::Deref for WorkerSubmitter<'ring> {
+    type Target = Submitter<'ring>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for WorkerSubmitter<'_> {
+    fn drop(&mut self) {
+        // Registration is optional; EINVAL means it was never registered.
+        while self
+            .0
+            .unregister_ring_fd()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
+        {}
+    }
+}
+
 /// Register what a worker's ring needs, once it has been split
 ///
 /// The ring fd, so each enter skips an fdget and fput (5.18+; behaviour is
@@ -348,12 +372,13 @@ pub fn build_worker_ring(connections: usize) -> Result<IoUring> {
 /// its fd as `types::Fixed(conn_idx)` and skips per-operation refcounting. And
 /// the provided buffer ring the multishot receives fill from (5.19+, and
 /// RecvMulti itself needs 6.0+).
-pub fn register_worker(
-    submitter: &mut Submitter<'_>,
+pub fn register_worker<'ring>(
+    submitter: Submitter<'ring>,
     connections: usize,
     buf_ring: &BufRing,
-) -> Result<()> {
-    let _ = submitter.register_ring_fd();
+) -> Result<WorkerSubmitter<'ring>> {
+    let mut submitter = WorkerSubmitter(submitter);
+    let _ = submitter.0.register_ring_fd();
     submitter
         .register_files_sparse(connections as u32)
         .context("register_files_sparse failed")?;
@@ -365,7 +390,7 @@ pub fn register_worker(
             .register_buf_ring_with_flags(buf_ring.ring_ptr as u64, buf_ring.entries, BUF_GROUP, 0)
             .context("register_buf_ring failed")?;
     }
-    Ok(())
+    Ok(submitter)
 }
 
 /// Arm the deadline a duration-mode run ends on, which is how the workers
@@ -536,6 +561,51 @@ pub fn push_recvmsg_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_ring_registration_drops_on_error_before_its_buffers() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        // Keep the thread alive after every return. Thread exit would release
+        // a leaked registered ring and hide the missing teardown.
+        for _ in 0..32 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let buffers = BufRing::new(8).unwrap();
+            let result: Result<()> = (|| {
+                let mut ring = build_worker_ring(1)?;
+                let (submitter, mut sq, _) = ring.split();
+                let mut submitter = register_worker(submitter, 1, &buffers)?;
+                // Registration must remain available through all iterations.
+                // A missing guard fills the thread's small registered-ring table.
+                assert_eq!(
+                    submitter.0.register_ring_fd().unwrap_err().raw_os_error(),
+                    Some(libc::EEXIST),
+                );
+                submitter.register_files_update(0, &[client.as_raw_fd()])?;
+                push_recv_multi(&submitter, &mut sq, 0, 0)?;
+                sq.sync();
+                submitter.submit()?;
+                drop(client);
+                anyhow::bail!("injected worker error")
+            })();
+            assert_eq!(result.unwrap_err().to_string(), "injected worker error");
+            let mut byte = [0];
+            loop {
+                match peer.read(&mut byte) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => {
+                        assert_eq!(result.unwrap(), 0, "ring retained the socket");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     /// The three fields share one u64, so each has to come back out of it
     /// unchanged at the far end of its budget

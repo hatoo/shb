@@ -489,8 +489,8 @@ pub fn run_worker(
     let mut ring = uring::build_worker_ring(connections)?;
     // Kept alive so that enter can use the registered ring fd; submitter, sq
     // and cq are disjoint borrows, and the ring is not touched from here on
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, connections, &buf_ring)?;
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, connections, &buf_ring)?;
 
     // The sockaddr / Timespec referenced by Connect SQEs must stay at a stable
     // address until completion

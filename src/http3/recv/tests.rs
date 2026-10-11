@@ -183,8 +183,8 @@ fn kernel_gro_and_plain_udp_preserve_datagrams_and_recycle_buffers_ipv4_ipv6() {
             let mut buffers = BufRing::with_buffer_size(8, BUFFER_SIZE).unwrap();
             let msg = template();
             let mut ring = uring::build_worker_ring(1).unwrap();
-            let (mut submitter, mut sq, mut cq) = ring.split();
-            uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+            let (submitter, mut sq, mut cq) = ring.split();
+            let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
             submitter
                 .register_files_update(0, &[receiver.as_raw_fd()])
                 .unwrap();
@@ -257,8 +257,8 @@ fn exhausted_multishot_rearms_once_and_delivers_every_datagram_after_recycling()
     let msg = template();
     let mut conn = Conn::new();
     let mut ring = uring::build_worker_ring(1).unwrap();
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
     submitter
         .register_files_update(0, &[receiver.as_raw_fd()])
         .unwrap();
@@ -317,8 +317,8 @@ fn a_queued_old_generation_keeps_its_template_until_submission_and_recycles_stal
     conn.fd = receiver.into_raw_fd();
     let mut retired = Vec::new();
     let mut ring = uring::build_worker_ring(1).unwrap();
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
     submitter.register_files_update(0, &[conn.fd]).unwrap();
     conn.arm_recv(&submitter, &mut sq, 0, &msg).unwrap();
     conn.close(0, &mut retired);
@@ -388,8 +388,8 @@ fn a_full_size_udp_payload_fits_and_a_truncated_one_is_rejected_then_recycled() 
         let mut buffers = BufRing::with_buffer_size(1, capacity).unwrap();
         let msg = template();
         let mut ring = uring::build_worker_ring(1).unwrap();
-        let (mut submitter, mut sq, mut cq) = ring.split();
-        uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+        let (submitter, mut sq, mut cq) = ring.split();
+        let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
         submitter
             .register_files_update(0, &[receiver.as_raw_fd()])
             .unwrap();
@@ -463,8 +463,8 @@ fn large_gso_sends_keep_all_original_boundaries_across_multiple_completions() {
     let mut buffers = BufRing::with_buffer_size(8, BUFFER_SIZE).unwrap();
     let msg = template();
     let mut ring = uring::build_worker_ring(1).unwrap();
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
     submitter
         .register_files_update(0, &[receiver.as_raw_fd()])
         .unwrap();
@@ -522,8 +522,8 @@ fn successful_terminal_completions_rearm_after_cq_pressure_without_losing_bytes(
         .setup_cqsize(2)
         .build(2)
         .unwrap();
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
     submitter
         .register_files_update(0, &[receiver.as_raw_fd()])
         .unwrap();
@@ -585,8 +585,8 @@ fn truncated_kernel_completion_returns_its_buffer_without_counting_partial_bytes
     let mut conn = Conn::new();
     let mut stats = crate::stats::Stats::default();
     let mut ring = uring::build_worker_ring(1).unwrap();
-    let (mut submitter, mut sq, mut cq) = ring.split();
-    uring::register_worker(&mut submitter, 1, &buffers).unwrap();
+    let (submitter, mut sq, mut cq) = ring.split();
+    let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
     submitter
         .register_files_update(0, &[receiver.as_raw_fd()])
         .unwrap();
