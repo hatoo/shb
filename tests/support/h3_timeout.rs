@@ -201,6 +201,19 @@ fn run(server: &Server, budget: crate::budget::Budget, timeout: Duration) -> cra
     stats
 }
 
+#[cfg(test)]
+fn assert_peer_count(counter: &AtomicUsize, expected: usize) {
+    // Quinn can deliver the final FIN before the serving task resumes from
+    // finish().await and publishes its counter. Client completion therefore
+    // does not synchronize this independent peer's bookkeeping. Wait for the
+    // exact count without changing the worker's request/timeout assertions.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while counter.load(Ordering::SeqCst) < expected && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), expected);
+}
+
 #[test]
 fn held_first_h3_response_keeps_its_latency_after_thousands_of_holes() {
     let server = server(Mode::Hold(8192));
@@ -210,7 +223,7 @@ fn held_first_h3_response_keeps_its_latency_after_thousands_of_holes() {
         Duration::from_secs(10),
     );
     assert_eq!((stats.completed, stats.errors), (8192, 0));
-    assert_eq!(server.responses.load(Ordering::SeqCst), 8192);
+    assert_peer_count(&server.responses, 8192);
     assert!(*stats.latencies_ns.iter().max().unwrap() >= 100_000_000);
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
 }
@@ -224,7 +237,7 @@ fn sparse_h3_timeout_cancels_the_peer_and_reconnects_with_exact_accounting() {
         Duration::from_secs(1),
     );
     assert_eq!((stats.completed, stats.errors), (384, 128));
-    assert_eq!(server.responses.load(Ordering::SeqCst), 384);
+    assert_peer_count(&server.responses, 384);
     assert_eq!(server.connections.load(Ordering::SeqCst), 2);
     for _ in 0..100 {
         if server.cancellations.load(Ordering::SeqCst) == 1 {
@@ -244,7 +257,7 @@ fn h3_head_reset_and_goaway_preserve_retries_and_samples() {
         Duration::from_secs(5),
     );
     assert_eq!((stats.completed, stats.errors), (511, 1));
-    assert_eq!(server.responses.load(Ordering::SeqCst), 511);
+    assert_peer_count(&server.responses, 511);
     assert_eq!(server.connections.load(Ordering::SeqCst), 2);
 }
 
@@ -257,6 +270,6 @@ fn duration_stopping_keeps_samples_with_a_live_oldest_h3_request() {
         Duration::from_secs(10),
     );
     assert_eq!((stats.completed, stats.errors), (256, 0));
-    assert_eq!(server.responses.load(Ordering::SeqCst), 256);
+    assert_peer_count(&server.responses, 256);
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
 }
