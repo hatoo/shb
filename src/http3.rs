@@ -58,6 +58,10 @@ const NEARLY_FULL: usize = crate::quic::conn::MAX_DATAGRAM - 64;
 /// Max segments per UDP GSO send (kernel limit is 64)
 const GSO_SEGMENTS: usize = 64;
 
+/// UDP_SEGMENT still limits the whole sendmsg to one maximum-size IP packet.
+/// Use the IPv4 payload ceiling (65535 minus IP/UDP headers) for both families.
+const GSO_MAX_PAYLOAD: usize = 65_507;
+
 /// One outgoing UDP send: either a single datagram (segment_size == 0) or a
 /// GSO batch of equally sized segments with a shorter tail
 struct Datagram {
@@ -494,7 +498,7 @@ fn pump_transmits(
         // probed for is often losing whole batches, and a probe that is itself
         // a batch is lost the same way, so the timeout doubles and nothing
         // ever gets through.
-        let max = match (gso, quic.probing()) {
+        let mut max = match (gso, quic.probing()) {
             (_, true) => 2,
             (true, false) => GSO_SEGMENTS,
             (false, false) => 1,
@@ -516,6 +520,10 @@ fn pump_transmits(
             }
             if count == 0 {
                 segment_size = n;
+                // The segment count alone is insufficient: 64 full QUIC
+                // datagrams exceed the UDP message ceiling and fail with
+                // EMSGSIZE, discarding the whole batch until loss recovery.
+                max = max.min(GSO_MAX_PAYLOAD / segment_size);
                 // Only worth batching if the first one filled up; a short
                 // datagram means there was nothing more to send, and padding
                 // the next one to match would truncate it
@@ -1292,6 +1300,10 @@ mod timeout_tests;
 #[cfg(test)]
 #[path = "http3/unsent_tests.rs"]
 mod unsent_tests;
+
+#[cfg(test)]
+#[path = "http3/gso_tests.rs"]
+mod gso_tests;
 
 #[cfg(test)]
 mod tests {
