@@ -48,7 +48,8 @@ pub(super) fn decode<'a>(buffer: &'a mut [u8], msg: &libc::msghdr) -> Option<Rec
         // The provided buffer need not align cmsghdr. Only one cmsg fits in
         // CONTROL_SIZE; its padding is not another header.
         let header = unsafe { control.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
-        let len = header.cmsg_len;
+        // libc exposes this as u32 on musl and usize on glibc.
+        let len: usize = header.cmsg_len as _;
         if len < header_len || len > control.len() {
             return None;
         }

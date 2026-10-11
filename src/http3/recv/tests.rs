@@ -18,11 +18,11 @@ fn message(payload: &[u8], segment: Option<i32>) -> Vec<u8> {
     );
     buf[8..12].copy_from_slice(&(payload.len() as u32).to_ne_bytes());
     if let Some(size) = segment {
-        let header = libc::cmsghdr {
-            cmsg_len: unsafe { libc::CMSG_LEN(4) as _ },
-            cmsg_level: libc::IPPROTO_UDP,
-            cmsg_type: libc::UDP_GRO,
-        };
+        // musl's cmsghdr also has private ABI padding fields.
+        let mut header: libc::cmsghdr = unsafe { std::mem::zeroed() };
+        header.cmsg_len = unsafe { libc::CMSG_LEN(4) as _ };
+        header.cmsg_level = libc::IPPROTO_UDP;
+        header.cmsg_type = libc::UDP_GRO;
         unsafe {
             buf.as_mut_ptr()
                 .add(PREFIX_SIZE)
@@ -132,8 +132,12 @@ fn rejects_invalid_gro_sizes_and_control_headers_without_alignment_assumptions()
         usize::MAX,
     ] {
         let mut buf = message(b"12345678", Some(4));
-        buf[PREFIX_SIZE..PREFIX_SIZE + std::mem::size_of::<usize>()]
-            .copy_from_slice(&len.to_ne_bytes());
+        unsafe {
+            let ptr = buf.as_mut_ptr().add(PREFIX_SIZE).cast::<libc::cmsghdr>();
+            let mut header = ptr.read_unaligned();
+            header.cmsg_len = len as _;
+            ptr.write_unaligned(header);
+        }
         assert!(decode(&mut buf, &msg).is_none());
     }
     let good = message(b"abcdefghij", Some(4));
