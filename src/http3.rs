@@ -1223,10 +1223,11 @@ fn begin_close(
     if conn.closing.is_none() {
         if conn.h3_ready {
             conn.fail_inflight(stats);
-        } else {
+        } else if budget.may_start(*started) {
             // Never got as far as a working HTTP/3 connection: count it like
             // the TCP workers count a failed connect, consuming one unit of
-            // budget
+            // budget. Handshakes do not reserve a request, so other
+            // connections may already have assigned the entire budget.
             stats.errors += 1;
             stats.connect_errors += 1;
             *started += 1;
@@ -1292,6 +1293,10 @@ fn finish_close(
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "http3/budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 #[path = "http3/timeout_tests.rs"]

@@ -30,6 +30,9 @@ mod tls;
 #[path = "../tests/support/credit_recovery.rs"]
 mod credit_recovery;
 #[cfg(test)]
+#[path = "../tests/support/h3_handshake.rs"]
+mod h3_handshake;
+#[cfg(test)]
 #[path = "../tests/support/h3_timeout.rs"]
 mod h3_timeout;
 mod uring;
