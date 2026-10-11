@@ -5,6 +5,7 @@ use super::*;
 /// these tests control the ordering of close notifications and completions.
 struct Fixture {
     ring: io_uring::IoUring,
+    recv_msg: Box<libc::msghdr>,
     conn: Conn,
     retired: Vec<Retired>,
     _buffers: BufRing,
@@ -25,7 +26,8 @@ impl Fixture {
         )
         .unwrap();
         let tls = crate::tls::client_config(b"h3").unwrap();
-        let buffers = BufRing::new(64).unwrap();
+        let buffers = BufRing::with_buffer_size(64, recv::BUFFER_SIZE).unwrap();
+        let recv_msg = recv::template();
         let mut conn = Conn::new();
         conn.fd = uring::make_udp_socket(&target.addr).unwrap();
         conn.quic = Some(
@@ -42,6 +44,7 @@ impl Fixture {
         submitter.register_files_update(0, &[conn.fd]).unwrap();
         Self {
             ring,
+            recv_msg,
             conn,
             retired: Vec::new(),
             _buffers: buffers,
@@ -96,6 +99,7 @@ impl Fixture {
             false,
             Instant::now(),
             &mut self.retired,
+            &self.recv_msg,
         )
         .unwrap();
     }

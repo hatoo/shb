@@ -4,14 +4,19 @@
 //! Every layer is Sans I/O: the QUIC connection turns UDP datagrams into
 //! stream data and this module turns stream data into completed requests. The
 //! datagrams are moved with the same io_uring machinery as the TCP workers - a
-//! connected UDP socket and a multishot recv, which is one completion per
-//! datagram since UDP keeps message boundaries. Sending is the one place the
-//! shape differs: where the kernel has UDP GSO, one `SendMsg` carries up to 64
-//! packets of equal size and the kernel cuts them apart, and only without it
-//! does each datagram get its own `Send`.
+//! connected UDP socket and a multishot recvmsg. UDP GRO can carry several
+//! datagrams in one completion; ancillary metadata restores their boundaries
+//! before QUIC sees them. Where the kernel has UDP GSO, one `SendMsg` carries
+//! up to 64 packets of equal size and the kernel cuts them apart, and only
+//! without it does each datagram get its own `Send`.
 
 pub mod proto;
 pub mod qpack;
+mod recv;
+
+#[cfg(test)]
+#[path = "../tests/support/h3_server.rs"]
+mod test_server;
 
 use std::collections::VecDeque;
 use std::net::UdpSocket;
@@ -303,6 +308,20 @@ impl Conn {
             give_backs: GiveBacks::default(),
             closing: None,
         }
+    }
+
+    fn arm_recv(
+        &mut self,
+        submitter: &io_uring::Submitter<'_>,
+        sq: &mut io_uring::squeue::SubmissionQueue<'_>,
+        conn_idx: usize,
+        recv_msg: &libc::msghdr,
+    ) -> Result<()> {
+        if !self.recv_armed {
+            uring::push_recvmsg_multi(submitter, sq, conn_idx, self.generation, recv_msg)?;
+            self.recv_armed = true;
+        }
+        Ok(())
     }
 
     /// Close the socket and forget the connection
@@ -768,7 +787,8 @@ pub fn run_worker(
 
     // Declare buf_ring / conns before the ring (see the h1/h2 workers)
     let buf_entries = (connections * 2).next_power_of_two().clamp(64, 32768) as u16;
-    let mut buf_ring = BufRing::new(buf_entries)?;
+    let mut buf_ring = BufRing::with_buffer_size(buf_entries, recv::BUFFER_SIZE)?;
+    let recv_msg = recv::template();
     let mut conns: Vec<Conn> = Vec::with_capacity(connections);
     for _ in 0..connections {
         conns.push(Conn::new());
@@ -807,8 +827,7 @@ pub fn run_worker(
             &target.host,
             local_params(connect_timeout, timeout),
         )?);
-        uring::push_recv_multi(&submitter, &mut sq, i, conn.generation)?;
-        conn.recv_armed = true;
+        conn.arm_recv(&submitter, &mut sq, i, &recv_msg)?;
         pump_transmits(&submitter, &mut sq, i, conn, now, &mut transmit_buf, gso)?;
     }
 
@@ -860,6 +879,7 @@ pub fn run_worker(
                         &mut transmit_buf,
                         gso,
                         &mut retired,
+                        &recv_msg,
                     )?;
                 } else {
                     wait = wait.min(deadline - now);
@@ -921,6 +941,7 @@ pub fn run_worker(
                         gso,
                         now,
                         &mut retired,
+                        &recv_msg,
                     )?;
                 }
             }
@@ -979,60 +1000,10 @@ pub fn run_worker(
                 }
                 OP_RECV => {
                     let conn = &mut conns[conn_idx];
-                    if !io_uring::cqueue::more(flags) {
-                        conn.recv_armed = false;
-                    }
-                    if res < 0 {
-                        if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
-                            buf_ring.recycle(bid);
-                        }
-                        if res == -libc::ENOBUFS || res == -libc::EMSGSIZE {
-                            // ENOBUFS: the buffer ring ran dry. EMSGSIZE: a
-                            // datagram we sent was too big for the path, and
-                            // the ICMP reply is reported on whichever
-                            // operation runs next - often a recv rather than
-                            // the send itself. Both leave the connection
-                            // intact; an MTU probe that draws one is a probe
-                            // that timed out, which is what the send path
-                            // already assumes.
-                            uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
-                            conn.recv_armed = true;
-                        } else {
-                            if narrate() {
-                                eprintln!("[recv] {}", std::io::Error::from_raw_os_error(-res));
-                            }
-                            conn_broken = true;
-                        }
-                    } else {
-                        // res == 0 is a valid empty datagram for UDP; QUIC
-                        // never sends one, so just recycle and move on
-                        stats.bytes_received += res as u64;
-                        if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
-                            if res > 0 {
-                                // Straight into the connection: there is no
-                                // endpoint to route through, since a client
-                                // socket carries exactly one connection
-                                if let Some(quic) = conn.quic.as_mut()
-                                    && let Err(e) = quic
-                                        .handle_datagram(now, buf_ring.data_mut(bid, res as usize))
-                                {
-                                    if narrate() {
-                                        eprintln!("[datagram] {e:#}");
-                                    }
-                                    conn_broken = true;
-                                }
-                            }
-                            buf_ring.recycle(bid);
-                        }
-                        if !conn.recv_armed {
-                            uring::push_recv_multi(&submitter, &mut sq, conn_idx, conn.generation)?;
-                            conn.recv_armed = true;
-                        }
-                        // Turning the state machine is the expensive part -
-                        // polling events, opening streams, building packets -
-                        // and it costs the same whether one datagram arrived
-                        // or eight, so leave it until the batch is drained
-                        conn.pending = true;
+                    conn_broken =
+                        recv::complete(conn, &mut stats, now, res, flags, &mut buf_ring, &recv_msg);
+                    if !conn_broken {
+                        conn.arm_recv(&submitter, &mut sq, conn_idx, &recv_msg)?;
                     }
                 }
                 _ => unreachable!(),
@@ -1057,6 +1028,7 @@ pub fn run_worker(
                     gso,
                     now,
                     &mut retired,
+                    &recv_msg,
                 )?;
             }
         }
@@ -1105,6 +1077,7 @@ pub fn run_worker(
                     gso,
                     now,
                     &mut retired,
+                    &recv_msg,
                 )?;
             }
         }
@@ -1154,6 +1127,7 @@ pub fn run_worker(
                     gso,
                     now,
                     &mut retired,
+                    &recv_msg,
                 )?;
             }
         }
@@ -1219,6 +1193,7 @@ fn begin_close(
     gso: bool,
     now: Instant,
     retired: &mut Vec<Retired>,
+    recv_msg: &libc::msghdr,
 ) -> Result<()> {
     if conn.closing.is_none() {
         if conn.h3_ready {
@@ -1252,6 +1227,7 @@ fn begin_close(
         transmit_buf,
         gso,
         retired,
+        recv_msg,
     )
 }
 
@@ -1273,6 +1249,7 @@ fn finish_close(
     transmit_buf: &mut Vec<u8>,
     gso: bool,
     retired: &mut Vec<Retired>,
+    recv_msg: &libc::msghdr,
 ) -> Result<()> {
     conn.close(conn_idx, retired);
     if stop || !budget.may_start(*started) {
@@ -1288,8 +1265,7 @@ fn finish_close(
         &target.host,
         local_params(connect_timeout, timeout),
     )?);
-    uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
-    conn.recv_armed = true;
+    conn.arm_recv(submitter, sq, conn_idx, recv_msg)?;
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
@@ -1313,6 +1289,55 @@ mod gso_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gro_worker_preserves_every_request_status_and_latency_sample() {
+        let addr = test_server::h3_server_addr();
+        let target =
+            crate::target::parse_target(&format!("https://{addr}/"), "GET", &[], None, false)
+                .unwrap();
+        let stats = run_worker(
+            &target,
+            2,
+            Budget::Requests(257),
+            Duration::from_secs(5),
+            Some(Duration::from_secs(2)),
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            (stats.completed, stats.errors, stats.connect_errors),
+            (257, 0, 0)
+        );
+        assert_eq!(stats.status_counts[200], 257);
+        assert_eq!(stats.status_counts.iter().sum::<u64>(), 257);
+        assert_eq!(stats.latencies_ns.len(), 257);
+        assert!(stats.latencies_ns.iter().all(|&n| n > 0));
+        assert!(stats.bytes_received > 0 && stats.bytes_sent > 0);
+    }
+
+    #[test]
+    fn gro_worker_reconnects_after_timeouts_without_success_samples_for_errors() {
+        let addr = test_server::h3_server_addr();
+        let target =
+            crate::target::parse_target(&format!("https://{addr}/slow"), "GET", &[], None, false)
+                .unwrap();
+        let stats = run_worker(
+            &target,
+            1,
+            Budget::Requests(12),
+            Duration::from_secs(5),
+            Some(Duration::from_millis(20)),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            (stats.completed, stats.errors, stats.connect_errors),
+            (0, 12, 0)
+        );
+        assert_eq!(stats.status_counts.iter().sum::<u64>(), 0);
+        assert!(stats.latencies_ns.is_empty());
+    }
 
     /// nginx past keepalive_requests: it answers some of a connection's
     /// requests and turns the rest away, so the rest go out again
