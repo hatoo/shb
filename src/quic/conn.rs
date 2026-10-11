@@ -2375,6 +2375,19 @@ impl Connection {
 // The HTTP/3 scheduler tests vary peer credit without a socket or a clock.
 #[cfg(test)]
 impl Connection {
+    /// Packet-packing fixture: known traffic keys, without a TLS handshake.
+    pub(crate) fn test_data_sender(&mut self, window: u64, probe: bool) {
+        self.discard_space(Space::Initial);
+        self.one_rtt_local = Some(initial_keys(&[9; 8], rustls::Side::Client).unwrap().local);
+        self.handshake_done = true;
+        self.max_data_peer = window;
+        self.test_send_limits(1, window);
+        if probe {
+            self.pto_probes = 2;
+            self.pto_space = Space::Data;
+        }
+    }
+
     pub(crate) fn test_send_limits(&mut self, streams: u64, window: u64) {
         self.max_streams_bidi = streams;
         self.params.initial_max_stream_data_bidi_remote = window;

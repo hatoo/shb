@@ -1,0 +1,46 @@
+[
+  {
+    "name": "get-c1-p1",
+    "mode": "hfast",
+    "body": 0,
+    "parallel": 1,
+    "connections": 1,
+    "count": 65536
+  },
+  {
+    "name": "get-c16-p128",
+    "mode": "hfast",
+    "body": 0,
+    "parallel": 128,
+    "connections": 16,
+    "count": 1048576
+  },
+  {
+    "name": "post64K-p8",
+    "mode": "hfast",
+    "body": 65543,
+    "parallel": 8,
+    "connections": 1,
+    "count": 2048
+  },
+  {
+    "name": "blocked1M-p8",
+    "mode": "quinn",
+    "body": 1048583,
+    "parallel": 8,
+    "connections": 1,
+    "count": 32,
+    "warmup": 8,
+    "connection_window": 16777216
+  },
+  {
+    "name": "blocked1M-p64",
+    "mode": "quinn",
+    "body": 1048583,
+    "parallel": 64,
+    "connections": 1,
+    "count": 128,
+    "warmup": 8,
+    "connection_window": 16777216
+  }
+]
