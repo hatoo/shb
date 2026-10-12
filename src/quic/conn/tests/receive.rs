@@ -318,3 +318,118 @@ fn a_new_authenticated_malformed_packet_still_reports_its_error() {
             .is_err()
     );
 }
+
+#[test]
+fn sparse_ack_only_eviction_preserves_replay_protection_in_every_space() {
+    for space in [Space::Initial, Space::Handshake, Space::Data] {
+        let mut conn = receiver();
+        let now = Instant::now();
+        let mut payload = Vec::new();
+        frame::put_ack(&mut payload, &[(0, 0)], 0);
+        let original = protected(&conn, space, 0, &payload);
+        for pn in (0..160).step_by(2) {
+            let packet = protected(&conn, space, pn, &payload);
+            receive(&mut conn, now, &packet);
+        }
+        assert!(!conn.spaces[space as usize].ack.ack_eliciting_pending);
+        let newest = protected(&conn, space, 160, &[frame::PING as u8]);
+        receive(&mut conn, now, &newest);
+        let later = now + Duration::from_millis(50);
+        let delay = conn.spaces[space as usize].ack.delay(later, 3);
+        conn.pto_count = 3;
+        conn.pto_probes = 2;
+        receive(&mut conn, later, &original);
+        assert_eq!((conn.pto_count, conn.pto_probes), (3, 2));
+        assert_eq!(conn.spaces[space as usize].ack.delay(later, 3), delay);
+
+        let mut out = Vec::new();
+        let filled = conn
+            .fill_payload(space, later, &mut out, 1200, &mut Vec::new(), false)
+            .unwrap();
+        assert_eq!(filled.ack_largest, Some(160));
+        let Frame::Ack {
+            largest,
+            first_range,
+            ranges,
+            delay: wire_delay,
+            ..
+        } = frame::Iter::new(&out).next().unwrap().unwrap()
+        else {
+            panic!("expected ACK");
+        };
+        assert_eq!(wire_delay, delay);
+        assert_eq!(
+            AckRanges::new(largest, first_range, ranges).collect::<Vec<_>>(),
+            (49..=80).rev().map(|n| (n * 2, n * 2)).collect::<Vec<_>>()
+        );
+
+        conn.spaces[space as usize].sent.push(SentPacket {
+            number: 7,
+            time_sent: now,
+            size: 80,
+            ack_eliciting: false,
+            ack_largest: filled.ack_largest,
+            frames: Vec::new(),
+        });
+        conn.on_ack(space, 7, 0, 0, &[], later).unwrap();
+        assert!(conn.spaces[space as usize].ack.ranges().is_empty());
+        receive(&mut conn, later, &original);
+        receive(&mut conn, later, &newest);
+        assert!(conn.spaces[space as usize].ack.ranges().is_empty());
+        assert!(!conn.spaces[space as usize].ack.take_pending());
+        assert_eq!(conn.spaces[space as usize].largest_received, Some(160));
+        let reordered = protected(&conn, space, 159, &[frame::PING as u8]);
+        receive(&mut conn, later, &reordered);
+        assert_eq!(conn.spaces[space as usize].ack.ranges(), &[(159, 159)]);
+        assert!(conn.spaces[space as usize].ack.take_pending());
+        assert_eq!(conn.spaces[space as usize].largest_received, Some(160));
+    }
+}
+
+#[test]
+fn ack_eviction_preserves_delayed_stream_bytes_and_new_packet_retransmissions() {
+    let mut conn = receiver();
+    let now = Instant::now();
+    let (id, _) = conn.send_oneshot(b"request").unwrap();
+    let mut response = Vec::new();
+    frame::put_stream(&mut response, id, 0, false, b"first");
+    let original = protected(&conn, Space::Data, 0, &response);
+    receive(&mut conn, now, &original);
+    for pn in (2..160).step_by(2) {
+        let packet = protected(&conn, Space::Data, pn, &[frame::PING as u8]);
+        receive(&mut conn, now, &packet);
+    }
+    response.clear();
+    frame::put_stream(&mut response, id, 5, true, b"second");
+    let delayed = protected(&conn, Space::Data, 1, &response);
+    receive(&mut conn, now, &delayed);
+    assert_eq!(conn.data_received, 11);
+    assert_eq!(conn.unanswered, 0);
+    assert_eq!(
+        conn.events
+            .iter()
+            .filter(|e| matches!(e, Event::Finished { .. }))
+            .count(),
+        1
+    );
+    let pending_events = conn.events.len();
+    for packet in [&original, &delayed] {
+        receive(&mut conn, now, packet);
+        assert_eq!(conn.events.len(), pending_events);
+    }
+    let retry = protected(&conn, Space::Data, 160, &response);
+    receive(&mut conn, now, &retry);
+    assert_eq!(conn.data_received, 11);
+    assert_eq!(
+        conn.events
+            .iter()
+            .filter(|e| matches!(e, Event::Finished { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        conn.spaces[Space::Data as usize].ack.ranges()[0],
+        (160, 160)
+    );
+    assert!(conn.spaces[Space::Data as usize].ack.take_pending());
+}

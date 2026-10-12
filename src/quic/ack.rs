@@ -6,6 +6,9 @@ use crate::clock::Instant;
 ///
 /// A benchmark client receives packets almost entirely in order, so this
 /// stays one or two ranges long and a linear walk beats anything cleverer.
+/// Sparse traffic retains only the newest ranges that fit in an ACK. Duplicate
+/// suppression belongs to the separate ReceivedPackets history, which must
+/// reject packets in discarded ranges (RFC 9000 Section 13.2.3).
 #[derive(Default)]
 pub struct AckState {
     /// (smallest, largest), descending and never touching
@@ -17,6 +20,8 @@ pub struct AckState {
 }
 
 impl AckState {
+    const MAX_RANGES: usize = 32;
+
     pub fn record(&mut self, pn: u64, ack_eliciting: bool, now: Instant) {
         if ack_eliciting {
             self.ack_eliciting_pending = true;
@@ -51,21 +56,28 @@ impl AckState {
                 return;
             }
             if pn > largest {
+                // Evict before inserting: truncating afterwards would double
+                // the allocation when a full vector grows by one range.
+                if self.ranges.len() == Self::MAX_RANGES {
+                    self.ranges.pop();
+                }
                 self.ranges.insert(i, (pn, pn));
                 return;
             }
         }
-        self.ranges.push((pn, pn));
+        // A new oldest range would not be sent even before the storage bound.
+        // Extending or bridging a retained range still takes the paths above.
+        if self.ranges.len() < Self::MAX_RANGES {
+            self.ranges.push((pn, pn));
+        }
     }
 
     /// The ranges to put in an ACK frame, largest first
     ///
-    /// Capped, because a connection that loses packets steadily would
-    /// otherwise grow an ACK frame without limit; the peer only needs the
-    /// recent ones to make progress.
+    /// Both storage and serialization are capped, including when ACK-only
+    /// traffic does not give the peer an occasion to acknowledge our ACKs.
     pub fn ranges(&self) -> &[(u64, u64)] {
-        const MAX_RANGES: usize = 32;
-        &self.ranges[..self.ranges.len().min(MAX_RANGES)]
+        &self.ranges
     }
 
     /// Microseconds since the largest packet arrived, scaled by the exponent
@@ -89,6 +101,10 @@ impl AckState {
         std::mem::take(&mut self.ack_eliciting_pending)
     }
 }
+
+#[cfg(test)]
+#[path = "ack/bounded_tests.rs"]
+mod bounded_tests;
 
 #[cfg(test)]
 mod tests {
