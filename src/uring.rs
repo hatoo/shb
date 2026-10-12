@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -54,7 +54,7 @@ pub fn decode_user_data(ud: u64) -> (u64, usize, u64) {
 }
 
 /// Create an unconnected TCP socket with TCP_NODELAY set
-pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
+fn make_socket(addr: &SocketAddr) -> Result<socket2::Socket> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(*addr),
         socket2::Type::STREAM,
@@ -64,7 +64,7 @@ pub fn make_socket(addr: &SocketAddr) -> Result<RawFd> {
     socket
         .set_tcp_nodelay(true)
         .context("setsockopt(TCP_NODELAY) failed")?;
-    Ok(socket.into_raw_fd())
+    Ok(socket)
 }
 
 /// Upper bound for a single submit_and_wait so workers notice a Ctrl-C
@@ -432,30 +432,6 @@ pub fn push_sqe(
     Ok(())
 }
 
-/// Push two linked SQEs within a single submission
-///
-/// An IOSQE_IO_LINK chain must not cross a submission boundary, so submit
-/// first to make room when fewer than 2 slots are free.
-pub fn push_sqe_pair(
-    submitter: &Submitter<'_>,
-    sq: &mut squeue::SubmissionQueue<'_>,
-    first: squeue::Entry,
-    second: squeue::Entry,
-) -> Result<()> {
-    unsafe {
-        if sq.capacity() - sq.len() < 2 {
-            sq.sync();
-            submitter.submit().context("io_uring submit failed")?;
-            sq.sync();
-        }
-        sq.push(&first)
-            .map_err(|_| anyhow::anyhow!("submission queue full"))?;
-        sq.push(&second)
-            .map_err(|_| anyhow::anyhow!("submission queue full"))?;
-    }
-    Ok(())
-}
-
 /// Start an async connect (a Connect SQE + a LinkTimeout as the connect timeout)
 /// and return the created socket fd
 ///
@@ -470,11 +446,8 @@ pub fn start_connect(
     raw_addr: &socket2::SockAddr,
     timeout: &types::Timespec,
 ) -> Result<RawFd> {
-    let fd = make_socket(addr)?;
-    // Overwriting the slot also releases the registered reference to the old fd
-    submitter
-        .register_files_update(conn_idx as u32, &[fd])
-        .context("register_files_update failed")?;
+    // Retain ownership until both registration and queueing have succeeded.
+    let socket = make_socket(addr)?;
     let connect = opcode::Connect::new(
         types::Fixed(conn_idx as u32),
         raw_addr.as_ptr().cast::<libc::sockaddr>(),
@@ -486,8 +459,26 @@ pub fn start_connect(
     let link_timeout = opcode::LinkTimeout::new(timeout as *const types::Timespec)
         .build()
         .user_data(user_data(conn_idx, generation, OP_CONNECT_TIMEOUT));
-    push_sqe_pair(submitter, sq, connect, link_timeout)?;
-    Ok(fd)
+    // Reserve the entire linked pair before installing a fixed-file reference.
+    // Submission may fail or consume fewer entries than expected; on either
+    // error the socket drops without leaving a slot or a queued Connect behind.
+    if sq.capacity() - sq.len() < 2 {
+        sq.sync();
+        submitter.submit().context("io_uring submit failed")?;
+        sq.sync();
+    }
+    anyhow::ensure!(sq.capacity() - sq.len() >= 2, "submission queue full");
+    submitter
+        .register_files_update(conn_idx as u32, &[socket.as_raw_fd()])
+        .context("register_files_update failed")?;
+    // We hold the only mutable queue borrow, so the reserved space cannot be
+    // consumed between the check and this push. Both entries enter together;
+    // their sockaddr/timeout storage belongs to the caller as on success before.
+    unsafe {
+        sq.push_multiple(&[connect, link_timeout])
+            .expect("reserved space for the connect pair");
+    }
+    Ok(socket.into_raw_fd())
 }
 
 /// Send a byte slice
@@ -557,6 +548,9 @@ pub fn push_recvmsg_multi(
         .user_data(user_data(conn_idx, generation, OP_RECV));
     push_sqe(submitter, sq, entry)
 }
+
+#[cfg(test)]
+mod connect_tests;
 
 #[cfg(test)]
 mod tests {
