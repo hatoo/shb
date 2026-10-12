@@ -713,6 +713,35 @@ fn h2_every_registered_method_arrives() {
     assert_every_method_arrives(&["--http2"], &url);
 }
 
+#[test]
+fn h2_empty_header_fragments_survive_tls_reconnects() {
+    let server = h2_peer::TlsServer::start(H2Script {
+        fragmented_response_headers: true,
+        streams_per_connection: Some(5),
+        ..H2Script::default()
+    });
+    let url = format!("https://{}/", server.addr);
+    let report = shb_json(&[
+        "--http2",
+        "-p",
+        "8",
+        "-n",
+        "256",
+        "-c",
+        "8",
+        "-t",
+        "1",
+        "--timeout",
+        "5s",
+        &url,
+    ]);
+    let peers = server.finish();
+    assert_eq!(peers.iter().map(|p| p.responses).sum::<usize>(), 256);
+    assert!(peers.iter().map(|p| p.goaways).sum::<usize>() >= 8);
+    assert_all_ok(&report, 256, "200");
+    assert_eq!(report["requests"]["connectErrors"], 0);
+}
+
 fn start_scripted_h2_server(script: H2Script) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");

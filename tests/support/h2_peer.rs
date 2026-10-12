@@ -195,6 +195,9 @@ fn unused_peer_requires_complete_connection_controls_and_no_streams() {
 /// but those, on a raw socket, one thread per connection.
 #[derive(Clone, Copy, Default)]
 pub struct H2Script {
+    /// Begin responses with empty, padded-only, or priority-only HEADERS and
+    /// finish their HPACK blocks in CONTINUATION frames, including empty ones.
+    pub fragmented_response_headers: bool,
     /// Advertise SETTINGS_HEADER_TABLE_SIZE 0 and, once the client has
     /// acknowledged it, tear the connection down unless the next header block
     /// opens with the dynamic table size update RFC 7541 Section 4.2 says it
@@ -300,6 +303,20 @@ pub fn serve_scripted_h2(mut sock: impl Read + Write, script: H2Script) -> io::R
 
             let mut respond = |out: &mut Vec<u8>, stream: u32| {
                 summary.responses += 1;
+                if script.fragmented_response_headers {
+                    let (flags, payload): (u8, &[u8]) = match (stream / 2) % 5 {
+                        0 => (0, &[]),
+                        1 => (8, &[0]),
+                        2 => (8, &[3, 0, 0, 0]),
+                        3 => (32, &[0, 0, 0, 0, 15]),
+                        _ => (40, &[2, 0, 0, 0, 0, 15, 0, 0]),
+                    };
+                    out.extend(h2_frame(HEADERS, flags | FLAG_END_STREAM, stream, payload));
+                    out.extend(h2_frame(9, 0, stream, &[]));
+                    out.extend(h2_frame(9, 0, stream, &[0x88]));
+                    out.extend(h2_frame(9, FLAG_END_HEADERS, stream, &[]));
+                    return;
+                }
                 out.extend_from_slice(&h2_frame(
                     HEADERS,
                     FLAG_END_HEADERS | FLAG_END_STREAM,

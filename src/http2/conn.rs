@@ -107,8 +107,10 @@ pub struct Connection {
     pending: Vec<u8>,
     /// Header block fragments of a HEADERS still awaiting END_HEADERS
     header_block: Vec<u8>,
-    /// Stream the pending header block belongs to, and whether it ends the stream
+    /// Stream awaiting CONTINUATION, or zero when no field block is pending.
+    /// The first fragment may be empty, so the buffer length is not its state.
     header_stream: u32,
+    /// Whether the HEADERS starting that block had END_STREAM set
     header_end_stream: bool,
     /// Next client stream id (odd, ascending)
     next_id: u32,
@@ -455,7 +457,7 @@ impl Connection {
 
             // A HEADERS awaiting END_HEADERS may only be followed by
             // CONTINUATION on the same stream (RFC 9113 Section 6.10)
-            if !self.header_block.is_empty() && kind != CONTINUATION {
+            if self.header_stream != 0 && kind != CONTINUATION {
                 bail!("frame interleaved with a header block");
             }
 
@@ -495,6 +497,11 @@ impl Connection {
         payload: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<()> {
+        // Zero is reserved for connection controls (RFC 9113 Section 6.2),
+        // and represents no pending field block in header_stream.
+        if stream == 0 {
+            bail!("HEADERS on stream zero");
+        }
         let mut block = payload;
         if flags & FLAG_PADDED != 0 {
             let pad = *block.first().ok_or_else(|| bad("padded HEADERS"))? as usize;
@@ -522,7 +529,7 @@ impl Connection {
         payload: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<()> {
-        if self.header_block.is_empty() || stream != self.header_stream {
+        if self.header_stream == 0 || stream != self.header_stream {
             bail!("unexpected CONTINUATION");
         }
         self.header_block.extend_from_slice(payload);
@@ -530,7 +537,8 @@ impl Connection {
             return Ok(());
         }
         let block = std::mem::take(&mut self.header_block);
-        let end_stream = self.header_end_stream;
+        self.header_stream = 0;
+        let end_stream = std::mem::take(&mut self.header_end_stream);
         let result = self.complete_headers(stream, end_stream, &block, events);
         self.header_block = block;
         self.header_block.clear();
@@ -728,6 +736,8 @@ fn bad(what: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod continuation;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u32;
