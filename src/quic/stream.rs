@@ -57,6 +57,9 @@ pub struct SendStream {
     /// Offsets the peer has not acknowledged and that need sending again,
     /// as (start, end) relative to `base_offset`
     lost: Vec<(usize, usize)>,
+    /// Acknowledged runs beyond `base_offset`, in absolute stream offsets.
+    /// Sorted, disjoint and nonadjacent. In-order ACKs never allocate here.
+    acked: Vec<(u64, u64)>,
     /// The peer's MAX_STREAM_DATA for this stream
     limit: u64,
     fin: bool,
@@ -86,6 +89,7 @@ impl SendStream {
             base_offset: 0,
             sent: 0,
             lost: Vec::new(),
+            acked: Vec::new(),
             limit,
             fin: false,
             fin_sent: false,
@@ -237,17 +241,31 @@ impl SendStream {
         self.reset_acked = true;
     }
 
-    /// The peer acknowledged everything below `offset`, so it can be dropped
+    /// Remember the acknowledged run and release any now-contiguous prefix.
     pub fn on_acked(&mut self, offset: u64, len: usize, fin: bool) {
-        if fin {
-            self.fin_acked = true;
-        }
-        let end = offset + len as u64;
-        if end <= self.base_offset {
+        if self.reset {
             return;
         }
-        // Only a prefix can be released, since the buffer is contiguous
+        if fin {
+            self.fin_acked = true;
+            self.fin_sent = true;
+        }
+        let mut end = offset + len as u64;
+        if len == 0 || end <= self.base_offset {
+            return;
+        }
+        // SentPackets removes an acknowledged packet. A sparse run will not
+        // get another callback when the earlier gap closes, so retain it here.
         if offset <= self.base_offset {
+            let mut consumed = 0;
+            for &(start, stop) in &self.acked {
+                if start > end {
+                    break;
+                }
+                end = end.max(stop);
+                consumed += 1;
+            }
+            self.acked.drain(..consumed);
             let drop = (end - self.base_offset) as usize;
             let drop = drop.min(self.buf.len() - self.buf_start);
             self.buf_start += drop;
@@ -262,31 +280,99 @@ impl SendStream {
                 r.1 = r.1.saturating_sub(drop);
             }
             self.lost.retain(|&(s, e)| e > s);
+        } else {
+            let first = self.acked.partition_point(|&(_, stop)| stop < offset);
+            let mut last = first;
+            let mut start = offset;
+            while let Some(&(lo, hi)) = self.acked.get(last) {
+                if lo > end {
+                    break;
+                }
+                start = start.min(lo);
+                end = end.max(hi);
+                last += 1;
+            }
+            if first == last {
+                self.acked.insert(first, (start, end));
+            } else {
+                self.acked[first] = (start, end);
+                self.acked.drain(first + 1..last);
+            }
+            // An original packet may arrive after its retransmission was
+            // queued. Remove the acknowledged bytes from every queued copy.
+            self.acknowledge_lost(
+                (start - self.base_offset) as usize,
+                (end - self.base_offset) as usize,
+            );
         }
+    }
+
+    fn acknowledge_lost(&mut self, start: usize, end: usize) {
+        let mut i = 0;
+        while i < self.lost.len() {
+            let (lo, hi) = self.lost[i];
+            if hi <= start || lo >= end {
+                i += 1;
+            } else if lo < start {
+                self.lost[i].1 = start;
+                if hi > end {
+                    self.lost.insert(i + 1, (end, hi));
+                    i += 1;
+                }
+                i += 1;
+            } else if hi > end {
+                self.lost[i].0 = end;
+                i += 1;
+            } else {
+                self.lost.remove(i);
+            }
+        }
+        self.lost.sort_unstable();
     }
 
     /// The packet carrying this run was declared lost
     pub fn on_lost(&mut self, offset: u64, len: usize, fin: bool) {
+        if self.reset {
+            return;
+        }
         // The FIN is not data and is not covered by base_offset, so it has to
         // be reconsidered even when every byte in the packet was already
         // acknowledged - an empty stream whose lost FIN is never sent again
         // leaves the peer waiting for an end that never comes
-        if fin {
+        if fin && !self.fin_acked {
             self.fin_sent = false;
         }
         if offset + len as u64 <= self.base_offset {
             return;
         }
-        let start = offset.saturating_sub(self.base_offset) as usize;
+        let mut start = offset.max(self.base_offset);
         // The prefix might have been acknowledged since this packet was
         // sent. Clip the original absolute end as well as the start, or a
         // late loss can incorrectly classify fresh bytes as retransmissions.
-        let end = (offset + len as u64 - self.base_offset)
-            .min(self.sent.min(self.buf.len() - self.buf_start) as u64) as usize;
-        if end > start {
-            self.lost.push((start, end));
-            self.lost.sort_unstable();
+        let end = (offset + len as u64)
+            .min(self.base_offset + self.sent.min(self.buf.len() - self.buf_start) as u64);
+        for &(lo, hi) in &self.acked {
+            if lo >= end {
+                break;
+            }
+            if hi <= start {
+                continue;
+            }
+            if lo > start {
+                self.lost.push((
+                    (start - self.base_offset) as usize,
+                    (lo - self.base_offset) as usize,
+                ));
+            }
+            start = start.max(hi);
         }
+        if end > start {
+            self.lost.push((
+                (start - self.base_offset) as usize,
+                (end - self.base_offset) as usize,
+            ));
+        }
+        self.lost.sort_unstable();
     }
 
     /// STOP_SENDING: the peer does not want the rest, so drop it and say
@@ -297,6 +383,7 @@ impl SendStream {
         self.buf.clear();
         self.buf_start = 0;
         self.lost.clear();
+        self.acked.clear();
         self.base_offset + self.sent as u64
     }
 
