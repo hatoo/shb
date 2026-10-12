@@ -789,8 +789,8 @@ impl Connection {
 struct Filled {
     ack_eliciting: bool,
     /// What the ACK in it acknowledged, if it carried one. A lost ACK is not
-    /// resent - the next one carries the same ranges - which is why the
-    /// ranges are held until the peer confirms them.
+    /// resent - the next one repeats recent ranges - which are retained
+    /// until the peer confirms them or the ACK storage limit evicts them.
     ack_largest: Option<u64>,
 }
 
@@ -1573,9 +1573,9 @@ impl Connection {
         for p in &acked {
             bytes += p.size;
             // The peer has this acknowledgement now, so what it covered can
-            // go. Nothing else drops a range: a lost packet's number is never
-            // reused, so the hole it leaves is permanent, and without this the
-            // list grows one entry per lost packet for the life of the run.
+            // go without causing a retransmission. AckState also bounds old
+            // ranges when ACK-of-ACK is delayed; ReceivedPackets independently
+            // prevents either kind of pruning from permitting packet replay.
             if let Some(largest) = p.ack_largest {
                 self.spaces[space as usize].ack.trim_below(largest);
             }
