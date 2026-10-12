@@ -88,6 +88,7 @@ use super::packet::{
     ConnectionId, Space, decode_packet_number, encode_packet_number, protect_header,
     unprotect_header,
 };
+use super::received::ReceivedPackets;
 use super::recovery::{Congestion, Rtt, SentFrame, SentPacket, SentPackets, pto_deadline};
 use super::stream::{
     Dir, RecvStream, SendStream, client_stream_id, is_client_initiated, stream_dir,
@@ -130,6 +131,7 @@ struct SpaceState {
     keys: Option<Keys>,
     next_packet_number: u64,
     largest_received: Option<u64>,
+    received: ReceivedPackets,
     ack: AckState,
     sent: SentPackets,
     /// Handshake bytes the peer has not acknowledged. Held rather than
@@ -430,6 +432,7 @@ impl Connection {
     fn discard_space(&mut self, space: Space) {
         let s = &mut self.spaces[space as usize];
         s.keys = None;
+        s.received = ReceivedPackets::default();
         s.ack = AckState::default();
         s.sent = SentPackets::default();
         s.crypto_out.clear();
@@ -1124,7 +1127,7 @@ impl Connection {
     }
 
     /// Returns how much of the buffer this packet took, and whether it was
-    /// decrypted and acted on
+    /// authenticated (including a duplicate, for idle/reset handling)
     fn handle_packet(&mut self, now: Instant, buf: &mut [u8]) -> Result<(usize, bool)> {
         // Nothing in a header has been authenticated, so a packet whose
         // header cannot be read - a version we do not speak, a connection
@@ -1209,6 +1212,13 @@ impl Connection {
             Ok(p) => p.len(),
             Err(_) => return Ok((end, false)),
         };
+        // ACK-of-ACK pruning must not let a packet run its frame handlers a
+        // second time or cancel pending PTO probes. Authenticate first: even a
+        // known packet number can have a forged header or payload (RFC 9000
+        // Section 12.3). Retransmissions in a new packet remain eligible.
+        if !self.spaces[space as usize].received.insert(pn) {
+            return Ok((end, true));
+        }
         if generation == Generation::Next {
             self.rotate_keys(pn, phase);
         }
@@ -2412,6 +2422,8 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod receive;
 
     fn client() -> Connection {
         let tls = crate::tls::client_config(b"h3").unwrap();
