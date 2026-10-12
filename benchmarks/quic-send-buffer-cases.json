@@ -1,0 +1,73 @@
+[
+  {
+    "name": "full8M-p1",
+    "mode": "quinn",
+    "body": 8388615,
+    "parallel": 1,
+    "connections": 1,
+    "count": 8,
+    "warmup": 1,
+    "window": 16777216,
+    "connection_window": 67108864
+  },
+  {
+    "name": "full8M-p8",
+    "mode": "quinn",
+    "body": 8388615,
+    "parallel": 8,
+    "connections": 1,
+    "count": 16,
+    "warmup": 8,
+    "window": 16777216,
+    "connection_window": 67108864
+  },
+  {
+    "name": "full1M-p8",
+    "mode": "quinn",
+    "body": 1048583,
+    "parallel": 8,
+    "connections": 1,
+    "count": 64,
+    "warmup": 8,
+    "window": 16777216,
+    "connection_window": 67108864
+  },
+  {
+    "name": "window64K-1M-p8",
+    "mode": "quinn",
+    "body": 1048583,
+    "parallel": 8,
+    "connections": 1,
+    "count": 32,
+    "warmup": 8,
+    "window": 65536,
+    "connection_window": 67108864
+  },
+  {
+    "name": "blocked1M-p8",
+    "mode": "quinn",
+    "body": 1048583,
+    "parallel": 8,
+    "connections": 1,
+    "count": 32,
+    "warmup": 8,
+    "window": 2048,
+    "connection_window": 67108864
+  },
+  {
+    "name": "get-c1-p1",
+    "mode": "hfast",
+    "body": 0,
+    "parallel": 1,
+    "connections": 1,
+    "count": 65536
+  },
+  {
+    "name": "get-c16-p128",
+    "mode": "hfast",
+    "body": 0,
+    "parallel": 128,
+    "connections": 16,
+    "count": 1048576
+  }
+]

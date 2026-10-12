@@ -9,6 +9,10 @@
 
 use anyhow::{Result, bail};
 
+#[cfg(test)]
+#[path = "send_buffer_tests.rs"]
+mod send_buffer_tests;
+
 /// How much buffer a pooled stream keeps hold of. Requests are tens of bytes
 /// and most responses are small, so this covers the common case; a stream that
 /// carried a large body gives the rest back rather than keeping it for a
@@ -42,11 +46,13 @@ pub const fn client_stream_id(dir: Dir, n: u64) -> u64 {
 /// One end of a stream we write to
 #[derive(Default)]
 pub struct SendStream {
-    /// Everything written and not yet acknowledged, starting at `base_offset`
+    /// Written bytes; the live suffix starts at `buf_start` / `base_offset`.
     buf: Vec<u8>,
-    /// Stream offset of `buf[0]`
+    /// Acknowledged prefix retained until an append can reclaim it cheaply.
+    buf_start: usize,
+    /// Stream offset of `buf[buf_start]`
     base_offset: u64,
-    /// How much of `buf` has been put into a packet at least once
+    /// How much of the live suffix has been put into a packet at least once
     sent: usize,
     /// Offsets the peer has not acknowledged and that need sending again,
     /// as (start, end) relative to `base_offset`
@@ -76,6 +82,7 @@ impl SendStream {
         buf.shrink_to(POOLED_CAPACITY);
         Self {
             buf,
+            buf_start: 0,
             base_offset: 0,
             sent: 0,
             lost: Vec::new(),
@@ -90,6 +97,7 @@ impl SendStream {
 
     /// Give the buffer back for the next stream to use
     pub fn take_buf(&mut self) -> Vec<u8> {
+        self.buf_start = 0;
         std::mem::take(&mut self.buf)
     }
 
@@ -106,11 +114,20 @@ impl SendStream {
             return 0;
         }
         self.limit
-            .saturating_sub(self.base_offset + self.buf.len() as u64)
+            .saturating_sub(self.base_offset + (self.buf.len() - self.buf_start) as u64)
     }
 
     pub fn write(&mut self, data: &[u8]) -> usize {
         let room = self.writable().min(data.len() as u64) as usize;
+        // Move at most as many bytes as have been released since the last
+        // compaction. Reclaiming on every ACK (or every append to a full Vec)
+        // makes packet-sized progress through a large body quadratic.
+        let live = self.buf.len() - self.buf_start;
+        if room != 0 && self.buf_start != 0 && self.buf_start >= live {
+            self.buf.copy_within(self.buf_start.., 0);
+            self.buf.truncate(live);
+            self.buf_start = 0;
+        }
         self.buf.extend_from_slice(&data[..room]);
         room
     }
@@ -126,7 +143,9 @@ impl SendStream {
     /// Whether `next_send` would produce anything, without borrowing the data
     pub fn has_pending(&self) -> bool {
         !self.reset
-            && (!self.lost.is_empty() || self.buf.len() > self.sent || (self.fin && !self.fin_sent))
+            && (!self.lost.is_empty()
+                || self.buf.len() - self.buf_start > self.sent
+                || (self.fin && !self.fin_sent))
     }
 
     /// Retransmissions use packet room but no new connection credit. Only
@@ -135,24 +154,21 @@ impl SendStream {
         if self.reset {
             return None;
         }
+        let buf = &self.buf[self.buf_start..];
         if let Some(&(start, end)) = self.lost.first() {
             if max == 0 {
                 return None;
             }
             let end = start + (end - start).min(max);
-            return Some((
-                self.base_offset + start as u64,
-                &self.buf[start..end],
-                false,
-            ));
+            return Some((self.base_offset + start as u64, &buf[start..end], false));
         }
         let max = (max as u64).min(credit) as usize;
-        let end = self.sent + (self.buf.len() - self.sent).min(max);
+        let end = self.sent + (buf.len() - self.sent).min(max);
         if end > self.sent {
-            let fin = self.fin && end == self.buf.len();
+            let fin = self.fin && end == buf.len();
             return Some((
                 self.base_offset + self.sent as u64,
-                &self.buf[self.sent..end],
+                &buf[self.sent..end],
                 fin,
             ));
         }
@@ -160,8 +176,8 @@ impl SendStream {
         // a FIN sits at the end of the buffer, so sending one while bytes are
         // still unsent would tell the peer the stream ends at an offset this
         // end has not written to it yet
-        if self.fin && !self.fin_sent && self.sent >= self.buf.len() {
-            return Some((self.base_offset + self.buf.len() as u64, &[], true));
+        if self.fin && !self.fin_sent && self.sent >= buf.len() {
+            return Some((self.base_offset + buf.len() as u64, &[], true));
         }
         None
     }
@@ -203,7 +219,7 @@ impl SendStream {
     /// A peer that has answered has seen all of it, so a stream in this
     /// state has nothing left that is worth a RESET_STREAM.
     pub fn fully_sent(&self) -> bool {
-        self.fin && self.fin_sent && self.sent >= self.buf.len()
+        self.fin && self.fin_sent && self.sent >= self.buf.len() - self.buf_start
     }
 
     /// The peer has acknowledged everything, the FIN or the RESET_STREAM
@@ -213,7 +229,7 @@ impl SendStream {
         if self.reset {
             self.reset_acked
         } else {
-            self.fin && self.fin_acked && self.buf.is_empty()
+            self.fin && self.fin_acked && self.buf_start == self.buf.len()
         }
     }
 
@@ -233,8 +249,12 @@ impl SendStream {
         // Only a prefix can be released, since the buffer is contiguous
         if offset <= self.base_offset {
             let drop = (end - self.base_offset) as usize;
-            let drop = drop.min(self.buf.len());
-            self.buf.drain(..drop);
+            let drop = drop.min(self.buf.len() - self.buf_start);
+            self.buf_start += drop;
+            if self.buf_start == self.buf.len() {
+                self.buf.clear();
+                self.buf_start = 0;
+            }
             self.base_offset += drop as u64;
             self.sent = self.sent.saturating_sub(drop);
             for r in &mut self.lost {
@@ -261,8 +281,8 @@ impl SendStream {
         // The prefix might have been acknowledged since this packet was
         // sent. Clip the original absolute end as well as the start, or a
         // late loss can incorrectly classify fresh bytes as retransmissions.
-        let end = (offset + len as u64 - self.base_offset).min(self.sent.min(self.buf.len()) as u64)
-            as usize;
+        let end = (offset + len as u64 - self.base_offset)
+            .min(self.sent.min(self.buf.len() - self.buf_start) as u64) as usize;
         if end > start {
             self.lost.push((start, end));
             self.lost.sort_unstable();
@@ -275,6 +295,7 @@ impl SendStream {
     pub fn reset(&mut self) -> u64 {
         self.reset = true;
         self.buf.clear();
+        self.buf_start = 0;
         self.lost.clear();
         self.base_offset + self.sent as u64
     }
