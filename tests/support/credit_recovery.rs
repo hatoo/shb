@@ -321,6 +321,14 @@ fn h3_preserves_patterned_body_offsets_over_many_credit_updates() {
 }
 
 #[test]
+fn h3_preserves_a_large_send_buffer_after_loss_and_late_duplicates() {
+    // The whole request fits the stream window, while connection credit
+    // forces many partial sends/ACKs. Exercise the retransmission buffer's
+    // released prefix independently of the HTTP/3 unsent-request buffer.
+    exercise_body(true, patterned_body(262_151), 512 * 1024, 2);
+}
+
+#[test]
 fn h3_shares_patterned_body_across_many_flow_controlled_streams() {
     let body = patterned_body(65_543);
     let server = server_with_windows(body.clone(), 2048, 1 << 24, false);
