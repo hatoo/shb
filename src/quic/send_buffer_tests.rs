@@ -114,10 +114,196 @@ fn sparse_ack_does_not_discard_an_unacknowledged_gap() {
     assert_eq!(s.next_send(8192, 0), Some((1024, &data[1024..4096], false)));
     assert_eq!(transmit(&mut s, &data, 8192, 0), 0);
     s.on_acked(1024, 3072, false);
-    // The existing conservative prefix policy retains a sparse ACK's data
-    // until another ACK covers it; this change does not alter that policy.
-    s.on_acked(4096, 4096, true);
     assert!(s.is_settled());
+}
+
+#[test]
+fn sparse_ack_cancels_pending_loss_and_late_loss_cannot_restore_it() {
+    let data = body(19);
+    for ack_first in [false, true] {
+        let mut s = SendStream::new(19);
+        s.write(&data);
+        s.on_sent(0, 16, false);
+        if !ack_first {
+            s.on_lost(0, 16, false);
+        }
+        s.on_acked(4, 4, false);
+        s.on_acked(12, 4, false);
+        if ack_first {
+            s.on_lost(0, 16, false);
+        }
+        for (start, end) in [(0, 4), (8, 12)] {
+            assert_eq!(
+                s.next_send(100, 0),
+                Some((start, &data[start as usize..end], false))
+            );
+            assert_eq!(transmit(&mut s, &data, 100, 0), 0);
+        }
+        assert_eq!(s.next_send(100, 0), None, "unsent bytes need fresh credit");
+        s.on_acked(8, 4, false);
+        s.on_acked(0, 4, false);
+        assert_eq!(s.next_send(100, 3), Some((16, &data[16..], false)));
+        assert_eq!(transmit(&mut s, &data, 100, 3), 3);
+        s.finish();
+        assert_eq!(transmit(&mut s, &data, 0, 0), 0);
+        s.on_acked(16, 3, true);
+        assert!(s.is_settled());
+    }
+}
+
+#[test]
+fn acknowledged_fin_is_not_retransmitted_after_loss_of_another_copy() {
+    let mut s = SendStream::new(8);
+    s.write(b"abcdefgh");
+    s.finish();
+    s.on_sent(0, 8, true);
+    s.on_lost(0, 8, true);
+    s.on_acked(4, 4, true);
+    s.on_lost(4, 4, true);
+    assert_eq!(s.next_send(8, 0), Some((0, &b"abcd"[..], false)));
+    assert_eq!(s.on_sent(0, 4, false), 0);
+    assert_eq!(s.next_send(8, 0), None);
+    s.on_acked(0, 4, false);
+    assert!(s.is_settled());
+    s.on_lost(0, 8, true);
+    assert!(!s.has_pending());
+    assert!(s.fully_sent());
+}
+
+#[test]
+fn overlapping_sparse_acks_merge_without_releasing_unsent_bytes() {
+    let data = body(64);
+    let mut s = SendStream::new(64);
+    s.write(&data);
+    s.on_sent(0, 48, false);
+    for (start, end) in [(16, 24), (32, 40), (20, 36), (40, 48), (16, 48)] {
+        s.on_acked(start, end - start as usize, false);
+    }
+    assert_eq!(s.acked, [(16, 48)]);
+    s.on_acked(0, 8, false);
+    s.on_acked(4, 12, false);
+    assert_eq!(s.base_offset, 48);
+    assert!(s.acked.is_empty());
+    assert_eq!(s.writable(), 0);
+    assert_eq!(s.next_send(64, 0), None);
+    assert_eq!(s.next_send(64, 16), Some((48, &data[48..], false)));
+    assert_eq!(transmit(&mut s, &data, 64, 16), 16);
+    s.finish();
+    transmit(&mut s, &data, 0, 0);
+    s.on_acked(64, 0, true);
+    assert!(!s.is_settled(), "FIN-only ACK does not cover the data");
+    s.on_acked(48, 16, false);
+    assert!(s.is_settled());
+}
+
+#[test]
+fn ordered_acks_need_no_interval_allocation_and_reverse_acks_merge() {
+    for reverse in [false, true] {
+        let data = body(4096);
+        let mut s = SendStream::new(4096);
+        s.write(&data);
+        s.finish();
+        s.on_sent(0, data.len(), true);
+        for n in 0..4096 {
+            let offset = if reverse { 4095 - n } else { n };
+            s.on_acked(offset, 1, offset == 4095);
+            assert!(s.acked.len() <= 1);
+            if !reverse {
+                assert_eq!(s.acked.capacity(), 0);
+            }
+        }
+        assert!(s.is_settled());
+        assert!(s.acked.is_empty());
+    }
+}
+
+#[test]
+fn sparse_acks_survive_append_compaction_and_reset_discards_them() {
+    let data = body(128);
+    let mut s = SendStream::new(128);
+    s.write(&data[..64]);
+    s.on_sent(0, 64, false);
+    s.on_acked(48, 16, false);
+    s.on_acked(0, 32, false);
+    // Reclaims the prefix while a remembered ACK uses absolute offsets.
+    s.write(&data[64..]);
+    assert_eq!(s.buf_start, 0);
+    s.on_lost(0, 64, false);
+    assert_eq!(s.next_send(128, 0), Some((32, &data[32..48], false)));
+    transmit(&mut s, &data, 128, 0);
+    s.on_acked(32, 16, false);
+    assert_eq!(s.base_offset, 64);
+    assert_eq!(transmit(&mut s, &data, 32, 32), 32);
+    s.on_acked(80, 16, false);
+    assert_eq!(s.reset(), 96);
+    assert!(s.acked.is_empty());
+    s.on_acked(64, 32, false);
+    s.on_lost(64, 32, true);
+    assert!(!s.has_pending());
+    assert!(!s.is_settled());
+    s.on_reset_acked();
+    assert!(s.is_settled());
+    let mut replacement = SendStream::with_buf(3, s.take_buf());
+    replacement.write(b"new");
+    replacement.finish();
+    assert_eq!(replacement.next_send(3, 3), Some((0, &b"new"[..], true)));
+    assert_eq!(replacement.acked.capacity(), 0);
+}
+
+/// Independent byte-set oracle: every acknowledged byte must disappear from
+/// queued and future retransmissions, irrespective of range boundaries/order.
+#[test]
+fn sparse_ack_and_loss_sequences_match_a_byte_set() {
+    const SENT: usize = 257;
+    let data = body(SENT + 17);
+    for seed in 1..=128 {
+        let mut rng = seed * 0x13ab_752f_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as usize
+        };
+        let mut s = SendStream::new(data.len() as u64);
+        s.write(&data);
+        s.on_sent(0, SENT, false);
+        let mut acked = [false; SENT];
+        for _ in 0..512 {
+            let start = next() % SENT;
+            let end = (start + next() % 33 + 1).min(SENT);
+            if next() % 3 == 0 {
+                acked[start..end].fill(true);
+                s.on_acked(start as u64, end - start, false);
+            } else {
+                s.on_lost(start as u64, end - start, false);
+            }
+            assert_eq!(
+                s.base_offset as usize,
+                acked.iter().take_while(|&&b| b).count()
+            );
+            assert_eq!(s.writable(), 0);
+            assert!(s.acked.windows(2).all(|w| w[0].1 < w[1].0));
+            if next() % 4 == 0 {
+                while let Some((offset, bytes, fin)) = s.next_send(7, 0) {
+                    let range = offset as usize..offset as usize + bytes.len();
+                    assert!(!bytes.is_empty());
+                    assert_eq!(bytes, &data[range.clone()]);
+                    assert!(acked[range].iter().all(|b| !b));
+                    assert!(!fin);
+                    assert_eq!(s.on_sent(offset, bytes.len(), fin), 0);
+                }
+            }
+        }
+        for offset in (0..SENT).rev() {
+            s.on_acked(offset as u64, 1, false);
+        }
+        s.on_lost(0, SENT, false);
+        assert_eq!(s.next_send(100, 0), None);
+        s.finish();
+        assert_eq!(transmit(&mut s, &data, 100, 17), 17);
+        s.on_acked(SENT as u64, 17, true);
+        assert!(s.is_settled());
+    }
 }
 
 #[test]

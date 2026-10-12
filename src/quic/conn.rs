@@ -3825,6 +3825,98 @@ mod tests {
         assert!(conn.stream_mut(id).is_none());
     }
 
+    /// The suffix packet leaves SentPackets after its first ACK. A later ACK
+    /// covering both packets cannot provide another callback for that suffix.
+    #[test]
+    fn sparse_packet_acks_release_retired_streams_and_reuse_their_buffers() {
+        let mut conn = client();
+        conn.max_streams_bidi = 256;
+        conn.params.initial_max_stream_data_bidi_remote = 8192;
+        let body: Vec<_> = (0..8192).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let now = Instant::now();
+        let ack_at = now + Duration::from_millis(10);
+        for n in 0..256 {
+            let (id, written) = conn.send_oneshot(&body).unwrap();
+            assert_eq!(written, body.len());
+            for (number, offset) in [(n * 2, 0), (n * 2 + 1, 4096)] {
+                let fin = offset == 4096;
+                let send = conn.send_mut(id).unwrap();
+                assert_eq!(
+                    send.next_send(4096, 4096),
+                    Some((offset, &body[offset as usize..offset as usize + 4096], fin))
+                );
+                assert_eq!(send.on_sent(offset, 4096, fin), 4096);
+                conn.spaces[Space::Data as usize].sent.push(SentPacket {
+                    ack_largest: None,
+                    number,
+                    time_sent: now,
+                    size: 4128,
+                    ack_eliciting: true,
+                    frames: vec![SentFrame::Stream {
+                        id,
+                        offset,
+                        len: 4096,
+                        fin,
+                    }],
+                });
+            }
+            conn.on_stream(id, 0, b"response", true).unwrap();
+            conn.retire(id, 0x10c);
+            assert_eq!(conn.unanswered, 0);
+            conn.on_ack(Space::Data, n * 2 + 1, 0, 0, &[], ack_at)
+                .unwrap();
+            assert!(conn.stream_mut(id).is_some(), "the prefix is still owed");
+            assert!(conn.spaces[Space::Data as usize].sent.any_ack_eliciting());
+            conn.on_ack(Space::Data, n * 2 + 1, 0, 1, &[], ack_at)
+                .unwrap();
+            assert!(!conn.spaces[Space::Data as usize].sent.any_ack_eliciting());
+            assert!(
+                conn.streams.is_empty(),
+                "all request bytes and FIN were acknowledged"
+            );
+            assert_eq!(conn.spare_bufs.len(), 1, "the same buffers are reused");
+            assert!(conn.reset_pending.is_empty());
+            conn.send_queue.clear();
+            while conn.poll_event().is_some() {}
+        }
+        assert_eq!(conn.base_stream, 256);
+    }
+
+    #[test]
+    fn sparse_stream_acks_release_slots_behind_an_unacknowledged_stream() {
+        let mut conn = client();
+        conn.max_streams_bidi = 65;
+        conn.params.initial_max_stream_data_bidi_remote = 8;
+        for n in 0..65 {
+            let (id, _) = conn.send_oneshot(b"request!").unwrap();
+            conn.send_mut(id).unwrap().on_sent(0, 8, true);
+            conn.retire(id, 0x10c);
+            if n == 0 {
+                continue;
+            }
+            for (offset, fin) in [(4, true), (0, false)] {
+                conn.on_frame_acked(SentFrame::Stream {
+                    id,
+                    offset,
+                    len: 4,
+                    fin,
+                });
+            }
+            assert!(conn.stream_mut(id).is_none());
+            assert_eq!(conn.streams.iter().flatten().count(), 1);
+        }
+        assert_eq!(conn.spare_bufs.len(), 1);
+        conn.on_frame_acked(SentFrame::Stream {
+            id: 0,
+            offset: 0,
+            len: 8,
+            fin: true,
+        });
+        assert!(conn.streams.is_empty());
+        assert_eq!(conn.spare_bufs.len(), 2);
+        assert_eq!(conn.unanswered, 0);
+    }
+
     /// RFC 9001 Section 4.8: a handshake rustls rejects ends in a
     /// CONNECTION_CLOSE carrying 0x100 plus the TLS alert, in the space the
     /// handshake was in, rather than in a socket that goes quiet
