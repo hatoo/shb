@@ -18,6 +18,10 @@ mod recv;
 #[path = "../tests/support/h3_server.rs"]
 mod test_server;
 
+#[cfg(test)]
+#[path = "../tests/support/h3_duplicates.rs"]
+mod duplicate_tests;
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, RawFd};
