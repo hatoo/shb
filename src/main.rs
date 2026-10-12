@@ -30,6 +30,9 @@ mod tls;
 #[path = "../tests/support/credit_recovery.rs"]
 mod credit_recovery;
 #[cfg(test)]
+#[path = "../tests/support/h2_continuation.rs"]
+mod h2_continuation;
+#[cfg(test)]
 #[path = "../tests/support/h2_handshake.rs"]
 mod h2_handshake;
 #[cfg(test)]
