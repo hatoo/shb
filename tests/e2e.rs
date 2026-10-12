@@ -25,6 +25,9 @@ mod h2_timeout;
 mod h2_peer;
 use h2_peer::{H2Script, h2_frame, serve_scripted_h2};
 
+#[path = "support/h3_relay.rs"]
+mod h3_relay;
+
 /// Status code by method so tests can verify the method actually reached the
 /// server. A request carrying an `X-Echo` header must send a matching body,
 /// and vice versa, so a single 200/201/... response proves both arrived.
@@ -1496,8 +1499,8 @@ fn a_slow_response_ends_an_http3_run_at_its_timeout() {
 /// stack showed up first against servers out on the internet, which is a slow
 /// way to learn.
 ///
-/// The impairment is driven by a seeded generator, so a run that fails fails
-/// the same way again.
+/// A seed fixes the impairment decisions for a given arrival sequence;
+/// concurrent connections can still interleave differently between runs.
 ///
 /// With `gate_handshake` the server's Handshake packets are dropped - the
 /// ones coalesced behind its Initial by cutting the datagram there - until
@@ -1550,45 +1553,7 @@ fn impaired_h3_addr(
     let front = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("bind relay"));
     let addr = front.local_addr().expect("relay addr");
 
-    // Deterministic and tiny; the sequence only has to be irregular
-    struct Rng(u64);
-    impl Rng {
-        fn hits(&mut self, percent: u32) -> bool {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            percent > 0 && (self.0 >> 33) as u32 % 100 < percent
-        }
-    }
-
-    // One datagram held back and released after the next one goes: reordering
-    // without a timer to make the test flaky
-    fn relay(
-        send: impl Fn(&[u8]),
-        rng: &mut Rng,
-        held: &mut Option<Vec<u8>>,
-        data: &[u8],
-        loss: u32,
-        dup: u32,
-        reorder: u32,
-    ) {
-        if rng.hits(loss) {
-            return;
-        }
-        if let Some(previous) = held.take() {
-            send(data);
-            send(&previous);
-            return;
-        }
-        if rng.hits(reorder) {
-            *held = Some(data.to_vec());
-            return;
-        }
-        send(data);
-        if rng.hits(dup) {
-            send(data);
-        }
-    }
+    use h3_relay::{Rng, relay};
 
     let peers: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Default::default();
     let f = Arc::clone(&front);
@@ -1628,12 +1593,12 @@ fn impaired_h3_addr(
                                 }
                             }
                             relay(
-                                |d| {
-                                    let _ = out.send_to(d, from);
+                                |destination, d| {
+                                    let _ = out.send_to(d, *destination);
                                 },
                                 &mut rng,
                                 &mut held,
-                                data,
+                                (&from, data),
                                 loss_pct,
                                 dup_pct,
                                 reorder_pct,
@@ -1647,12 +1612,12 @@ fn impaired_h3_addr(
                 gate_open.store(true, Ordering::Relaxed);
             }
             relay(
-                |d| {
-                    let _ = up.send(d);
+                |destination, d| {
+                    let _ = destination.send(d);
                 },
                 &mut rng,
                 &mut held,
-                &buf[..n],
+                (&up, &buf[..n]),
                 loss_pct,
                 dup_pct,
                 reorder_pct,
@@ -1676,7 +1641,18 @@ fn h3_gets_through_a_lossy_path() {
 fn h3_gets_through_duplication_and_reordering() {
     let addr = impaired_h3_addr(2, 10, 10, 0xd0e5, false);
     let url = format!("https://127.0.0.1:{}/", addr.port());
-    let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
+    let report = shb_json(&[
+        "--http3",
+        "--timeout",
+        "5s",
+        "-n",
+        "40",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
     assert_all_ok(&report, 40, "200");
 }
 
