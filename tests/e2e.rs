@@ -21,6 +21,13 @@ use axum::routing::any;
 #[path = "support/h2_timeout.rs"]
 mod h2_timeout;
 
+#[path = "support/h2_peer.rs"]
+mod h2_peer;
+use h2_peer::{H2Script, h2_frame, serve_scripted_h2};
+
+#[path = "support/h3_relay.rs"]
+mod h3_relay;
+
 /// Status code by method so tests can verify the method actually reached the
 /// server. A request carrying an `X-Echo` header must send a matching body,
 /// and vice versa, so a single 200/201/... response proves both arrived.
@@ -706,206 +713,24 @@ fn h2_every_registered_method_arrives() {
     assert_every_method_arrives(&["--http2"], &url);
 }
 
-/// What a scripted HTTP/2 server does, beyond answering every request 200
-///
-/// hyper behind axum is a well-behaved peer, and the things the protocol
-/// lets a server do to a client - shrink the header table, refuse streams,
-/// go away - are the things it does not do on demand. This one does nothing
-/// but those, on a raw socket, one thread per connection.
-#[derive(Clone, Copy, Default)]
-struct H2Script {
-    /// Advertise SETTINGS_HEADER_TABLE_SIZE 0 and, once the client has
-    /// acknowledged it, tear the connection down unless the next header block
-    /// opens with the dynamic table size update RFC 7541 Section 4.2 says it
-    /// must. That is what nghttp2 does.
-    header_table_size_zero: bool,
-    /// Act on this many streams per connection and no more: the first one
-    /// past the line draws a GOAWAY naming the last one acted on, streams
-    /// above it are never answered, and the connection closes once those
-    /// below it have been. That is nginx's keepalive_requests.
-    streams_per_connection: Option<u32>,
-    /// Advertise this many concurrent streams and take that many of the
-    /// HEADERS in one read, refusing the rest with RST_STREAM(REFUSED_STREAM)
-    /// as a server does when a client opens more than it said it would take.
-    /// Node with maxConcurrentStreams does this to a first flight.
-    accept_per_read: Option<usize>,
-}
-
-fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u32;
-    let mut v = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
-    v.extend_from_slice(&stream.to_be_bytes());
-    v.extend_from_slice(payload);
-    v
-}
-
 fn start_scripted_h2_server(script: H2Script) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            std::thread::spawn(move || serve_scripted_h2(stream, script));
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            std::thread::spawn(move || {
+                let _ = serve_scripted_h2(stream, script);
+            });
         }
     });
     addr
-}
-
-fn serve_scripted_h2(mut sock: impl std::io::Read + std::io::Write, script: H2Script) {
-    const DATA: u8 = 0x0;
-    const HEADERS: u8 = 0x1;
-    const RST_STREAM: u8 = 0x3;
-    const SETTINGS: u8 = 0x4;
-    const PING: u8 = 0x6;
-    const GOAWAY: u8 = 0x7;
-    const WINDOW_UPDATE: u8 = 0x8;
-    const FLAG_ACK: u8 = 0x1;
-    const FLAG_END_STREAM: u8 = 0x1;
-    const FLAG_END_HEADERS: u8 = 0x4;
-    const NO_ERROR: u32 = 0x0;
-    const REFUSED_STREAM: u32 = 0x7;
-    const COMPRESSION_ERROR: u32 = 0x9;
-
-    let goaway = |last: u32, code: u32| {
-        let mut payload = last.to_be_bytes().to_vec();
-        payload.extend_from_slice(&code.to_be_bytes());
-        h2_frame(GOAWAY, 0, 0, &payload)
-    };
-    // The highest stream id this connection acts on
-    let last_stream = script
-        .streams_per_connection
-        .map_or(u32::MAX, |n| (2 * n).saturating_sub(1));
-
-    let mut settings = Vec::new();
-    if script.header_table_size_zero {
-        settings.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
-    }
-    if let Some(n) = script.accept_per_read {
-        settings.extend_from_slice(&[0, 3]);
-        settings.extend_from_slice(&(n as u32).to_be_bytes());
-    }
-    if sock
-        .write_all(&h2_frame(SETTINGS, 0, 0, &settings))
-        .is_err()
-    {
-        return;
-    }
-
-    let mut pending = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    let mut preface_read = false;
-    // The first header block after the client acknowledges our SETTINGS is
-    // the one that owes the size update
-    let mut size_update_due = false;
-    // Streams whose request body has not finished arriving
-    let mut awaiting_body: Vec<u32> = Vec::new();
-    let mut goaway_sent = false;
-    loop {
-        match sock.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => pending.extend_from_slice(&chunk[..n]),
-        }
-        if !preface_read {
-            if pending.len() < 24 {
-                continue;
-            }
-            assert_eq!(&pending[..24], b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-            pending.drain(..24);
-            preface_read = true;
-        }
-        let mut out = Vec::new();
-        let mut pos = 0;
-        let mut accepted_this_read = 0;
-        while pending.len() - pos >= 9 {
-            let h = &pending[pos..pos + 9];
-            let len = u32::from_be_bytes([0, h[0], h[1], h[2]]) as usize;
-            let (kind, flags) = (h[3], h[4]);
-            let stream = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
-            if pending.len() < pos + 9 + len {
-                break;
-            }
-            let payload = &pending[pos + 9..pos + 9 + len];
-            pos += 9 + len;
-
-            let respond = |out: &mut Vec<u8>, stream: u32| {
-                out.extend_from_slice(&h2_frame(
-                    HEADERS,
-                    FLAG_END_HEADERS | FLAG_END_STREAM,
-                    stream,
-                    &[0x88],
-                ));
-            };
-            match kind {
-                SETTINGS if flags & FLAG_ACK != 0 => {
-                    size_update_due = script.header_table_size_zero;
-                }
-                SETTINGS => out.extend_from_slice(&h2_frame(SETTINGS, FLAG_ACK, 0, &[])),
-                PING if flags & FLAG_ACK == 0 => {
-                    out.extend_from_slice(&h2_frame(PING, FLAG_ACK, 0, payload));
-                }
-                HEADERS => {
-                    // The client sets neither PADDED nor PRIORITY, so the
-                    // block starts at the payload. The update is 001xxxxx.
-                    if std::mem::take(&mut size_update_due)
-                        && payload.first().map(|b| b & 0xe0) != Some(0x20)
-                    {
-                        let _ = sock.write_all(&goaway(0, COMPRESSION_ERROR));
-                        return;
-                    }
-                    if stream > last_stream {
-                        if !goaway_sent {
-                            // Ahead of the responses already queued: nginx
-                            // sends control frames in front of everything
-                            // else, so its GOAWAY reaches the client before
-                            // the answers to the streams below its line
-                            out.splice(0..0, goaway(last_stream, NO_ERROR));
-                            goaway_sent = true;
-                        }
-                        continue;
-                    }
-                    if script
-                        .accept_per_read
-                        .is_some_and(|n| accepted_this_read >= n)
-                    {
-                        out.extend_from_slice(&h2_frame(
-                            RST_STREAM,
-                            0,
-                            stream,
-                            &REFUSED_STREAM.to_be_bytes(),
-                        ));
-                        continue;
-                    }
-                    accepted_this_read += 1;
-                    if flags & FLAG_END_STREAM != 0 {
-                        respond(&mut out, stream);
-                    } else {
-                        awaiting_body.push(stream);
-                    }
-                }
-                DATA if stream > last_stream => {}
-                DATA => {
-                    // Credit goes straight back, on both windows
-                    let credit = (len as u32).to_be_bytes();
-                    out.extend_from_slice(&h2_frame(WINDOW_UPDATE, 0, 0, &credit));
-                    out.extend_from_slice(&h2_frame(WINDOW_UPDATE, 0, stream, &credit));
-                    if flags & FLAG_END_STREAM != 0
-                        && let Some(i) = awaiting_body.iter().position(|s| *s == stream)
-                    {
-                        awaiting_body.swap_remove(i);
-                        respond(&mut out, stream);
-                    }
-                }
-                _ => {}
-            }
-        }
-        pending.drain(..pos);
-        if sock.write_all(&out).is_err() {
-            return;
-        }
-        if goaway_sent && awaiting_body.is_empty() {
-            return;
-        }
-    }
 }
 
 /// Node with `headerTableSize: 0` answered the first flight of a run and
@@ -998,36 +823,11 @@ fn h2_concurrent_reconnects_preserve_the_request_budget() {
 /// then repeat that path while other slots are sending requests or responses.
 #[test]
 fn h2_tls_handshakes_and_reconnects_flush_every_slot() {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
-    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![certified.cert.der().clone()], key.into())
-    .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    let config = std::sync::Arc::new(config);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let config = config.clone();
-            std::thread::spawn(move || {
-                let mut tls = rustls::ServerConnection::new(config).unwrap();
-                serve_scripted_h2(
-                    rustls::Stream::new(&mut tls, &mut stream),
-                    H2Script {
-                        streams_per_connection: Some(5),
-                        ..H2Script::default()
-                    },
-                );
-            });
-        }
+    let server = h2_peer::TlsServer::start(H2Script {
+        streams_per_connection: Some(5),
+        ..H2Script::default()
     });
+    let addr = server.addr;
     let url = format!("https://{addr}/");
     let report = shb_json(&[
         "--http2",
@@ -1043,6 +843,9 @@ fn h2_tls_handshakes_and_reconnects_flush_every_slot() {
         "5s",
         &url,
     ]);
+    let peers = server.finish();
+    assert_eq!(peers.iter().map(|p| p.responses).sum::<usize>(), 256);
+    assert!(peers.iter().map(|p| p.goaways).sum::<usize>() >= 8);
     assert_all_ok(&report, 256, "200");
     assert_eq!(report["requests"]["connectErrors"], 0);
 }
@@ -1696,8 +1499,8 @@ fn a_slow_response_ends_an_http3_run_at_its_timeout() {
 /// stack showed up first against servers out on the internet, which is a slow
 /// way to learn.
 ///
-/// The impairment is driven by a seeded generator, so a run that fails fails
-/// the same way again.
+/// A seed fixes the impairment decisions for a given arrival sequence;
+/// concurrent connections can still interleave differently between runs.
 ///
 /// With `gate_handshake` the server's Handshake packets are dropped - the
 /// ones coalesced behind its Initial by cutting the datagram there - until
@@ -1750,45 +1553,7 @@ fn impaired_h3_addr(
     let front = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("bind relay"));
     let addr = front.local_addr().expect("relay addr");
 
-    // Deterministic and tiny; the sequence only has to be irregular
-    struct Rng(u64);
-    impl Rng {
-        fn hits(&mut self, percent: u32) -> bool {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            percent > 0 && (self.0 >> 33) as u32 % 100 < percent
-        }
-    }
-
-    // One datagram held back and released after the next one goes: reordering
-    // without a timer to make the test flaky
-    fn relay(
-        send: impl Fn(&[u8]),
-        rng: &mut Rng,
-        held: &mut Option<Vec<u8>>,
-        data: &[u8],
-        loss: u32,
-        dup: u32,
-        reorder: u32,
-    ) {
-        if rng.hits(loss) {
-            return;
-        }
-        if let Some(previous) = held.take() {
-            send(data);
-            send(&previous);
-            return;
-        }
-        if rng.hits(reorder) {
-            *held = Some(data.to_vec());
-            return;
-        }
-        send(data);
-        if rng.hits(dup) {
-            send(data);
-        }
-    }
+    use h3_relay::{Rng, relay};
 
     let peers: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Default::default();
     let f = Arc::clone(&front);
@@ -1828,12 +1593,12 @@ fn impaired_h3_addr(
                                 }
                             }
                             relay(
-                                |d| {
-                                    let _ = out.send_to(d, from);
+                                |destination, d| {
+                                    let _ = out.send_to(d, *destination);
                                 },
                                 &mut rng,
                                 &mut held,
-                                data,
+                                (&from, data),
                                 loss_pct,
                                 dup_pct,
                                 reorder_pct,
@@ -1847,12 +1612,12 @@ fn impaired_h3_addr(
                 gate_open.store(true, Ordering::Relaxed);
             }
             relay(
-                |d| {
-                    let _ = up.send(d);
+                |destination, d| {
+                    let _ = destination.send(d);
                 },
                 &mut rng,
                 &mut held,
-                &buf[..n],
+                (&up, &buf[..n]),
                 loss_pct,
                 dup_pct,
                 reorder_pct,
@@ -1876,7 +1641,18 @@ fn h3_gets_through_a_lossy_path() {
 fn h3_gets_through_duplication_and_reordering() {
     let addr = impaired_h3_addr(2, 10, 10, 0xd0e5, false);
     let url = format!("https://127.0.0.1:{}/", addr.port());
-    let report = shb_json(&["--http3", "-n", "40", "-c", "2", "-t", "1", &url]);
+    let report = shb_json(&[
+        "--http3",
+        "--timeout",
+        "5s",
+        "-n",
+        "40",
+        "-c",
+        "2",
+        "-t",
+        "1",
+        &url,
+    ]);
     assert_all_ok(&report, 40, "200");
 }
 

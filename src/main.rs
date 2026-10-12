@@ -33,6 +33,12 @@ mod credit_recovery;
 #[path = "../tests/support/h2_handshake.rs"]
 mod h2_handshake;
 #[cfg(test)]
+#[path = "../tests/support/h2_peer.rs"]
+mod h2_peer;
+#[cfg(test)]
+#[path = "../tests/support/h2_shutdown.rs"]
+mod h2_shutdown;
+#[cfg(test)]
 #[path = "../tests/support/h3_handshake.rs"]
 mod h3_handshake;
 #[cfg(test)]
