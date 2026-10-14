@@ -998,6 +998,43 @@ mod tests {
     }
 
     #[test]
+    fn huffman_literal_status_survives_every_header_and_transport_split() {
+        // python-hpack 4.1.0 verifies this literal name/value as :status 503.
+        let block = b"\x00\x85\xb8\x84\x8d\x36\xa3\x83\x6c\x0c\xff";
+        for header_split in 0..=block.len() {
+            let mut data = frame(HEADERS, FLAG_END_STREAM, 1, &block[..header_split]);
+            data.extend(frame(CONTINUATION, 0, 1, &[]));
+            data.extend(frame(
+                CONTINUATION,
+                FLAG_END_HEADERS,
+                1,
+                &block[header_split..],
+            ));
+            for transport_split in 0..=data.len() {
+                let mut c = connected();
+                assert_eq!(c.start_stream(&[0x82], b""), Some(1));
+                c.take_output();
+                let mut events = Vec::new();
+                c.feed(&data[..transport_split], &mut events).unwrap();
+                c.feed(&data[transport_split..], &mut events).unwrap();
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "{header_split}/{transport_split}: {events:?}"
+                );
+                assert!(matches!(
+                    events[0],
+                    Event::Status {
+                        stream_id: 1,
+                        status: 503
+                    }
+                ));
+                assert!(matches!(events[1], Event::End { stream_id: 1 }));
+            }
+        }
+    }
+
+    #[test]
     fn ping_is_acknowledged() {
         let mut c = connected();
         let mut events = Vec::new();

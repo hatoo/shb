@@ -45,6 +45,9 @@ mod h2_send_accounting;
 #[path = "../tests/support/h2_shutdown.rs"]
 mod h2_shutdown;
 #[cfg(test)]
+#[path = "../tests/support/h2_status_names.rs"]
+mod h2_status_names;
+#[cfg(test)]
 #[path = "../tests/support/h3_handshake.rs"]
 mod h3_handshake;
 #[cfg(test)]
