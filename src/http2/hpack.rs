@@ -218,7 +218,13 @@ pub fn find_status(block: &[u8]) -> Result<Option<u16>> {
 
         let named_status = if name_index == 0 {
             let (name, huffman) = read_str(block, &mut pos)?;
-            !huffman && name == b":status"
+            if huffman {
+                // RFC 7541 Appendix B gives one encoding of this fixed name;
+                // compare it directly without decoding or allocating a string.
+                name == b"\xb8\x84\x8d\x36\xa3"
+            } else {
+                name == b":status"
+            }
         } else {
             if name_index > 61 {
                 bail!("HPACK dynamic table reference");
@@ -337,6 +343,76 @@ mod tests {
         // 00010 00000 00001 1 -> 0001_0000 0000_0011
         let block = [0x08u8, 0x82, 0x10, 0x03];
         assert_eq!(find_status(&block).unwrap(), Some(201));
+    }
+
+    #[test]
+    fn literal_status_names_support_both_string_encodings() {
+        // Independently encoded/decoded by python-hpack 4.1.0; Appendix B's
+        // fixed code and mandatory EOS-prefix padding give one encoding.
+        for mode in [0x00, 0x10, 0x40] {
+            for (name, name_mask) in [
+                (&b":status"[..], 0),
+                (&[0xb8, 0x84, 0x8d, 0x36, 0xa3][..], 0x80),
+            ] {
+                for (status, encoded) in [
+                    (103, &[0x08, 0x19][..]),
+                    (201, &[0x10, 0x03][..]),
+                    (404, &[0x68, 0x0d, 0x7f][..]),
+                    (503, &[0x6c, 0x0c, 0xff][..]),
+                ] {
+                    let plain = status.to_string();
+                    for (value, value_mask) in [(plain.as_bytes(), 0), (encoded, 0x80)] {
+                        let mut block = vec![0x20, mode, name_mask | name.len() as u8];
+                        block.extend_from_slice(name);
+                        block.push(value_mask | value.len() as u8);
+                        block.extend_from_slice(value);
+                        assert_eq!(find_status(&block).unwrap(), Some(status), "{block:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn similar_or_invalid_literal_names_are_not_a_status() {
+        for name in [
+            &[0x42, 0x46, 0x9b, 0x51][..],         // status
+            &[0xb9, 0xb9, 0x23, 0x4d, 0xa8],       // :Status
+            &[0xb8, 0x84, 0x8d, 0x36, 0xff],       // :statu
+            &[0xb8, 0x84, 0x8d, 0x36, 0xa3, 0xcf], // :statusx
+            &[0xb8, 0x84, 0x8d, 0x36, 0xa3, 0xff], // excess padding
+            b":status",                            // not Huffman bytes despite the flag
+        ] {
+            let mut block = vec![0, 0x80 | name.len() as u8];
+            block.extend_from_slice(name);
+            block.extend_from_slice(b"\x03200");
+            // Ignored fields are still skipped, never promoted to :status.
+            assert_eq!(find_status(&block).unwrap(), None, "{name:?}");
+            block.push(0x8e);
+            assert_eq!(find_status(&block).unwrap(), Some(500), "{name:?}");
+        }
+        assert_eq!(
+            find_status(b"\x00\x05\xb8\x84\x8d\x36\xa3\x03200").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn huffman_literal_status_keeps_truncation_and_value_errors() {
+        let block = b"\x00\x85\xb8\x84\x8d\x36\xa3\x83\x6c\x0c\xff";
+        for end in 1..block.len() {
+            assert!(find_status(&block[..end]).is_err(), "truncated at {end}");
+        }
+        for bad_value in [
+            &b"\x0220"[..],
+            b"\x032x0",
+            b"\x83\x6c\x0c\xfe",
+            b"\x84\x6c\x0c\xff\xff",
+        ] {
+            let mut invalid = block[..7].to_vec();
+            invalid.extend_from_slice(bad_value);
+            assert!(find_status(&invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]
