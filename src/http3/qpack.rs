@@ -255,7 +255,13 @@ pub fn find_status(section: &[u8]) -> Result<Option<u16>> {
         } else if first & 0x20 != 0 {
             // Literal field line with a literal name
             let (name, name_huffman) = read_str(section, &mut pos, 3)?;
-            let named_status = !name_huffman && name == b":status";
+            let named_status = if name_huffman {
+                // QPACK uses HPACK's fixed Huffman code. Match the one valid
+                // encoding of this name without decoding or allocating it.
+                name == b"\xb8\x84\x8d\x36\xa3"
+            } else {
+                name == b":status"
+            };
             let (value, huffman) = read_str(section, &mut pos, 7)?;
             if named_status {
                 return crate::status::status_value(value, huffman).map(Some);
@@ -381,6 +387,85 @@ mod tests {
         let mut body = Vec::new();
         literal(&mut body, b":status", b"418");
         assert_eq!(find_status(&section(&body)).unwrap(), Some(418));
+    }
+
+    #[test]
+    fn literal_status_names_support_both_encodings_and_never_index() {
+        // Independent pylsqpack decoding verifies these RFC 9204 4.5.6
+        // representations. N and H are separate from the 3-bit name length.
+        for never_index in [0, 0x10] {
+            for (name, name_mask) in [(&b":status"[..], 0), (&b"\xb8\x84\x8d\x36\xa3"[..], 0x08)] {
+                for (status, encoded) in [
+                    (103, &b"\x08\x19"[..]),
+                    (201, &b"\x10\x03"[..]),
+                    (404, &b"\x68\x0d\x7f"[..]),
+                    (503, &b"\x6c\x0c\xff"[..]),
+                ] {
+                    let plain = status.to_string();
+                    for (value, value_mask) in [(plain.as_bytes(), 0), (encoded, 0x80)] {
+                        let mut body = Vec::new();
+                        encode_int(
+                            &mut body,
+                            3,
+                            0x20 | never_index | name_mask,
+                            name.len() as u64,
+                        );
+                        body.extend_from_slice(name);
+                        encode_int(&mut body, 7, value_mask, value.len() as u64);
+                        body.extend_from_slice(value);
+                        assert_eq!(
+                            find_status(&section(&body)).unwrap(),
+                            Some(status),
+                            "{body:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn similar_or_invalid_literal_names_are_not_a_status() {
+        for name in [
+            &b"\x42\x46\x9b\x51"[..],    // status
+            b"\xb9\xb9\x23\x4d\xa8",     // :Status
+            b"\xb8\x84\x8d\x36\xff",     // :statu
+            b"\xb8\x84\x8d\x36\xa3\xcf", // :statusx
+            b"\xb8\x84\x8d\x36\xa3\xff", // excess padding
+            b"\xb8\x84\x8d\x36\xa2",     // incorrect padding
+            b":status",                  // raw name with the Huffman flag
+        ] {
+            let mut body = Vec::new();
+            encode_int(&mut body, 3, 0x28, name.len() as u64);
+            body.extend_from_slice(name);
+            body.extend_from_slice(b"\x03200");
+            assert_eq!(find_status(&section(&body)).unwrap(), None, "{name:?}");
+            indexed(&mut body, 28);
+            assert_eq!(find_status(&section(&body)).unwrap(), Some(503), "{name:?}");
+        }
+        // The same fixed bytes with H=0 are not a :status name either.
+        assert_eq!(
+            find_status(b"\0\0\x25\xb8\x84\x8d\x36\xa3\x03200").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn huffman_literal_status_keeps_truncation_and_value_errors() {
+        let block = b"\0\0\x3d\xb8\x84\x8d\x36\xa3\x83\x6c\x0c\xff";
+        for end in 3..block.len() {
+            assert!(find_status(&block[..end]).is_err(), "truncated at {end}");
+        }
+        for bad_value in [
+            &b"\x0220"[..],
+            b"\x032x0",
+            b"\x83\x6c\x0c\xfe",
+            b"\x84\x6c\x0c\xff\xff",
+        ] {
+            let mut invalid = block[..8].to_vec();
+            invalid.extend_from_slice(bad_value);
+            assert!(find_status(&invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

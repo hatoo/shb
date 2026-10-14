@@ -362,6 +362,38 @@ mod tests {
     }
 
     #[test]
+    fn literal_huffman_status_survives_every_fragment_and_trailers() {
+        let early = frame(FRAME_HEADERS, b"\0\0\x3d\xb8\x84\x8d\x36\xa3\x82\x08\x19");
+        let final_headers = frame(
+            FRAME_HEADERS,
+            b"\0\0\x2d\xb8\x84\x8d\x36\xa3\x83\x6c\x0c\xff",
+        );
+        let mut stream = early.clone();
+        stream.extend_from_slice(&final_headers);
+        stream.extend(frame(FRAME_DATA, b"body"));
+        // Huffman "status" without the colon is an ordinary trailer.
+        stream.extend(frame(FRAME_HEADERS, b"\0\0\x2c\x42\x46\x9b\x51\x03103"));
+        let boundary = early.len() + final_headers.len();
+        for split in 0..=stream.len() {
+            let mut r = ResponseReader::default();
+            r.feed(&stream[..split]).unwrap();
+            assert_eq!(
+                r.status(),
+                if split < boundary { 0 } else { 503 },
+                "split {split}"
+            );
+            r.feed(&stream[split..]).unwrap();
+            assert_eq!(r.status(), 503, "split {split}");
+            assert!(r.pending.is_empty());
+        }
+        let mut r = ResponseReader::default();
+        for (pos, byte) in stream.iter().enumerate() {
+            r.feed(std::slice::from_ref(byte)).unwrap();
+            assert_eq!(r.status(), if pos + 1 < boundary { 0 } else { 503 });
+        }
+    }
+
+    #[test]
     fn a_large_body_is_skipped_across_reads() {
         let mut r = ResponseReader::default();
         let body = vec![b'x'; 100_000];
