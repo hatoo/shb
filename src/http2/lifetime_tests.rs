@@ -108,6 +108,160 @@ impl Fixture {
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         std::mem::replace(&mut self.peer, peer)
     }
+
+    fn queue_send(&mut self, len: usize, generation: u64) {
+        let (submitter, mut sq, _) = self.ring.split();
+        uring::push_send_slice(
+            &submitter,
+            &mut sq,
+            0,
+            generation,
+            &self.conn.out[self.conn.out_off..self.conn.out_off + len],
+        )
+        .unwrap();
+    }
+
+    fn finish_sends(&mut self, stats: &mut Stats) {
+        let (submitter, mut sq, mut cq) = self.ring.split();
+        sq.sync();
+        uring::submit_and_wait_timeout(&submitter, Duration::from_secs(1), 1).unwrap();
+        cq.sync();
+        assert!(!cq.is_empty(), "expected a real kernel completion");
+        drain_final_completions(
+            &mut cq,
+            std::slice::from_mut(&mut self.conn),
+            &mut self.buffers,
+            stats,
+        );
+        assert!(cq.is_empty());
+        // A second pass must not report the same CQE twice.
+        drain_final_completions(
+            &mut cq,
+            std::slice::from_mut(&mut self.conn),
+            &mut self.buffers,
+            stats,
+        );
+    }
+}
+
+#[test]
+fn final_send_completions_count_only_the_completed_bytes_once() {
+    let mut f = Fixture::new();
+    f.conn.out = b"partial send".to_vec();
+    f.conn.sending = true;
+    let start = Instant::now();
+    f.conn.streams.push(1, InFlight { start, status: 200 });
+    let mut stats = Stats {
+        bytes_sent: 123,
+        bytes_received: 456,
+        completed: 2,
+        errors: 3,
+        connect_errors: 1,
+        latencies_ns: vec![17, 29],
+        ..Stats::default()
+    };
+    stats.status_counts[200] = 2;
+    // Bound each real send to exercise a partial completion deterministically,
+    // independent of the kernel's socket-buffer size or TCP scheduling.
+    for n in [3, 4, 5] {
+        let before = f.conn.out_off;
+        f.queue_send(n, f.conn.generation);
+        f.finish_sends(&mut stats);
+        let mut bytes = vec![0; n];
+        f.peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, f.conn.out[before..before + n]);
+        assert_eq!(f.conn.out_off, before + n);
+        assert_eq!(stats.bytes_sent, 123 + f.conn.out_off as u64);
+        assert_eq!(f.conn.sending, f.conn.out_off < f.conn.out.len());
+        assert_eq!(
+            (stats.completed, stats.errors, stats.connect_errors),
+            (2, 3, 1)
+        );
+        assert_eq!(stats.bytes_received, 456);
+        assert_eq!(stats.latencies_ns, [17, 29]);
+        assert_eq!(stats.status_counts[200], 2);
+        assert_eq!(stats.status_counts.iter().sum::<u64>(), 2);
+        assert!(f.conn.streams.get_mut(1).unwrap().start == start);
+    }
+    assert!(!f.conn.sending);
+}
+
+#[test]
+fn final_send_completions_ignore_old_connection_generations() {
+    let mut f = Fixture::new();
+    f.conn.out = b"stale".to_vec();
+    f.conn.sending = true;
+    f.conn.generation = 1;
+    let mut stats = Stats::default();
+    f.queue_send(f.conn.out.len(), 0);
+    f.finish_sends(&mut stats);
+    assert_eq!(stats.bytes_sent, 0);
+    assert_eq!(f.conn.out_off, 0);
+    assert!(f.conn.sending);
+    let mut bytes = [0; 5];
+    f.peer.read_exact(&mut bytes).unwrap();
+    assert_eq!(
+        &bytes, b"stale",
+        "old-generation success was actually delivered"
+    );
+}
+
+#[test]
+fn final_send_completions_ignore_zero_and_failed_sends() {
+    for failed in [false, true] {
+        let mut f = Fixture::new();
+        f.conn.out = b"unsent".to_vec();
+        f.conn.sending = true;
+        if failed {
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(f.conn.fd) };
+            socket2::SockRef::from(&fd)
+                .shutdown(std::net::Shutdown::Write)
+                .unwrap();
+        }
+        f.queue_send(if failed { f.conn.out.len() } else { 0 }, 0);
+        let mut stats = Stats::default();
+        f.finish_sends(&mut stats);
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(f.conn.out_off, 0);
+        assert!(
+            f.conn.sending,
+            "unfinished output must still prevent GOAWAY"
+        );
+        assert_eq!(
+            (stats.completed, stats.errors, stats.connect_errors),
+            (0, 0, 0)
+        );
+        assert!(stats.latencies_ns.is_empty());
+    }
+}
+
+#[test]
+fn final_completion_drain_ignores_timeouts_and_recycles_receive_buffers() {
+    let mut f = Fixture::with_buffers(1);
+    f.arm(true);
+    let mut stats = Stats::default();
+    for bytes in [b"first".as_slice(), b"reused".as_slice()] {
+        f.peer.write_all(bytes).unwrap();
+        f.finish_sends(&mut stats);
+        assert_eq!(f.buffers.data(0, bytes.len()), bytes);
+        assert_eq!((stats.bytes_sent, stats.bytes_received), (0, 0));
+        assert_eq!(f.conn.out_off, 0);
+        // With a single provided buffer, the next positive receive proves
+        // the final drain returned ownership to the kernel.
+    }
+    let (submitter, mut sq, _) = f.ring.split();
+    uring::push_sqe(
+        &submitter,
+        &mut sq,
+        io_uring::opcode::Nop::new()
+            .build()
+            .user_data(TIMEOUT_USER_DATA),
+    )
+    .unwrap();
+    drop(sq);
+    f.finish_sends(&mut stats);
+    assert_eq!((stats.bytes_sent, stats.bytes_received), (0, 0));
+    f.retire();
 }
 
 impl Drop for Fixture {

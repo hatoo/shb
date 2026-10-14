@@ -367,6 +367,34 @@ fn flush_pending(
     pending.drain(|conn_idx| flush(submitter, sq, conn_idx, &mut conns[conn_idx]))
 }
 
+/// Account for sends completed by the last submission, after the request
+/// budget was met. This pass does not retry partial sends or process responses.
+/// The later best-effort GOAWAY uses libc::send and remains outside this count.
+fn drain_final_completions(
+    cq: &mut cqueue::CompletionQueue<'_>,
+    conns: &mut [Conn],
+    buf_ring: &mut BufRing,
+    stats: &mut Stats,
+) {
+    cq.sync();
+    for cqe in cq {
+        let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
+        if let Some(bid) = cqueue::buffer_select(flags) {
+            buf_ring.recycle(bid);
+        }
+        if ud == TIMEOUT_USER_DATA {
+            continue;
+        }
+        let (op, conn_idx, generation) = uring::decode_user_data(ud);
+        let conn = &mut conns[conn_idx];
+        if op == OP_SEND && generation == conn.generation && res > 0 {
+            stats.bytes_sent += res as u64;
+            conn.out_off += res as usize;
+            conn.sending = conn.out_off < conn.out.len();
+        }
+    }
+}
+
 /// Turn the connection's events into statistics
 ///
 /// A request is found by its stream number, which is where its slot is.
@@ -839,22 +867,7 @@ pub fn run_worker(
     // whose send is still not done gets no GOAWAY and is closed as before.
     sq.sync();
     let _ = uring::submit_and_wait_timeout(&submitter, Duration::ZERO, 1);
-    cq.sync();
-    for cqe in &mut cq {
-        let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
-        if let Some(bid) = cqueue::buffer_select(flags) {
-            buf_ring.recycle(bid);
-        }
-        if ud == TIMEOUT_USER_DATA {
-            continue;
-        }
-        let (op, conn_idx, generation) = uring::decode_user_data(ud);
-        let conn = &mut conns[conn_idx];
-        if op == OP_SEND && generation == conn.generation && res > 0 {
-            conn.out_off += res as usize;
-            conn.sending = conn.out_off < conn.out.len();
-        }
-    }
+    drain_final_completions(&mut cq, &mut conns, &mut buf_ring, &mut stats);
     for (conn_idx, conn) in conns.iter_mut().enumerate() {
         if conn.connected
             && !conn.sending
