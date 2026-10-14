@@ -39,6 +39,9 @@ mod h2_handshake;
 #[path = "../tests/support/h2_peer.rs"]
 mod h2_peer;
 #[cfg(test)]
+#[path = "../tests/support/h2_send_accounting.rs"]
+mod h2_send_accounting;
+#[cfg(test)]
 #[path = "../tests/support/h2_shutdown.rs"]
 mod h2_shutdown;
 #[cfg(test)]
