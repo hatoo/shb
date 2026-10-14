@@ -497,6 +497,106 @@ fn recycle(conn: &mut Conn) {
     }
 }
 
+/// A successful send still contributed bytes even if its socket generation
+/// closed before the CQE arrived. Only the retained operation owns those bytes;
+/// it must not change the replacement connection's queue or sending state.
+fn complete_retired_send(ud: u64, res: i32, retired: &mut Vec<Retired>, stats: &mut Stats) {
+    if let Some(index) = retired.iter().position(|r| r.user_data == ud) {
+        retired.swap_remove(index);
+        if res > 0 {
+            stats.bytes_sent += res as u64;
+        }
+    }
+}
+
+/// Reap shutdown completions without driving QUIC, starting more sends, or
+/// changing request results and clocks. The later raw CONNECTION_CLOSE is
+/// best-effort teardown and remains outside benchmark byte accounting.
+fn drain_final_completions(
+    cq: &mut io_uring::cqueue::CompletionQueue<'_>,
+    conns: &mut [Conn],
+    retired: &mut Vec<Retired>,
+    buf_ring: &mut BufRing,
+    stats: &mut Stats,
+) {
+    cq.sync();
+    for cqe in cq {
+        let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
+        if let Some(bid) = io_uring::cqueue::buffer_select(flags) {
+            buf_ring.recycle(bid);
+        }
+        if ud == TIMEOUT_USER_DATA {
+            continue;
+        }
+        let (op, conn_idx, generation) = uring::decode_user_data(ud);
+        if op != OP_SEND {
+            continue;
+        }
+        let conn = &mut conns[conn_idx];
+        if generation != conn.generation {
+            complete_retired_send(ud, res, retired, stats);
+        } else if conn.sending {
+            if res > 0 {
+                stats.bytes_sent += res as u64;
+            }
+            conn.sending = false;
+            recycle(conn);
+        }
+    }
+}
+
+/// Submit the last queued operations, then settle kernel ownership before
+/// reading their results. UDP normally completes during submission, but a
+/// blocked send may be asynchronous. Cancel it rather than waiting for socket
+/// capacity after the run has ended. The same cancellation stops receives and
+/// the deadline. Reap every outstanding send, including a cancellation whose
+/// linked completion is published after the cancellation itself returns.
+#[allow(clippy::too_many_arguments)]
+fn finish_io(
+    submitter: &io_uring::Submitter<'_>,
+    sq: &mut io_uring::squeue::SubmissionQueue<'_>,
+    cq: &mut io_uring::cqueue::CompletionQueue<'_>,
+    conns: &mut [Conn],
+    retired: &mut Vec<Retired>,
+    buf_ring: &mut BufRing,
+    stats: &mut Stats,
+) -> Result<()> {
+    sq.sync();
+    while !sq.is_empty() {
+        match submitter.submit() {
+            Ok(0) => bail!("io_uring made no progress before UDP shutdown"),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("submit before UDP shutdown failed"),
+        }
+        sq.sync();
+    }
+    match submitter.register_sync_cancel(
+        Some(CLOSE_GRACE.into()),
+        io_uring::types::CancelBuilder::any(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => return Err(e).context("cancel final UDP I/O failed"),
+    }
+    let deadline = Instant::now() + CLOSE_GRACE;
+    let mut wait = Duration::ZERO;
+    loop {
+        // DEFER_TASKRUN needs an enter with GETEVENTS to publish deferred CQEs.
+        uring::submit_and_wait_timeout(submitter, wait, 1)?;
+        drain_final_completions(cq, conns, retired, buf_ring, stats);
+        if !conns.iter().any(|conn| conn.sending) && retired.is_empty() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("timed out reaping final UDP sends");
+        }
+        wait = deadline - now;
+    }
+    Ok(())
+}
+
 /// Move pending QUIC datagrams into the send queue and start sending
 fn pump_transmits(
     submitter: &io_uring::Submitter<'_>,
@@ -971,7 +1071,7 @@ pub fn run_worker(
                 }
                 // The kernel is done with what the send pointed at
                 if op == OP_SEND {
-                    retired.retain(|r| r.user_data != ud);
+                    complete_retired_send(ud, res, &mut retired, &mut stats);
                 }
                 continue;
             }
@@ -1141,11 +1241,15 @@ pub fn run_worker(
         }
     }
 
-    // What the last pass pushed has not been submitted: for a connection
-    // that was closing, that is its CONNECTION_CLOSE, and the buffer is kept
-    // past the ring for it. A UDP send runs to completion at submission.
-    sq.sync();
-    submitter.submit().context("io_uring submit failed")?;
+    finish_io(
+        &submitter,
+        &mut sq,
+        &mut cq,
+        &mut conns,
+        &mut retired,
+        &mut buf_ring,
+        &mut stats,
+    )?;
 
     // Best-effort CONNECTION_CLOSE so servers see a clean shutdown
     let now = Instant::now();
@@ -1322,6 +1426,10 @@ mod unsent_tests;
 #[cfg(test)]
 #[path = "http3/gso_tests.rs"]
 mod gso_tests;
+
+#[cfg(test)]
+#[path = "http3/send_accounting_tests.rs"]
+mod send_accounting_tests;
 
 #[cfg(test)]
 mod tests {
