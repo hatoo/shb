@@ -51,6 +51,9 @@ mod h2_status_names;
 #[path = "../tests/support/h3_handshake.rs"]
 mod h3_handshake;
 #[cfg(test)]
+#[path = "../tests/support/h3_status_names.rs"]
+mod h3_status_names;
+#[cfg(test)]
 #[path = "../tests/support/h3_timeout.rs"]
 mod h3_timeout;
 mod uring;
