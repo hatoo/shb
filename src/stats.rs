@@ -58,13 +58,24 @@ impl Stats {
 
 /// Combine worker results after the benchmark's elapsed time is captured.
 /// A sole worker already owns the complete report; retaining it avoids copying
-/// its samples and status table. Keep sequential merging for multiple workers
-/// so a worker's spare capacity does not change aggregate buffer growth.
+/// its samples and status table. For multiple workers, reserve all samples at
+/// once so appending later workers never copies the already merged prefix.
 pub fn merge_workers<E>(mut results: Vec<Result<Stats, E>>) -> Result<Stats, E> {
     if results.len() == 1 {
         return results.pop().unwrap();
     }
-    let mut stats = Stats::default();
+    // On a worker error, keep the ordinary merge/error path without reserving
+    // space for results that will not be reported.
+    let samples = results
+        .iter()
+        .try_fold(0usize, |total, result| {
+            total.checked_add(result.as_ref().ok()?.latencies_ns.len())
+        })
+        .unwrap_or(0);
+    let mut stats = Stats {
+        latencies_ns: Vec::with_capacity(samples),
+        ..Stats::default()
+    };
     for result in results {
         stats.merge(result?);
     }
@@ -439,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_workers_keep_sequential_merging_and_buffer_growth() {
+    fn multiple_workers_keep_every_sample_and_counter_in_worker_order() {
         for count in [2, 4, 16] {
             for first in 0..4 {
                 let mut expected = Stats::default();
@@ -452,9 +463,46 @@ mod tests {
                 assert_same_stats(&actual, &expected);
                 assert_eq!(
                     actual.latencies_ns.capacity(),
-                    expected.latencies_ns.capacity()
+                    expected.latencies_ns.len(),
+                    "reserve exactly the final length, independent of worker spare capacity"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn uneven_workers_and_empty_reserved_buffers_merge_exactly() {
+        for lengths in [[0, 0, 0, 0], [0, 1, 10003, 0], [10003, 0, 1, 7]] {
+            let mut expected = Stats::default();
+            let mut inputs = Vec::new();
+            for (id, len) in lengths.into_iter().enumerate() {
+                let mut input = worker(id);
+                input.latencies_ns.clear();
+                input.latencies_ns.reserve(len + 4096);
+                input.completed = len as u64;
+                input.status_counts.fill(0);
+                for i in 0..len {
+                    input.latencies_ns.push([u64::MAX, 0, 73, 73][(i + id) % 4]);
+                    input.status_counts[(i + id) % 1000] += 1;
+                }
+                expected.completed += input.completed;
+                expected.errors += input.errors;
+                expected.connect_errors += input.connect_errors;
+                expected.bytes_received += input.bytes_received;
+                expected.bytes_sent += input.bytes_sent;
+                expected.latencies_ns.extend_from_slice(&input.latencies_ns);
+                for (a, b) in expected
+                    .status_counts
+                    .iter_mut()
+                    .zip(input.status_counts.iter())
+                {
+                    *a += *b;
+                }
+                inputs.push(Ok::<_, ()>(input));
+            }
+            let actual = merge_workers(inputs).unwrap();
+            assert_same_stats(&actual, &expected);
+            assert_eq!(actual.latencies_ns.capacity(), expected.latencies_ns.len());
         }
     }
 
