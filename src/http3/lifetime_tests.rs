@@ -412,7 +412,10 @@ fn grace_expiry_binds_queued_plain_and_gso_sends_to_the_retired_socket() {
 
 #[test]
 fn replacement_completes_quinn_request_without_stale_receive_consumption() {
-    let mut f = Fixture::new();
+    // Match the production worker's minimum pool. Unlike the marker fixtures,
+    // an independent QUIC peer can deliver more than eight packets before a
+    // completion batch is drained. Exhaustion is exercised separately below.
+    let mut f = Fixture::sized(64, false);
     f.arm(false);
     f.target = crate::target::parse_target(
         &format!("https://{}/", test_server::h3_server_addr()),
@@ -469,4 +472,88 @@ fn replacement_completes_quinn_request_without_stale_receive_consumption() {
     assert!(f.received.iter().all(|(generation, _)| *generation == 1));
     assert_eq!(f.selected, f.returned);
     assert_eq!(f.terminals, vec![(0, -libc::ECANCELED)]);
+}
+
+#[test]
+fn replacement_recovers_current_receive_buffer_exhaustion() {
+    for entries in [8, 64] {
+        let mut f = Fixture::sized(entries, false);
+        f.arm(false);
+        f.close(false);
+        f.conn.quic = None; // Marker bytes distinguish the receive generations.
+        // Observe retirement before introducing the controlled current burst;
+        // cancellation and replacement receive CQEs need not arrive in order.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while f.terminals.is_empty() || f.conn.sending {
+            assert!(std::time::Instant::now() < deadline, "retirement deadline");
+            f.step();
+        }
+        assert_eq!(f.terminals, vec![(0, -libc::ECANCELED)]);
+        for marker in 0u64..32 {
+            f.peer.send_to(&marker.to_le_bytes(), f.address()).unwrap();
+        }
+
+        // Hold selected buffers until the whole burst fits or the shot ends.
+        // This forces current-generation ENOBUFS with eight buffers without
+        // relying on the independent QUIC peer's timing or packetization.
+        let mut completions = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline, "burst deadline");
+            completions.extend(f.completions());
+            let selected = completions
+                .iter()
+                .filter(|c| io_uring::cqueue::buffer_select(c.flags()).is_some())
+                .count();
+            let terminal = completions.iter().find(|c| {
+                uring::decode_user_data(c.user_data()) == (OP_RECV, 0, 1)
+                    && !io_uring::cqueue::more(c.flags())
+            });
+            if entries == 8 {
+                if let Some(terminal) = terminal {
+                    assert_eq!(terminal.result(), -libc::ENOBUFS);
+                    assert_eq!(selected, 8);
+                    break;
+                }
+            } else {
+                assert!(terminal.is_none());
+                if selected == 32 {
+                    break;
+                }
+            }
+        }
+        for cqe in completions {
+            f.handle(cqe);
+        }
+        while f.received.len() < 32 {
+            assert!(std::time::Instant::now() < deadline, "rearm deadline");
+            f.step();
+        }
+        assert_eq!(
+            f.received,
+            (0u64..32)
+                .map(|marker| (1, marker.to_le_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!((f.selected, f.returned), (32, 32));
+        assert_eq!(f.stats.bytes_received, 32 * 8);
+        assert_eq!(
+            (
+                f.started,
+                f.stats.completed,
+                f.stats.errors,
+                f.stats.connect_errors
+            ),
+            (1, 0, 1, 1)
+        );
+        assert!(f.stats.latencies_ns.is_empty());
+        assert!(f.conn.recv_armed);
+        assert!(f.retired.is_empty());
+        assert_eq!(f.terminals[0], (0, -libc::ECANCELED));
+        if entries == 8 {
+            assert!(f.terminals.len() > 1);
+            assert!(f.terminals[1..].iter().all(|&t| t == (1, -libc::ENOBUFS)));
+        } else {
+            assert_eq!(f.terminals, vec![(0, -libc::ECANCELED)]);
+        }
+    }
 }
