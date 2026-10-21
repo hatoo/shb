@@ -267,6 +267,9 @@ pub struct Connection {
     /// flight; this keeps it proportional to the streams that have data.
     send_queue: VecDeque<u64>,
     base_stream: u64,
+    /// Cumulative peer uni limit advertised in our transport parameters. We
+    /// never send MAX_STREAMS, and advertise no peer bidirectional streams.
+    max_peer_uni: u64,
     /// Peer-opened unidirectional streams, few and long-lived
     peer_uni: Vec<(u64, RecvStream)>,
     /// Our own unidirectional streams
@@ -406,6 +409,7 @@ impl Connection {
             streams: VecDeque::new(),
             send_queue: VecDeque::new(),
             base_stream: 0,
+            max_peer_uni: local_params.initial_max_streams_uni,
             peer_uni: Vec::new(),
             local_uni: Vec::new(),
             rtt: Rtt::default(),
@@ -2174,6 +2178,16 @@ impl Connection {
         }
     }
 
+    /// Called only for server-initiated streams, before lookup or allocation.
+    /// The ID counts implicit gaps too; closing a stream does not replenish
+    /// this cumulative limit (RFC 9000 Section 4.6).
+    fn check_peer_uni(&self, id: u64) -> Result<(), RecvError> {
+        if stream_dir(id) == Dir::Bi || id / 4 >= self.max_peer_uni {
+            return Err(RecvError::StreamLimit);
+        }
+        Ok(())
+    }
+
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
         let credit = self.max_data_local - self.data_received;
         let new = if let Some(i) = self.stream_index(id) {
@@ -2209,6 +2223,7 @@ impl Connection {
             // A unidirectional stream we opened: the peer may not write to it
             bail!("the peer sent data on our unidirectional stream {id}");
         } else {
+            self.check_peer_uni(id)?;
             let (pos, new) = match self.peer_uni.iter().position(|(i, _)| *i == id) {
                 Some(pos) => {
                     let new = self.peer_uni[pos]
@@ -2255,15 +2270,18 @@ impl Connection {
                 bail!("the peer reset a stream {id} that it cannot send on");
             }
             // No receive state remains for this fully retired request.
-        } else if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
-            self.data_received += recv.reset(final_size, credit)?;
         } else {
-            // RESET_STREAM can be the first frame received on a peer stream.
-            let mut recv = RecvStream::new(self.stream_window);
-            let new = recv.reset(final_size, credit)?;
-            self.peer_uni.push((id, recv));
-            self.events.push_back(Event::Opened(id));
-            self.data_received += new;
+            self.check_peer_uni(id)?;
+            if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
+                self.data_received += recv.reset(final_size, credit)?;
+            } else {
+                // RESET_STREAM can be the first frame received on a peer stream.
+                let mut recv = RecvStream::new(self.stream_window);
+                let new = recv.reset(final_size, credit)?;
+                self.peer_uni.push((id, recv));
+                self.events.push_back(Event::Opened(id));
+                self.data_received += new;
+            }
         }
         Ok(())
     }
@@ -2457,6 +2475,7 @@ mod tests {
     mod credit_wire;
     mod receive;
     mod receive_limits;
+    mod stream_limits;
 
     fn client() -> Connection {
         let tls = crate::tls::client_config(b"h3").unwrap();

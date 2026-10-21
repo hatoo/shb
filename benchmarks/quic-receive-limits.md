@@ -29,7 +29,8 @@ budgets, grant loss, and unauthenticated packets. Existing independent Quinn
 credit-recovery tests exercise real encryption and loss/reordering.
 
 `check-quic-receive-limits.py --shb ./target/release/shb` supplies 12 independent
-wire cases using aioquic 1.3.0. It deliberately bypasses the peer's send limits
+receive-credit/final-size cases alongside the [peer stream-count cases](quic-stream-limits.md),
+using aioquic 1.3.0. It deliberately bypasses the peer's send limits
 when writing frames, while keeping aioquic's TLS, encryption and close decoder.
 It verifies exact request/error/status counts, success-latency presence, and
 transport-close codes. It is included in the required CI job.

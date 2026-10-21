@@ -460,3 +460,47 @@ fn unauthenticated_receive_limit_violation_cannot_close_the_connection() {
     receive(&mut conn, now, &valid);
     assert_eq!(conn.events.len(), 1);
 }
+
+#[test]
+fn peer_stream_limit_closes_only_for_authenticated_frames() {
+    for id in [1, 15, (1 << 62) - 1] {
+        for reset in [false, true] {
+            let mut conn = receiver();
+            let (request, _) = conn.send_oneshot(b"request").unwrap();
+            let mut payload = Vec::new();
+            if reset {
+                frame::put_reset_stream(&mut payload, id, 42, 0);
+            } else {
+                frame::put_stream(&mut payload, id, 0, false, b"");
+            }
+            // An invalid frame must stop dispatch before a later frame can
+            // turn this request into a successful latency sample.
+            frame::put_stream(&mut payload, request, 0, true, b"response");
+            let valid = protected(&conn, Space::Data, 0, &payload);
+            let mut forged = valid.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            let now = Instant::now();
+            receive(&mut conn, now, &forged);
+            assert!(conn.closed.is_none());
+            assert!(conn.close_pending.is_none());
+            assert!(conn.peer_uni.is_empty());
+            assert_eq!(conn.peer_uni.capacity(), 0);
+            assert_eq!(conn.data_received, 0);
+            assert_eq!(conn.unanswered, 1);
+            assert!(conn.events.is_empty());
+            receive(&mut conn, now, &valid);
+            assert!(conn.closed.is_some());
+            assert_eq!(conn.close_pending.as_ref().unwrap().code, 4);
+            assert!(!conn.close_pending.as_ref().unwrap().app);
+            assert!(conn.peer_uni.is_empty());
+            assert_eq!(conn.peer_uni.capacity(), 0);
+            assert_eq!(conn.data_received, 0);
+            assert_eq!(conn.unanswered, 1);
+            assert!(!conn.recv_mut(request).unwrap().has_data());
+            assert_eq!(conn.events.len(), 1);
+            assert!(matches!(conn.events.front(), Some(Event::Lost(_))));
+            receive(&mut conn, now, &valid);
+            assert_eq!(conn.events.len(), 1);
+        }
+    }
+}
