@@ -91,7 +91,7 @@ use super::packet::{
 use super::received::ReceivedPackets;
 use super::recovery::{Congestion, Rtt, SentFrame, SentPacket, SentPackets, pto_deadline};
 use super::stream::{
-    Dir, RecvStream, SendStream, client_stream_id, is_client_initiated, stream_dir,
+    Dir, RecvError, RecvStream, SendStream, client_stream_id, is_client_initiated, stream_dir,
 };
 use super::transport::{ACTIVE_CONNECTION_ID_LIMIT, LocalParams, Params};
 
@@ -936,11 +936,16 @@ impl Connection {
         // Hand the peer more connection-level credit once it has used enough
         // of what it has that another window would not arrive in time
         let window = self.max_data_window;
-        if self.data_received + window / 2 >= self.max_data_local {
-            self.max_data_local = self.data_received + window;
+        let extend_window = self.data_received + window / 2 >= self.max_data_local;
+        if extend_window {
             self.max_data_owed = true;
         }
         if self.max_data_owed && room(out) > 16 {
+            // An unsent grant is not credit the peer is allowed to use yet.
+            // A lost grant below the threshold still repeats the current limit.
+            if extend_window {
+                self.max_data_local = self.data_received + window;
+            }
             frame::put_max_data(out, self.max_data_local);
             frames.push(SentFrame::MaxData(self.max_data_local));
             self.max_data_owed = false;
@@ -1088,7 +1093,16 @@ impl Connection {
         let mut processed = false;
         let mut pos = 0;
         while pos < datagram.len() {
-            let (consumed, ok) = self.handle_packet(now, &mut datagram[pos..])?;
+            let (consumed, ok) = match self.handle_packet(now, &mut datagram[pos..]) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(error) = error.downcast_ref::<RecvError>() {
+                        self.close_transport(error.code(), &error.to_string());
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            };
             processed |= ok;
             if consumed == 0 {
                 break;
@@ -2161,13 +2175,14 @@ impl Connection {
     }
 
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
+        let credit = self.max_data_local - self.data_received;
         let new = if let Some(i) = self.stream_index(id) {
             let Some(pair) = self.streams[i].as_mut().filter(|p| !p.retired) else {
                 // Already retired; the peer is answering a stream we stopped
                 // caring about, which is not an error
                 return Ok(());
             };
-            let new = pair.recv.push(offset, data, fin)?;
+            let new = pair.recv.push_with_credit(offset, data, fin, credit)?;
             let readable = pair.recv.has_data();
             let done = pair.recv.is_finished() && !pair.finished;
             if done {
@@ -2194,16 +2209,21 @@ impl Connection {
             // A unidirectional stream we opened: the peer may not write to it
             bail!("the peer sent data on our unidirectional stream {id}");
         } else {
-            let pos = match self.peer_uni.iter().position(|(i, _)| *i == id) {
-                Some(pos) => pos,
+            let (pos, new) = match self.peer_uni.iter().position(|(i, _)| *i == id) {
+                Some(pos) => {
+                    let new = self.peer_uni[pos]
+                        .1
+                        .push_with_credit(offset, data, fin, credit)?;
+                    (pos, new)
+                }
                 None => {
-                    self.peer_uni
-                        .push((id, RecvStream::new(self.stream_window)));
+                    let mut recv = RecvStream::new(self.stream_window);
+                    let new = recv.push_with_credit(offset, data, fin, credit)?;
+                    self.peer_uni.push((id, recv));
                     self.events.push_back(Event::Opened(id));
-                    self.peer_uni.len() - 1
+                    (self.peer_uni.len() - 1, new)
                 }
             };
-            let new = self.peer_uni[pos].1.push(offset, data, fin)?;
             if self.peer_uni[pos].1.has_data() {
                 self.push_readable(id);
             }
@@ -2211,18 +2231,16 @@ impl Connection {
         };
 
         self.data_received += new;
-        if self.data_received > self.max_data_local {
-            bail!("the peer sent more than the connection flow control window allows");
-        }
         Ok(())
     }
 
     #[cold]
     #[inline(never)]
     fn on_reset(&mut self, id: u64, error: u64, final_size: u64) -> Result<()> {
+        let credit = self.max_data_local - self.data_received;
         if let Some(i) = self.stream_index(id) {
             if let Some(pair) = self.streams[i].as_mut() {
-                pair.recv.reset(final_size)?;
+                self.data_received += pair.recv.reset(final_size, credit)?;
                 if !pair.finished {
                     pair.finished = true;
                     self.unanswered -= 1;
@@ -2232,8 +2250,20 @@ impl Connection {
                     });
                 }
             }
+        } else if is_client_initiated(id) {
+            if stream_dir(id) == Dir::Uni || id / 4 >= self.next_bidi {
+                bail!("the peer reset a stream {id} that it cannot send on");
+            }
+            // No receive state remains for this fully retired request.
         } else if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
-            recv.reset(final_size)?;
+            self.data_received += recv.reset(final_size, credit)?;
+        } else {
+            // RESET_STREAM can be the first frame received on a peer stream.
+            let mut recv = RecvStream::new(self.stream_window);
+            let new = recv.reset(final_size, credit)?;
+            self.peer_uni.push((id, recv));
+            self.events.push_back(Event::Opened(id));
+            self.data_received += new;
         }
         Ok(())
     }
@@ -2426,6 +2456,7 @@ mod tests {
     mod credit;
     mod credit_wire;
     mod receive;
+    mod receive_limits;
 
     fn client() -> Connection {
         let tls = crate::tls::client_config(b"h3").unwrap();

@@ -433,3 +433,30 @@ fn ack_eviction_preserves_delayed_stream_bytes_and_new_packet_retransmissions() 
     );
     assert!(conn.spaces[Space::Data as usize].ack.take_pending());
 }
+
+#[test]
+fn unauthenticated_receive_limit_violation_cannot_close_the_connection() {
+    let mut conn = receiver();
+    conn.stream_window = 8;
+    let (id, _) = conn.send_oneshot(b"request").unwrap();
+    let mut payload = Vec::new();
+    frame::put_stream(&mut payload, id, 8, true, b"x");
+    let valid = protected(&conn, Space::Data, 0, &payload);
+    let mut forged = valid.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    let now = Instant::now();
+    receive(&mut conn, now, &forged);
+    assert!(conn.closed.is_none());
+    assert_eq!(conn.data_received, 0);
+    assert!(conn.events.is_empty());
+    receive(&mut conn, now, &valid);
+    assert!(conn.closed.is_some());
+    assert_eq!(conn.close_pending.as_ref().unwrap().code, 0x03);
+    assert!(!conn.close_pending.as_ref().unwrap().app);
+    assert_eq!(conn.data_received, 0);
+    assert!(!conn.recv_mut(id).unwrap().has_data());
+    assert_eq!(conn.events.len(), 1);
+    assert!(matches!(conn.events.front(), Some(Event::Lost(_))));
+    receive(&mut conn, now, &valid);
+    assert_eq!(conn.events.len(), 1);
+}
