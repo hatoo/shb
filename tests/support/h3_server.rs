@@ -1,6 +1,18 @@
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
+pub const STATIC_NAME_HEADERS: &[(&str, &str)] = &[
+    ("accept", "application/custom"),
+    ("accept-encoding", "identity"),
+    ("cookie", "first=1"),
+    ("user-agent", "qpack-test"),
+    ("accept", "second"),
+    ("cookie", "second=2"),
+    ("x-frame-options", "custom"),
+    ("origin", "https://example.com"),
+    ("x-unknown", "literal"),
+];
+
 /// Bound address of the shared HTTP/3 (QUIC) test server
 pub fn h3_server_addr() -> SocketAddr {
     static SERVER: OnceLock<SocketAddr> = OnceLock::new();
@@ -93,7 +105,27 @@ pub fn h3_server_addr() -> SocketAddr {
                                     .headers()
                                     .get("x-expect-method")
                                     .map(|v| v.as_bytes().to_vec());
+                                let static_names_match =
+                                    STATIC_NAME_HEADERS.iter().all(|(name, _)| {
+                                        let actual: Vec<_> = request
+                                            .headers()
+                                            .get_all(*name)
+                                            .iter()
+                                            .map(|v| v.as_bytes())
+                                            .collect();
+                                        let expected: Vec<_> = STATIC_NAME_HEADERS
+                                            .iter()
+                                            .filter(|(n, _)| n == name)
+                                            .map(|(_, v)| v.as_bytes())
+                                            .collect();
+                                        actual == expected
+                                    });
                                 let (status, body) = match echo {
+                                    _ if request.uri().path() == "/static-names"
+                                        && !static_names_match =>
+                                    {
+                                        (http::StatusCode::BAD_REQUEST, "header mismatch")
+                                    }
                                     _ if want_len == Some(req_body.len()) => {
                                         (http::StatusCode::OK, "body complete")
                                     }
