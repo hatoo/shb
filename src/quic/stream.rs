@@ -400,6 +400,7 @@ impl SendStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecvError {
     FlowControl,
+    StreamLimit,
     FinalSize,
     FrameEncoding,
 }
@@ -408,6 +409,7 @@ impl RecvError {
     pub fn code(self) -> u64 {
         match self {
             Self::FlowControl => 0x03,
+            Self::StreamLimit => 0x04,
             Self::FinalSize => 0x06,
             Self::FrameEncoding => 0x07,
         }
@@ -418,6 +420,7 @@ impl std::fmt::Display for RecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::FlowControl => "the peer exceeded a receive flow control limit",
+            Self::StreamLimit => "the peer exceeded an incoming stream count limit",
             Self::FinalSize => "stream data disagrees with its final size",
             Self::FrameEncoding => "stream offset exceeds the QUIC maximum",
         })

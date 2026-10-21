@@ -45,7 +45,7 @@ jobs:
           "$RUNNER_TEMP/h3-status-venv/bin/pip" install aioquic==1.3.0 pylsqpack==0.3.24 hpack==4.1.0
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-status-names.py --shb ./target/release/shb
 
-      - name: QUIC receive flow control and final sizes (aioquic)
+      - name: QUIC receive flow control, stream counts and final sizes (aioquic)
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-limits.py --shb ./target/release/shb
 

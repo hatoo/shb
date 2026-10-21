@@ -38,12 +38,34 @@ CASES = {
     'offset-overflow': (1, 7),
     'valid-reordered': (1, None),
     'valid-duplicate-reset': (1, None),
+    'peer-bidi-stream': (1, 4),
+    'peer-bidi-reset': (1, 4),
+    'peer-uni-stream': (1, 4),
+    'peer-uni-reset': (1, 4),
+    'peer-sparse-stream': (1, 4),
+    'peer-sparse-reset': (1, 4),
+    'peer-bidi-after-valid': (1, 4),
+    'peer-uni-after-valid': (1, 4),
+    'valid-peer-duplicates': (1, None),
 }
 
 
 def injected(case, ids, limit, connection_limit):
     # (kind, stream id, offset/final size, payload, fin)
     sid = ids[0]
+    if case.startswith('peer-'):
+        _, direction, kind, *suffix = case.split('-')
+        peer_id = {'bidi': 1, 'uni': 15, 'sparse': (1 << 62) - 1}[direction]
+        if suffix:
+            assert kind == 'after' and suffix == ['valid']
+            return [('stream', i, 0, b'', False) for i in [11, 7, 3]] + [
+                ('stream', peer_id, 0, b'', False)]
+        return [(kind, peer_id, 0, b'', False)]
+    if case == 'valid-peer-duplicates':
+        # Empty retransmissions on all three permitted peer streams, in a
+        # different order, must leave the response and accounting intact.
+        return [('stream', i, 0, b'', False) for i in [11, 7, 3, 7, 11, 3]] + [
+            ('stream', sid, 0, b'\x01\x03\x00\x00\xd9', True)]
     if case == 'stream-over':
         return [('stream', sid, limit, b'x', False)]
     if case in ('stream-empty-over', 'stream-fin-over'):
@@ -94,6 +116,10 @@ async def check(binary, config, case):
             assert stream.sender.get_frame(64, max_offset) is not None
             frames = injected(case, self.ids, stream.max_stream_data_remote,
                               self._quic._remote_max_data)
+            ledger['peer_stream_limits'] = dict(
+                bidi=self._quic._remote_max_streams_bidi,
+                uni=self._quic._remote_max_streams_uni)
+            assert ledger['peer_stream_limits'] == dict(bidi=0, uni=3)
             for kind, sid, offset, data, fin in frames:
                 if kind == 'reset':
                     buf = builder.start_frame(0x04, capacity=32)
@@ -140,7 +166,7 @@ async def check(binary, config, case):
         assert proc.returncode == 0, stderr.decode()
         assert not failures, failures
         report = json.loads(stdout)
-        success = case == 'valid-reordered'
+        success = case in ('valid-reordered', 'valid-peer-duplicates')
         ok = count if success else 0
         assert report['requests'] == dict(total=count, ok=ok, errors=count-ok, connectErrors=0), report
         assert report['statusCodes'] == ({'200': count} if success else {}), report
