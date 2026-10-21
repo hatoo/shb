@@ -11,6 +11,9 @@ use std::time::Duration;
 mod header_tests;
 
 #[cfg(test)]
+mod trailer_tests;
+
+#[cfg(test)]
 #[path = "http1/idle_tests.rs"]
 mod idle_tests;
 
