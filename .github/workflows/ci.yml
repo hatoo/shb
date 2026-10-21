@@ -59,6 +59,11 @@ jobs:
           fi
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-send-accounting.py --shb ./target/release/shb
 
+      - name: HTTP/3 request header encoding (pylsqpack and aioquic)
+        run: |
+          cargo build --release --locked --example h3-request-encoding
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-request-encoding.py --probe ./target/release/examples/h3-request-encoding --shb ./target/release/shb
+
       # Multishot recv and provided buffer rings need kernel 6.0; the setup
       # flags and completion batching degrade gracefully without 6.6 and 6.12.
       # The ubuntu-latest (24.04, kernel 6.8+) VM runners cover all but the

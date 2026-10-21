@@ -1685,6 +1685,41 @@ fn h3_gets_through_duplication_and_reordering() {
     assert_all_ok(&report, 40, "200");
 }
 
+/// The independent h3 decoder must recover the exact repeated names/values
+/// while both HEADERS and DATA cross packets, receive windows and reordering.
+#[test]
+fn h3_static_header_names_with_body_and_reordering() {
+    let addr = impaired_h3_addr(2, 10, 10, 0x179, false);
+    let url = format!("https://127.0.0.1:{}/static-names", addr.port());
+    let body = "abc0123".repeat(10000);
+    let mut args: Vec<String> = [
+        "--http3",
+        "--timeout",
+        "10s",
+        "-n",
+        "17",
+        "-c",
+        "2",
+        "-p",
+        "4",
+        "-t",
+        "1",
+        "-H",
+        "x-body-len: 70000",
+        "-d",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    args.push(body);
+    for (name, value) in h3_server::STATIC_NAME_HEADERS {
+        args.extend(["-H".into(), format!("{name}: {value}")]);
+    }
+    args.push(url);
+    let report = shb_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_all_ok(&report, 17, "200");
+}
+
 /// The server's Handshake flight does not get through until the client
 /// sends a Handshake packet of its own
 ///

@@ -70,3 +70,7 @@ path = "benchmarks/stats-merge.rs"
 [[example]]
 name = "h2-request-encoding"
 path = "benchmarks/h2-request-encoding.rs"
+
+[[example]]
+name = "h3-request-encoding"
+path = "benchmarks/h3-request-encoding.rs"
