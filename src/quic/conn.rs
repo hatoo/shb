@@ -2423,6 +2423,8 @@ impl Connection {
 mod tests {
     use super::*;
 
+    mod credit;
+    mod credit_wire;
     mod receive;
 
     fn client() -> Connection {
