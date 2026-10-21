@@ -66,3 +66,7 @@ mimalloc = ["dep:mimalloc"]
 [[example]]
 name = "stats-merge"
 path = "benchmarks/stats-merge.rs"
+
+[[example]]
+name = "h2-request-encoding"
+path = "benchmarks/h2-request-encoding.rs"
