@@ -7,11 +7,15 @@
 //! appends in-order data straight through and only sorts when a datagram
 //! actually arrives out of order.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 #[cfg(test)]
 #[path = "send_buffer_tests.rs"]
 mod send_buffer_tests;
+
+#[cfg(test)]
+#[path = "receive_limit_tests.rs"]
+mod receive_limit_tests;
 
 /// How much buffer a pooled stream keeps hold of. Requests are tens of bytes
 /// and most responses are small, so this covers the common case; a stream that
@@ -392,8 +396,37 @@ impl SendStream {
     }
 }
 
+/// A receive error that must be reported as a QUIC transport close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecvError {
+    FlowControl,
+    FinalSize,
+    FrameEncoding,
+}
+
+impl RecvError {
+    pub fn code(self) -> u64 {
+        match self {
+            Self::FlowControl => 0x03,
+            Self::FinalSize => 0x06,
+            Self::FrameEncoding => 0x07,
+        }
+    }
+}
+
+impl std::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FlowControl => "the peer exceeded a receive flow control limit",
+            Self::FinalSize => "stream data disagrees with its final size",
+            Self::FrameEncoding => "stream offset exceeds the QUIC maximum",
+        })
+    }
+}
+
+impl std::error::Error for RecvError {}
+
 /// One end of a stream we read from
-#[derive(Default)]
 pub struct RecvStream {
     /// Contiguous data from `read_offset` that the application has not taken.
     /// Only ever appended to and taken whole, so a Vec beats a VecDeque: both
@@ -405,10 +438,18 @@ pub struct RecvStream {
     pending: Vec<(u64, Vec<u8>)>,
     /// Offset the stream ends at, once the peer says so
     final_size: Option<u64>,
-    /// Total bytes delivered, for connection-level flow control accounting
+    /// Highest accepted end offset, including RESET final sizes and gaps
     received: u64,
     /// The most the peer may send on this stream, as last told
     max_data: u64,
+}
+
+impl Default for RecvStream {
+    /// CRYPTO reassembly has no stream flow control. Application streams use
+    /// `new` or `with_buf` with their advertised transport-parameter limit.
+    fn default() -> Self {
+        Self::new(u64::MAX)
+    }
 }
 
 impl RecvStream {
@@ -453,21 +494,27 @@ impl RecvStream {
 
     /// Take a STREAM frame. Returns how many new bytes of stream this covered,
     /// which is what counts against the flow control window.
-    pub fn push(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<u64> {
+    pub fn push(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<u64, RecvError> {
+        self.push_with_credit(offset, data, fin, u64::MAX)
+    }
+
+    /// Validate both advertised limits before copying any payload or changing
+    /// the final size. Gaps spend credit, but overlaps and duplicates do not.
+    pub fn push_with_credit(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        connection_credit: u64,
+    ) -> Result<u64, RecvError> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end < (1 << 62))
+            .ok_or(RecvError::FrameEncoding)?;
+        let new = self.check_end(end, fin, connection_credit)?;
         if fin {
-            let end = offset + data.len() as u64;
-            match self.final_size {
-                Some(prev) if prev != end => bail!("stream final size changed"),
-                _ => self.final_size = Some(end),
-            }
+            self.final_size = Some(end);
         }
-        let end = offset + data.len() as u64;
-        if let Some(final_size) = self.final_size
-            && end > final_size
-        {
-            bail!("stream data past its final size");
-        }
-        let new = end.saturating_sub(self.received.max(self.read_offset));
         self.received = self.received.max(end);
 
         if offset <= self.read_offset + self.ready.len() as u64 {
@@ -532,14 +579,33 @@ impl RecvStream {
         !self.ready.is_empty()
     }
 
-    pub fn reset(&mut self, final_size: u64) -> Result<()> {
-        if let Some(prev) = self.final_size
-            && prev != final_size
+    fn check_end(
+        &self,
+        end: u64,
+        final_size: bool,
+        connection_credit: u64,
+    ) -> Result<u64, RecvError> {
+        if self
+            .final_size
+            .is_some_and(|size| end > size || (final_size && end != size))
+            || (final_size && end < self.received)
         {
-            bail!("RESET_STREAM final size disagrees with the data already sent");
+            return Err(RecvError::FinalSize);
         }
+        let new = end.saturating_sub(self.received);
+        if end > self.max_data || new > connection_credit {
+            return Err(RecvError::FlowControl);
+        }
+        Ok(new)
+    }
+
+    /// RESET consumes the declared final size even when its data never arrived.
+    /// Return only the increase so retransmitted resets cannot spend it twice.
+    pub fn reset(&mut self, final_size: u64, connection_credit: u64) -> Result<u64, RecvError> {
+        let new = self.check_end(final_size, true, connection_credit)?;
         self.final_size = Some(final_size);
-        Ok(())
+        self.received = final_size;
+        Ok(new)
     }
 }
 
@@ -669,8 +735,8 @@ mod tests {
     fn a_reset_disagreeing_with_the_data_is_rejected() {
         let mut r = RecvStream::default();
         r.push(0, b"abcde", true).unwrap();
-        assert!(r.reset(99).is_err());
-        assert!(r.reset(5).is_ok());
+        assert!(r.reset(99, u64::MAX).is_err());
+        assert!(r.reset(5, u64::MAX).is_ok());
     }
 
     #[test]
