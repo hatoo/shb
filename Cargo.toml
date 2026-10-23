@@ -37,6 +37,7 @@ socket2 = "0.6.5"
 [dev-dependencies]
 axum = { version = "0.8", features = ["http2"] }
 bytes = "1.12.1"
+h2 = "0.4.19"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
@@ -74,3 +75,7 @@ path = "benchmarks/h2-request-encoding.rs"
 [[example]]
 name = "h3-request-encoding"
 path = "benchmarks/h3-request-encoding.rs"
+
+[[example]]
+name = "h2-upload-server"
+path = "benchmarks/h2-upload-server.rs"
