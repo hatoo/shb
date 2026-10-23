@@ -189,3 +189,215 @@ fn close_notify_discards_only_the_unaccepted_suffix() {
         assert!(client.take_ciphertext().unwrap().is_empty());
     }
 }
+
+fn record_shapes(mut wire: &[u8]) -> Vec<(u8, usize)> {
+    let mut records = Vec::new();
+    while !wire.is_empty() {
+        assert!(wire.len() >= 5);
+        let size = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+        assert!(wire.len() >= size + 5);
+        records.push((wire[0], size));
+        wire = &wire[size + 5..];
+    }
+    records
+}
+
+fn flush_input(client: &mut TlsSession, data: &[u8], out: &mut Vec<u8>, combined: bool) {
+    if combined {
+        client
+            .write_plaintext_and_take_ciphertext(data, out)
+            .unwrap();
+    } else {
+        // The sequential write/drain, retained as an independent
+        // reference for record boundaries and the order of accepted bytes.
+        client.write_plaintext(data).unwrap();
+        client.take_ciphertext_into(out).unwrap();
+    }
+}
+
+#[test]
+fn combined_flush_matches_queued_records_and_plaintext_at_buffer_boundaries() {
+    for version in VERSIONS {
+        for limit in [Some(0), Some(1), Some(1024), Some(65536), None] {
+            let (mut client, mut server) = pair(version);
+            let (mut reference, mut peer) = pair(version);
+            exchange(&mut client, &mut server);
+            exchange(&mut reference, &mut peer);
+            client.conn.set_buffer_limit(limit);
+            reference.conn.set_buffer_limit(limit);
+            let sizes: &[usize] = if limit == Some(1) {
+                &[0, 1, 73]
+            } else {
+                &[0, 256, 16384, 65536, 131073, 1048613]
+            };
+            let mut out = vec![0xaa; 19];
+            let mut expected = out.clone();
+            for &size in sizes {
+                let data = pattern(size, 37);
+                flush_input(&mut client, &data, &mut out, true);
+                flush_input(&mut reference, &data, &mut expected, false);
+                assert_eq!(record_shapes(&out), record_shapes(&expected));
+                assert_eq!(
+                    &client.pending_plaintext[client.pending_pos..],
+                    &reference.pending_plaintext[reference.pending_pos..]
+                );
+                let got = receive(&mut server, &out);
+                assert_eq!(got, receive(&mut peer, &expected));
+                if limit == Some(0) {
+                    assert!(got.is_empty());
+                    client.conn.set_buffer_limit(Some(4096));
+                    reference.conn.set_buffer_limit(Some(4096));
+                    assert_eq!(exchange(&mut client, &mut server).0, data);
+                    assert_eq!(exchange(&mut reference, &mut peer).0, data);
+                    client.conn.set_buffer_limit(limit);
+                    reference.conn.set_buffer_limit(limit);
+                } else {
+                    assert_eq!(got, data);
+                    assert!(client.pending_plaintext.is_empty());
+                    assert_eq!(client.pending_plaintext.capacity(), 0);
+                }
+                assert_eq!(client.pending_pos, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn combined_flush_keeps_queued_ciphertext_and_backlog_ahead_of_new_bytes() {
+    for version in VERSIONS {
+        for prefix_len in [317, 8192, 131073] {
+            let (mut client, mut server) = pair(version);
+            let (mut reference, mut peer) = pair(version);
+            exchange(&mut client, &mut server);
+            exchange(&mut reference, &mut peer);
+            client.conn.set_buffer_limit(Some(4096));
+            reference.conn.set_buffer_limit(Some(4096));
+            let mut want = pattern(prefix_len, 11);
+            client.write_plaintext(&want).unwrap();
+            reference.write_plaintext(&want).unwrap();
+            let tail = pattern(1048613, 41);
+            let mut out = Vec::new();
+            let mut expected = Vec::new();
+            flush_input(&mut client, &tail, &mut out, true);
+            flush_input(&mut reference, &tail, &mut expected, false);
+            want.extend_from_slice(&tail);
+            assert_eq!(record_shapes(&out), record_shapes(&expected));
+            assert_eq!(receive(&mut server, &out), want);
+            assert_eq!(receive(&mut peer, &expected), want);
+            assert!(client.pending_plaintext.is_empty());
+            assert_eq!(client.pending_pos, 0);
+        }
+    }
+}
+
+#[test]
+fn combined_flush_owns_handshake_and_zero_progress_suffixes() {
+    for version in VERSIONS {
+        for established in [false, true] {
+            for limit in [0, 4096] {
+                let (mut client, mut server) = pair(version);
+                if established {
+                    exchange(&mut client, &mut server);
+                }
+                client.conn.set_buffer_limit(Some(limit));
+                let want = pattern(131073, 7);
+                let mut borrowed = want.clone();
+                let mut out = vec![0xff; 19];
+                client
+                    .write_plaintext_and_take_ciphertext(&borrowed, &mut out)
+                    .unwrap();
+                // The caller may immediately overwrite its recycled input.
+                borrowed.fill(0xcc);
+                drop(borrowed);
+                let mut got = receive(&mut server, &out);
+                client.conn.set_buffer_limit(Some(4096));
+                got.extend(exchange(&mut client, &mut server).0);
+                assert_eq!(got, want);
+                assert!(client.pending_plaintext.is_empty());
+                assert_eq!(client.pending_pos, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn combined_flush_preserves_close_notify_and_existing_discard_behavior() {
+    for version in VERSIONS {
+        let mut shapes = Vec::new();
+        for combined in [false, true] {
+            let (mut client, mut server) = pair(version);
+            exchange(&mut client, &mut server);
+            client.conn.set_buffer_limit(Some(1024));
+            let prefix = pattern(16384, 17);
+            client.write_plaintext(&prefix).unwrap();
+            let accepted = client.pending_pos;
+            client.send_close_notify();
+            let tail = pattern(521, 19);
+            let mut out = Vec::new();
+            flush_input(&mut client, &tail, &mut out, combined);
+            shapes.push(record_shapes(&out));
+            assert_eq!(receive(&mut server, &out), prefix[..accepted]);
+            assert_eq!(server.reader().read(&mut [0; 1]).unwrap(), 0);
+            // rustls consumes and discards writes after our close_notify;
+            // neither path may put these bytes after the alert on the wire.
+            assert!(client.pending_plaintext.is_empty());
+            assert_eq!(client.pending_pos, 0);
+            assert!(client.take_ciphertext().unwrap().is_empty());
+        }
+        assert_eq!(shapes[0], shapes[1]);
+    }
+}
+
+#[test]
+fn combined_flush_after_peer_close_preserves_existing_half_close_behavior() {
+    for version in VERSIONS {
+        let mut shapes = Vec::new();
+        for combined in [false, true] {
+            let (mut client, mut server) = pair(version);
+            exchange(&mut client, &mut server);
+            server.send_close_notify();
+            let mut reply = Vec::new();
+            server.write_tls(&mut reply).unwrap();
+            client.feed_into(&reply, &mut [0; 7], |_| Ok(())).unwrap();
+            assert!(client.peer_closed());
+            let data = pattern(131073, 73);
+            let mut out = Vec::new();
+            flush_input(&mut client, &data, &mut out, combined);
+            shapes.push(record_shapes(&out));
+            assert_eq!(receive(&mut server, &out), data);
+        }
+        assert_eq!(shapes[0], shapes[1]);
+    }
+}
+
+#[test]
+fn combined_empty_flush_drains_the_same_alert_after_corrupt_ciphertext() {
+    for version in VERSIONS {
+        let mut shapes = Vec::new();
+        for combined in [false, true] {
+            let (mut client, mut server) = pair(version);
+            exchange(&mut client, &mut server);
+            server.writer().write_all(b"authenticate this").unwrap();
+            let mut reply = Vec::new();
+            server.write_tls(&mut reply).unwrap();
+            *reply.last_mut().unwrap() ^= 1;
+            assert!(
+                client
+                    .feed_into(&reply, &mut [0; 17], |_| panic!(
+                        "unauthenticated plaintext"
+                    ))
+                    .is_err()
+            );
+            let mut out = vec![0xaa; 19];
+            flush_input(&mut client, &[], &mut out, combined);
+            assert!(!out.is_empty());
+            shapes.push(record_shapes(&out));
+            server.read_tls(&mut &out[..]).unwrap();
+            assert!(matches!(
+                server.process_new_packets(),
+                Err(rustls::Error::AlertReceived(_))
+            ));
+        }
+        assert_eq!(shapes[0], shapes[1]);
+    }
+}

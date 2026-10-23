@@ -258,6 +258,44 @@ fn queue_request(conn: &mut Conn, request: &[u8]) -> Result<()> {
     }
 }
 
+/// Borrow the immutable request until TLS has accepted and drained its bytes.
+/// A pending Send still owns `out`, so an early response keeps the queued path.
+fn queue_and_flush_request(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+    request: &[u8],
+) -> Result<()> {
+    if !conn.sending
+        && let Some(tls) = &mut conn.tls
+    {
+        tls.write_plaintext_and_take_ciphertext(request, &mut conn.out)?;
+        return submit_tls_output(submitter, sq, conn_idx, conn);
+    }
+    queue_request(conn, request)?;
+    flush(submitter, sq, conn_idx, conn, request)
+}
+
+/// Submit already prepared TLS output without draining (and clearing) it again.
+fn submit_tls_output(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    conn: &mut Conn,
+) -> Result<()> {
+    if !conn.out.is_empty() {
+        // Only the first flush after the handshake carries the request.
+        if !conn.tls.as_ref().unwrap().is_handshaking() {
+            conn.mark_sent();
+        }
+        conn.out_off = 0;
+        conn.sending = true;
+        uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
+    }
+    Ok(())
+}
+
 /// Submit pending output unless a send is already in flight
 ///
 /// TLS mode drains the pending ciphertext (handshake messages included)
@@ -274,17 +312,7 @@ fn flush(
     }
     if let Some(tls) = &mut conn.tls {
         tls.take_ciphertext_into(&mut conn.out)?;
-        if !conn.out.is_empty() {
-            // Until the handshake is done the ciphertext is the handshake,
-            // and the request is only buffered behind it; the first flush
-            // after it finishes is the one that carries the request
-            if !tls.is_handshaking() {
-                conn.mark_sent();
-            }
-            conn.out_off = 0;
-            conn.sending = true;
-            uring::push_send_slice(submitter, sq, conn_idx, conn.generation, &conn.out)?;
-        }
+        submit_tls_output(submitter, sq, conn_idx, conn)?;
     } else if conn.out_off < conn.outbound(request).len() {
         conn.mark_sent();
         conn.sending = true;
@@ -495,8 +523,13 @@ pub fn run_worker(
                         // otherwise loses; the latency clock waits for the
                         // request itself to leave
                         conn.begin_request(timeout);
-                        queue_request(conn, &target.request_bytes)?;
-                        flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
+                        queue_and_flush_request(
+                            &submitter,
+                            &mut sq,
+                            conn_idx,
+                            conn,
+                            &target.request_bytes,
+                        )?;
                     }
                 }
                 OP_CONNECT_TIMEOUT => {
@@ -641,8 +674,13 @@ pub fn run_worker(
                         if !conn.recv_armed {
                             push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
                         }
-                        queue_request(conn, &target.request_bytes)?;
-                        flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
+                        queue_and_flush_request(
+                            &submitter,
+                            &mut sq,
+                            conn_idx,
+                            conn,
+                            &target.request_bytes,
+                        )?;
                     } else {
                         retire(&submitter, &mut sq, conn_idx, conn)?;
                         conn.parser.reset();

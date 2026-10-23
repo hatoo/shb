@@ -153,10 +153,9 @@ fn retirement_completes_a_queued_send_before_clearing_its_storage() {
                 TlsSession::new(&crate::tls::setup("localhost", b"http/1.1").unwrap()).unwrap(),
             );
         }
-        queue_request(&mut f.conn, request).unwrap();
         {
             let (submitter, mut sq, _) = f.ring.split();
-            flush(&submitter, &mut sq, 0, &mut f.conn, request).unwrap();
+            queue_and_flush_request(&submitter, &mut sq, 0, &mut f.conn, request).unwrap();
         }
         let sent = f.conn.outbound(request).to_vec();
         f.retire();
@@ -181,10 +180,9 @@ fn retirement_completes_a_queued_send_before_clearing_its_storage() {
                 TlsSession::new(&crate::tls::setup("localhost", b"http/1.1").unwrap()).unwrap(),
             );
         }
-        queue_request(&mut f.conn, request).unwrap();
         {
             let (submitter, mut sq, _) = f.ring.split();
-            flush(&submitter, &mut sq, 0, &mut f.conn, request).unwrap();
+            queue_and_flush_request(&submitter, &mut sq, 0, &mut f.conn, request).unwrap();
         }
         let expected = f.conn.outbound(request).to_vec();
         let cqes = f.completions();
@@ -402,13 +400,19 @@ fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
 }
 
 fn server_config() -> std::sync::Arc<rustls::ServerConfig> {
+    server_config_for(rustls::DEFAULT_VERSIONS)
+}
+
+fn server_config_for(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> std::sync::Arc<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     std::sync::Arc::new(
         rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert.der().clone()], key.into())
@@ -501,6 +505,12 @@ fn timeout_releases_each_socket_and_preserves_the_request_budget() {
 
 #[test]
 fn partial_tls_upload_timeout_closes_before_a_complete_replacement_upload() {
+    for established in [false, true] {
+        partial_tls_upload_timeout(established);
+    }
+}
+
+fn partial_tls_upload_timeout(established: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     // Far larger than the TCP buffers, with a pattern that exposes a spliced
@@ -526,6 +536,15 @@ fn partial_tls_upload_timeout_closes_before_a_complete_replacement_upload() {
             .unwrap();
         let mut session = rustls::ServerConnection::new(config.clone()).unwrap();
         let mut stream = rustls::Stream::new(&mut session, &mut first);
+        if established {
+            let mut complete = vec![0; expected.len()];
+            stream.read_exact(&mut complete).unwrap();
+            assert_eq!(complete, expected);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        }
         let mut prefix = [0; 1024];
         stream.read_exact(&mut prefix).unwrap();
         assert_eq!(prefix, expected[..prefix.len()]);
@@ -568,7 +587,7 @@ fn partial_tls_upload_timeout_closes_before_a_complete_replacement_upload() {
         &target,
         Some(&setup),
         1,
-        Budget::Requests(2),
+        Budget::Requests(2 + u64::from(established)),
         Duration::from_secs(5),
         Some(Duration::from_secs(1)),
     )
@@ -576,11 +595,14 @@ fn partial_tls_upload_timeout_closes_before_a_complete_replacement_upload() {
     server.join().unwrap();
     assert_eq!(
         (stats.completed, stats.errors, stats.connect_errors),
-        (1, 1, 0)
+        (1 + u64::from(established), 1, 0)
     );
-    assert_eq!(stats.latencies_ns.len(), 1);
-    assert_eq!(stats.status_counts[200], 1);
-    assert_eq!(stats.status_counts.iter().sum::<u64>(), 1);
+    assert_eq!(stats.latencies_ns.len(), 1 + usize::from(established));
+    assert_eq!(stats.status_counts[200], 1 + u64::from(established));
+    assert_eq!(
+        stats.status_counts.iter().sum::<u64>(),
+        1 + u64::from(established)
+    );
 }
 
 #[test]
@@ -656,3 +678,201 @@ fn early_responses_preserve_complete_plain_and_tls_upload_order() {
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
+
+fn decrypt_upload(server: &mut rustls::ServerConnection, mut wire: &[u8]) -> Vec<u8> {
+    let mut received = Vec::new();
+    while !wire.is_empty() {
+        assert!(server.read_tls(&mut wire).unwrap() > 0);
+        server.process_new_packets().unwrap();
+        loop {
+            let mut scratch = [0; 997];
+            match server.reader().read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&scratch[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("upload decrypt failed: {e}"),
+            }
+        }
+    }
+    received
+}
+
+fn establish_tls(
+    f: &mut Fixture,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> rustls::ServerConnection {
+    let mut tls = TlsSession::new(&crate::tls::setup("localhost", b"http/1.1").unwrap()).unwrap();
+    let mut peer = rustls::ServerConnection::new(server_config_for(&[version])).unwrap();
+    for _ in 0..16 {
+        let sent = tls.take_ciphertext().unwrap();
+        assert!(decrypt_upload(&mut peer, &sent).is_empty());
+        let mut reply = Vec::new();
+        while peer.wants_write() {
+            peer.write_tls(&mut reply).unwrap();
+        }
+        tls.feed_into(&reply, &mut [0; 1024], |_| panic!("unexpected response"))
+            .unwrap();
+        if sent.is_empty() && reply.is_empty() {
+            assert!(!tls.is_handshaking());
+            assert!(!peer.is_handshaking());
+            f.conn.tls = Some(tls);
+            return peer;
+        }
+    }
+    panic!("handshake did not finish");
+}
+
+#[test]
+fn next_tls_request_preserves_pending_send_storage_and_clock() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let mut f = Fixture::new();
+        let mut peer = establish_tls(&mut f, version);
+        let first = b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let next: Vec<_> = (0..131073).map(|i| (i % 251) as u8).collect();
+        f.conn.begin_request(Some(Duration::from_secs(5)));
+        let deadline = f.conn.deadline;
+        {
+            let (submitter, mut sq, _) = f.ring.split();
+            queue_and_flush_request(&submitter, &mut sq, 0, &mut f.conn, first).unwrap();
+        }
+        assert!(f.conn.sending && !f.conn.unsent && f.conn.active);
+        assert_eq!(f.conn.deadline, deadline);
+        let wire = f.conn.out.clone();
+        assert!(
+            !wire.is_empty(),
+            "prepared ciphertext was cleared before submission"
+        );
+        let storage = (f.conn.out.as_ptr(), f.conn.out.capacity(), f.conn.out_off);
+        let first_start = f.conn.request_start;
+
+        // A response may finish before its Send CQE is processed. Queuing the
+        // next request must neither rewrite the old ciphertext nor start the
+        // next latency clock. Leave the SQE queued to make this deterministic.
+        f.conn.end_request();
+        f.conn.begin_request(Some(Duration::from_secs(7)));
+        let next_deadline = f.conn.deadline;
+        {
+            let (submitter, mut sq, _) = f.ring.split();
+            queue_and_flush_request(&submitter, &mut sq, 0, &mut f.conn, &next).unwrap();
+            flush(&submitter, &mut sq, 0, &mut f.conn, &next).unwrap();
+            assert_eq!(sq.len(), 1);
+        }
+        assert_eq!(f.conn.out, wire);
+        assert_eq!(
+            (f.conn.out.as_ptr(), f.conn.out.capacity(), f.conn.out_off),
+            storage
+        );
+        assert!(f.conn.unsent && f.conn.active);
+        assert_eq!(f.conn.request_start, first_start);
+        assert_eq!(f.conn.deadline, next_deadline);
+
+        let cqes = f.completions();
+        assert_eq!(cqes.len(), 1);
+        assert_eq!(cqes[0].user_data(), uring::user_data(0, 0, OP_SEND));
+        assert_eq!(cqes[0].result() as usize, wire.len());
+        let mut received = vec![0; wire.len()];
+        f.peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, wire);
+        assert_eq!(decrypt_upload(&mut peer, &received), first);
+        f.conn.sending = false;
+        {
+            let (submitter, mut sq, _) = f.ring.split();
+            flush(&submitter, &mut sq, 0, &mut f.conn, &next).unwrap();
+        }
+        assert!(!f.conn.unsent && f.conn.sending);
+        assert!(f.conn.request_start >= first_start);
+        assert_eq!(f.conn.deadline, next_deadline);
+        let wire = f.conn.out.clone();
+        let mut received = Vec::new();
+        while f.conn.out_off < wire.len() {
+            let cqes = f.completions();
+            assert_eq!(cqes.len(), 1);
+            assert_eq!(cqes[0].user_data(), uring::user_data(0, 0, OP_SEND));
+            assert!(cqes[0].result() > 0);
+            let n = cqes[0].result() as usize;
+            let mut part = vec![0; n];
+            f.peer.read_exact(&mut part).unwrap();
+            received.extend_from_slice(&part);
+            f.conn.out_off += n;
+            if f.conn.out_off < wire.len() {
+                let (submitter, mut sq, _) = f.ring.split();
+                uring::push_send_slice(&submitter, &mut sq, 0, 0, &f.conn.out[f.conn.out_off..])
+                    .unwrap();
+            }
+        }
+        assert_eq!(received, wire);
+        assert_eq!(decrypt_upload(&mut peer, &received), next);
+        f.conn.sending = false;
+        {
+            let (submitter, mut sq, _) = f.ring.split();
+            flush(&submitter, &mut sq, 0, &mut f.conn, &next).unwrap();
+            assert!(sq.is_empty(), "request was submitted twice");
+        }
+        f.retire();
+    }
+}
+
+#[test]
+fn complete_tls_uploads_preserve_keepalive_bytes_and_every_sample() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        for size in [256, 16384, 1048576] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let body: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            let target = crate::target::parse_target(
+                &format!("https://{}/", listener.local_addr().unwrap()),
+                "POST",
+                &[],
+                Some(&body),
+                false,
+            )
+            .unwrap();
+            let expected = target.request_bytes.clone();
+            let server = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut stream = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(server_config_for(&[version])).unwrap(),
+                    socket,
+                );
+                for i in 0..3 {
+                    let mut got = vec![0; expected.len()];
+                    stream.read_exact(&mut got).unwrap();
+                    assert_eq!(got, expected);
+                    stream
+                        .write_all(if i == 2 {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                        })
+                        .unwrap();
+                    stream.flush().unwrap();
+                }
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            });
+            let setup = crate::tls::setup("localhost", b"http/1.1").unwrap();
+            let stats = run_worker(
+                &target,
+                Some(&setup),
+                1,
+                Budget::Requests(3),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                (stats.completed, stats.errors, stats.connect_errors),
+                (3, 0, 0)
+            );
+            assert_eq!(stats.latencies_ns.len(), 3);
+            assert_eq!(stats.status_counts[200], 3);
+            assert_eq!(stats.status_counts.iter().sum::<u64>(), 3);
+            assert!(stats.bytes_sent >= 3 * target.request_bytes.len() as u64);
+        }
+    }
+}

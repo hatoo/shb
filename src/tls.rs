@@ -216,6 +216,58 @@ impl TlsSession {
         self.push_plaintext()
     }
 
+    /// Encrypt borrowed plaintext and drain ciphertext into a reusable buffer.
+    ///
+    /// The caller retains the input until this returns and must own `out`
+    /// exclusively (no socket send may still reference it). Established
+    /// sessions can alternate writes and drains without staging a large input
+    /// in `pending_plaintext`. Handshake data and older backlog keep the queued
+    /// path so ordering and bounded buffering are unchanged.
+    pub fn write_plaintext_and_take_ciphertext(
+        &mut self,
+        mut data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if self.is_handshaking() || !self.pending_plaintext.is_empty() {
+            self.write_plaintext(data)?;
+            return self.take_ciphertext_into(out);
+        }
+
+        out.clear();
+        loop {
+            while !data.is_empty() {
+                let n = match self.conn.writer().write(data) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // Retain the unaccepted suffix, as the queued path
+                        // does. The HTTP worker treats this error as terminal.
+                        self.pending_plaintext.extend_from_slice(data);
+                        return Err(e).context("TLS plaintext write failed");
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                data = &data[n..];
+            }
+            let before = out.len();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut *out).context("write_tls failed")?;
+            }
+            if data.is_empty() {
+                break;
+            }
+            if out.len() == before {
+                // A zero buffer limit or another blocked writer cannot make
+                // progress even after a drain. Own the suffix before the
+                // caller recycles its input, and resume on a later flush.
+                self.pending_plaintext.extend_from_slice(data);
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Hand rustls as much of the backlog as it will take
     fn push_plaintext(&mut self) -> Result<()> {
         while !self.pending_plaintext.is_empty() {
