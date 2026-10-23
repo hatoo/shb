@@ -1134,6 +1134,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "h2",
  "h3",
  "h3-quinn",
  "http",

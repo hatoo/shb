@@ -55,6 +55,11 @@ jobs:
           cargo build --release --locked --example h2-request-encoding
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h2-request-encoding.py --probe ./target/release/examples/h2-request-encoding --shb ./target/release/shb
 
+      - name: HTTP/2 complete request bodies (hyper-h2)
+        run: |
+          cargo build --release --locked --example h2-upload-server
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h2-complete-uploads.py --shb ./target/release/shb --peer ./target/release/examples/h2-upload-server
+
       - name: HTTP/3 final-send byte accounting (aioquic)
         run: |
           if ! command -v strace; then
