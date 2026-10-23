@@ -22,6 +22,13 @@ import h2.events
 import h2.settings
 
 
+def log_lines(path):
+    # A regular-file read can end in the middle of a concurrent stderr write.
+    # Parse only newline-terminated records; malformed complete records still fail.
+    data = path.read_text()
+    return data[:data.rfind('\n') + 1].splitlines()
+
+
 def run_case(shb, directory, name, length, parallel=8, connections=2,
              count=16, window=4194304, max_frame=16384, reconnect=False,
              tls=False, change_settings=False):
@@ -165,83 +172,163 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
                 command=command, connections=ledgers, report=report)
 
 
-def native_case(peer, directory, name):
-    """Validate the independent benchmark peer, including its failure oracles."""
-    length = 1048576
+def native_case(peer, directory, name, tls=None):
+    """Use Python SSL + hyper-h2 to certify the native peer and its ledgers."""
+    concurrent = name in ('concurrent', 'aborted-streams')
+    length = 16384 if concurrent else 1048576
+    connections, streams = (8, 8) if concurrent else (1, 1)
     expected = bytes(33 + i % 90 for i in range(length))
-    body_path = directory / ('native-' + name + '.body')
+    stem = f'native-{tls or "clear"}-{name}'
+    body_path = directory / (stem + '.body')
     body_path.write_bytes(expected)
     payload = bytearray(expected)
     if name == 'bad-payload':
         payload[0] ^= 1
-    if name == 'truncated':
+    if name in ('truncated', 'truncated-frame'):
         payload.pop()
-    with socket.socket() as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        port = reservation.getsockname()[1]
-    log_path = directory / ('native-' + name + '.log')
-    with log_path.open('w+') as log:
-        process = subprocess.Popen([str(peer), str(port), str(body_path)], stdout=log, stderr=log)
+    command = [str(peer), '0', str(body_path)]
+    if tls:
+        command += ['--tls', tls, '--cert', str(directory / 'cert.pem'),
+                    '--key', str(directory / 'key.pem')]
+    log_path = directory / (stem + '.log')
+    results, failures = [], []
+    barrier = threading.Barrier(connections)
+    with log_path.open('x') as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 10
             while True:
-                assert process.poll() is None
-                try:
-                    conn = socket.create_connection(('127.0.0.1', port), timeout=1)
+                assert process.poll() is None, log_path.read_text()
+                ready = [line for line in log_lines(log_path)
+                         if line.startswith('READY ')]
+                if ready:
+                    port = int(ready[0].split()[1])
+                    assert port != 0
                     break
-                except OSError:
-                    assert time.monotonic() < deadline
-                    time.sleep(0.01)
-            with conn:
-                conn.settimeout(5)
-                h = h2.connection.H2Connection()
-                h.initiate_connection()
-                h.send_headers(1, [(':method', 'POST'), (':scheme', 'http'),
-                                   (':authority', f'127.0.0.1:{port}'), (':path', '/upload'),
-                                   ('content-length', str(length))])
-                conn.sendall(h.data_to_send())
-                statuses, resets, ends, response, pings = [], [], [], bytearray(), []
+                assert time.monotonic() < deadline, 'native peer readiness'
+                time.sleep(0.01)
 
-                def receive():
-                    data = conn.recv(65536)
-                    assert data, 'peer closed before reporting its result'
-                    for event in h.receive_data(data):
-                        if isinstance(event, h2.events.ResponseReceived):
-                            statuses.append(dict(event.headers)[b':status'])
-                        elif isinstance(event, h2.events.DataReceived):
-                            response.extend(event.data)
-                            h.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
-                        elif isinstance(event, h2.events.StreamEnded):
-                            ends.append(event.stream_id)
-                        elif isinstance(event, h2.events.StreamReset):
-                            resets.append(event.stream_id)
-                        elif isinstance(event, h2.events.PingAckReceived):
-                            pings.append(event.ping_data)
-                    pending = h.data_to_send()
-                    if pending:
-                        conn.sendall(pending)
+            def client():
+                try:
+                    context = None
+                    if tls:
+                        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        version = (ssl.TLSVersion.TLSv1_2 if tls == 'tls12'
+                                   else ssl.TLSVersion.TLSv1_3)
+                        context.minimum_version = context.maximum_version = version
+                        context.set_alpn_protocols(['h2'])
+                    with socket.create_connection(('127.0.0.1', port), timeout=10) as raw:
+                        conn = context.wrap_socket(raw, server_hostname='localhost') if tls else raw
+                        with conn:
+                            if tls:
+                                assert conn.selected_alpn_protocol() == 'h2'
+                                assert conn.version() == ('TLSv1.2' if tls == 'tls12' else 'TLSv1.3')
+                            barrier.wait(timeout=10)
+                            h = h2.connection.H2Connection()
+                            h.initiate_connection()
+                            ids = list(range(1, streams * 2, 2))
+                            for sid in ids:
+                                h.send_headers(sid, [(':method', 'POST'),
+                                    (':scheme', 'https' if tls else 'http'),
+                                    (':authority', f'127.0.0.1:{port}'), (':path', '/upload'),
+                                    ('content-length', str(length))])
+                            conn.sendall(h.data_to_send())
+                            statuses, resets, ends, pings = {}, [], [], []
+                            response = {sid: bytearray() for sid in ids}
 
-                while h.local_flow_control_window(1) < length:
-                    receive()
-                for at in range(0, len(payload), h.max_outbound_frame_size):
-                    h.send_data(1, payload[at:at + h.max_outbound_frame_size])
-                # Even the full correct payload is unfinished until END_STREAM.
-                # A PING fences the preceding DATA without timing sleeps.
-                h.ping(b'endcheck')
-                conn.sendall(h.data_to_send())
-                while b'endcheck' not in pings:
-                    receive()
-                assert not statuses and not ends, 'peer answered before END_STREAM'
-                if not resets:
-                    h.send_data(1, b'', end_stream=True)
-                    conn.sendall(h.data_to_send())
-                    while not ends and not resets:
-                        receive()
-                if name == 'complete':
-                    assert statuses == [b'200'] and ends == [1] and not resets
-                    assert bytes(response) == b'Hello, World!'
-                else:
-                    assert resets == [1] and not statuses and not ends
+                            def receive():
+                                data = conn.recv(65536)
+                                assert data, 'peer closed before reporting its result'
+                                for event in h.receive_data(data):
+                                    if isinstance(event, h2.events.ResponseReceived):
+                                        assert event.stream_id not in statuses
+                                        headers = dict(event.headers)
+                                        assert headers[b'content-length'] == b'13'
+                                        statuses[event.stream_id] = headers[b':status']
+                                    elif isinstance(event, h2.events.DataReceived):
+                                        response[event.stream_id].extend(event.data)
+                                        h.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                                    elif isinstance(event, h2.events.StreamEnded):
+                                        ends.append(event.stream_id)
+                                    elif isinstance(event, h2.events.StreamReset):
+                                        resets.append(event.stream_id)
+                                    elif isinstance(event, h2.events.PingAckReceived):
+                                        pings.append(event.ping_data)
+                                pending = h.data_to_send()
+                                if pending:
+                                    conn.sendall(pending)
+
+                            while (h.outbound_flow_control_window < len(payload) * streams
+                                   or any(h.local_flow_control_window(sid) < len(payload) for sid in ids)):
+                                receive()
+                            for sid in ids:
+                                for at in range(0, len(payload), h.max_outbound_frame_size):
+                                    h.send_data(sid, payload[at:at + h.max_outbound_frame_size])
+                            # PING is an ordering fence, not a timing-based absence check.
+                            h.ping(b'endcheck')
+                            conn.sendall(h.data_to_send())
+                            while b'endcheck' not in pings:
+                                receive()
+                            assert not statuses and not ends, 'peer answered before END_STREAM'
+                            if name == 'truncated-frame':
+                                # Declare one last DATA byte with END_STREAM, then close
+                                # after its header. The final payload byte never arrives.
+                                conn.sendall(b'\x00\x00\x01\x00\x01\x00\x00\x00\x01')
+                            elif name != 'aborted-streams':
+                                for sid in ids:
+                                    if sid not in resets:
+                                        h.send_data(sid, b'', end_stream=True)
+                                wire = h.data_to_send()
+                                if name == 'split-end-frame':
+                                    for piece in (wire[:3], wire[3:8], wire[8:]):
+                                        conn.sendall(piece)
+                                elif wire:
+                                    conn.sendall(wire)
+                                while len(ends) + len(resets) < streams:
+                                    receive()
+                                if name in ('complete', 'concurrent', 'split-end-frame'):
+                                    assert statuses == {sid: b'200' for sid in ids}
+                                    assert sorted(ends) == ids and not resets
+                                    assert all(bytes(response[sid]) == b'Hello, World!' for sid in ids)
+                                else:
+                                    assert sorted(resets) == ids and not statuses and not ends
+                                h.close_connection()
+                                conn.sendall(h.data_to_send())
+                            results.append(dict(ends=ends, resets=resets,
+                                                response_bytes=sum(map(len, response.values()))))
+                except BaseException as exc:
+                    failures.append(repr(exc))
+                    barrier.abort()
+
+            threads = [threading.Thread(target=client, daemon=True) for _ in range(connections)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+            assert all(not thread.is_alive() for thread in threads), stem
+            assert not failures, (stem, failures, log_path.read_text())
+            # Do not kill the process before the per-connection tasks retire.
+            deadline = time.monotonic() + 10
+            while True:
+                output = log_path.read_text()
+                ledgers = [json.loads(line[7:]) for line in log_lines(log_path)
+                           if line.startswith('LEDGER ')]
+                if len(ledgers) == connections:
+                    break
+                assert process.poll() is None and time.monotonic() < deadline, output
+                time.sleep(0.01)
+            successful = name in ('complete', 'concurrent', 'split-end-frame')
+            assert len({r['connection'] for r in ledgers}) == connections
+            for ledger in ledgers:
+                assert ledger['requests'] == (streams if successful else 0), ledger
+                assert ledger['body_bytes'] == (streams * length if successful else 0), ledger
+                assert ledger['pending'] == 0, ledger
+                assert ledger['rejected'] == (0 if successful else streams), ledger
+            assert 'panicked' not in output, output
+            if name == 'bad-payload':
+                assert 'request DATA differs' in output, output
         finally:
             process.terminate()
             try:
@@ -249,13 +336,59 @@ def native_case(peer, directory, name):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-    output = log_path.read_text()
-    if name == 'complete':
-        assert 'panicked' not in output, output
-    elif name == 'bad-payload':
-        assert 'request DATA differs' in output, output
-    return dict(name=name, payload_bytes=len(payload), response_bytes=len(response),
-                resets=resets, ends=ends, body_sha256=hashlib.sha256(expected).hexdigest())
+    return dict(name=stem, payload_bytes=len(payload), connections=ledgers,
+                results=results, command=command,
+                body_sha256=hashlib.sha256(expected).hexdigest())
+
+
+def native_tls_rejection(peer, directory, tls, fault):
+    """Reject a wrong TLS version or an absent/incompatible ALPN protocol."""
+    body = directory / 'rejection.body'
+    body.write_bytes(b'x')
+    command = [str(peer), '0', str(body), '--tls', tls,
+               '--cert', str(directory / 'cert.pem'), '--key', str(directory / 'key.pem')]
+    log_path = directory / f'{tls}-{fault}.log'
+    with log_path.open('x') as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                ready = [line for line in log_lines(log_path) if line.startswith('READY ')]
+                if ready:
+                    port = int(ready[0].split()[1])
+                    break
+                assert process.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            version = ssl.TLSVersion.TLSv1_2 if tls == 'tls12' else ssl.TLSVersion.TLSv1_3
+            if fault == 'wrong-version':
+                version = ssl.TLSVersion.TLSv1_3 if tls == 'tls12' else ssl.TLSVersion.TLSv1_2
+            context.minimum_version = context.maximum_version = version
+            if fault != 'no-alpn':
+                context.set_alpn_protocols(['http/1.1' if fault == 'wrong-alpn' else 'h2'])
+            rejected = False
+            with socket.create_connection(('127.0.0.1', port), timeout=5) as raw:
+                try:
+                    with context.wrap_socket(raw, server_hostname='localhost') as conn:
+                        # TLS with no ALPN can finish, but H2 must not start.
+                        rejected = conn.recv(1) == b''
+                except (ssl.SSLError, ConnectionResetError):
+                    rejected = True
+            assert rejected, (tls, fault)
+            while 'TLS_ERROR' not in log_path.read_text():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert 'LEDGER ' not in log_path.read_text()
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return dict(tls=tls, fault=fault, rejected=True)
 
 
 def main():
@@ -279,12 +412,17 @@ def main():
             ('tls-16k', 16384, dict(tls=True)),
             ('tls-1m', 1048576, dict(tls=True)),
         ]
-        native = [native_case(args.peer.resolve(), directory, name) for name in
-                  ['complete', 'bad-payload', 'truncated']] if args.peer else []
+        native = [native_case(args.peer.resolve(), directory, name, tls)
+                  for tls in [None, 'tls12', 'tls13']
+                  for name in ['complete', 'bad-payload', 'truncated', 'split-end-frame',
+                               'truncated-frame', 'concurrent', 'aborted-streams']] if args.peer else []
+        tls_rejections = [native_tls_rejection(args.peer.resolve(), directory, tls, fault)
+                          for tls in ['tls12', 'tls13']
+                          for fault in ['wrong-version', 'wrong-alpn', 'no-alpn']] if args.peer else []
         records = []
         for name, size, options in cases:
             records.append(run_case(args.shb.resolve(), directory, name, size, **options))
-        print(json.dumps(dict(h2_version=h2.__version__, binary_sha256=hashlib.sha256(args.shb.read_bytes()).hexdigest(), cases=records, native=native), indent=2))
+        print(json.dumps(dict(h2_version=h2.__version__, binary_sha256=hashlib.sha256(args.shb.read_bytes()).hexdigest(), cases=records, native=native, tls_rejections=tls_rejections), indent=2))
 
 
 if __name__ == '__main__':
