@@ -29,19 +29,33 @@ python3 -m venv /tmp/h2-upload-check
 ```
 
 The optional `--peer` argument also validates the native h2 0.4.19 benchmark
-peer. A PING fences the full DATA payload before END_STREAM; no response may
-have arrived. Sending END_STREAM then produces exactly one complete response.
-Separate wrong-payload and truncated-body cases must reset the stream without
-a successful response. The wrong-payload case deliberately triggers the
-peer's assertion in its connection task; its captured log is checked by the
-oracle. These faults are expected test outcomes, not successful workloads.
+peer over cleartext, TLS 1.2 and TLS 1.3. Python SSL and hyper-h2 independently
+check the negotiated version and h2 ALPN. Each transport runs seven cases:
+
+- Complete 1 MiB body, corrupt payload, and a body one byte short.
+- END_STREAM split across writes, and a final DATA frame missing its payload.
+- Eight connections with eight concurrent 16 KiB uploads each.
+- Those same concurrent streams closed before END_STREAM.
+
+A PING fences the full DATA payload before END_STREAM; no response may have
+arrived. Every success checks status, response length and `Hello, World!`.
+Faults must produce no successful response, and every closed connection must
+report an exact request/byte ledger with zero pending tasks. Rejected uploads
+are counted separately. Wrong TLS versions, incompatible ALPN and absent ALPN
+add six rejection cases. The existing nine shb-to-Python cases also still run.
+All these checks run in the existing complete-body CI step.
 
 The native peer uses four Tokio workers, a 4 MiB stream receive window, a 32 MiB
-connection receive window, and 16 KiB frames. Its only arguments are a TCP port
-and the file containing the exact expected request body. It compares each DATA
-chunk, releases credit as it consumes data, and responds with `Hello, World!`
-only after the exact declared body and stream end. Each closed connection logs
-a ledger of completed requests, body bytes and pending tasks.
+connection receive window, 1,024 concurrent streams and 16 KiB frames. Its
+positional arguments remain a TCP port and the file containing the expected
+request body. Port zero selects an unused port; `READY <actual-port>` is written
+to stderr after binding. It compares each DATA chunk, releases credit as it
+consumes data, and responds only after the declared body and END_STREAM. A
+missing or zero content length is permitted for bodyless control requests.
+Stream tasks are joined before the final per-connection ledger is emitted,
+including after rejected or interrupted uploads. TLS configuration is optional;
+`--tls tls12` or `--tls tls13` requires `--cert` and `--key` PEM paths. The async
+TLS adapter is a development dependency.
 
 ```sh
 # Generate a body with no newline characters.
@@ -58,3 +72,34 @@ pending tasks. Preserve the ledger with the client report. Freeze the peer
 binary when comparing clients; alternate immutable release clients with
 identical bodies, settings and counts. This fixture adds no production client
 behavior and makes no performance-improvement claim.
+
+For TLS, generate a test certificate and select one protocol version explicitly:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/upload.key \
+  -out /tmp/upload.crt -days 1 -subj /CN=localhost
+target/release/examples/h2-upload-server 18779 /tmp/upload.body \
+  --tls tls13 --cert /tmp/upload.crt --key /tmp/upload.key
+# Use an https:// URL with the same client arguments above.
+```
+
+`compare-h2-tls-uploads.py` runs a fixed 16 KiB/c8/p8/t1 workload against this
+peer for both TLS versions, with 512 warmup requests before each measurement
+and 32,768 measured requests. It alternates immutable clients for three pairs,
+checks every connection ledger, saves the raw client reports and server logs,
+and records CPU time separately for the client and peer (whole-process CPU,
+including startup and teardown). Throughput, p99 and p99.9 come from shb's
+unchanged reports. Warmups use separate processes. Output directories must be
+new, and input hashes are checked before and after the run.
+
+```sh
+python3 benchmarks/compare-h2-tls-uploads.py \
+  --baseline /path/to/frozen-baseline --candidate /path/to/frozen-candidate \
+  --peer /path/to/frozen-h2-upload-server --out /tmp/h2-tls-primary
+# Repeat with a new output directory and --reverse for independent confirmation.
+```
+
+Freeze the same peer for both clients and both comparison orders. Its TLS and
+stream-task scheduling differ from other peers, so rates measured against
+different peers are different workloads. This tool alone cannot establish that
+a client has improved or that a previously observed regression was noise.
