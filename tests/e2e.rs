@@ -18,6 +18,9 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::any;
 
+#[path = "support/body_sources.rs"]
+mod body_sources;
+
 #[path = "support/h2_timeout.rs"]
 mod h2_timeout;
 
@@ -47,8 +50,8 @@ async fn handler(method: Method, headers: HeaderMap, body: Bytes) -> (StatusCode
         };
     }
     // If the client sent our marker header, its value must equal the body
-    if let Some(echo) = headers.get("x-echo") {
-        if echo.as_bytes() != body.as_ref() {
+    if let Some(echo) = h3_server::expected_echo(&headers) {
+        if echo.as_slice() != body.as_ref() {
             return (StatusCode::BAD_REQUEST, "header/body mismatch");
         }
     } else if !body.is_empty() {

@@ -27,6 +27,9 @@ mod target;
 mod tls;
 
 #[cfg(test)]
+#[path = "../tests/support/body_normalization.rs"]
+mod body_normalization;
+#[cfg(test)]
 #[path = "../tests/support/credit_recovery.rs"]
 mod credit_recovery;
 #[cfg(test)]
@@ -212,8 +215,12 @@ fn resolve_body(arg: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
         data =
             std::fs::read(source).with_context(|| format!("failed to read body file {source}"))?;
     }
-    data.retain(|&b| b != b'\r' && b != b'\n');
+    strip_body_newlines(&mut data);
     Ok(Some(data))
+}
+
+fn strip_body_newlines(data: &mut Vec<u8>) {
+    data.retain(|&b| b != b'\r' && b != b'\n');
 }
 
 fn main() -> Result<()> {
