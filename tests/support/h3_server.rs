@@ -1,6 +1,22 @@
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
+/// Hex permits the independent peers to check NUL, CR/LF and non-UTF-8 bytes.
+pub(super) fn expected_echo(headers: &http::HeaderMap) -> Option<Vec<u8>> {
+    if let Some(hex) = headers.get("x-echo-hex") {
+        let hex = hex.to_str().unwrap();
+        assert_eq!(hex.len() % 2, 0);
+        Some(
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect(),
+        )
+    } else {
+        headers.get("x-echo").map(|v| v.as_bytes().to_vec())
+    }
+}
+
 pub const STATIC_NAME_HEADERS: &[(&str, &str)] = &[
     ("accept", "application/custom"),
     ("accept-encoding", "identity"),
@@ -95,10 +111,7 @@ pub fn h3_server_addr() -> SocketAddr {
                                     .get("x-body-len")
                                     .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
                                     .and_then(|v| v.parse::<usize>().ok());
-                                let echo = request
-                                    .headers()
-                                    .get("x-echo")
-                                    .map(|v| v.as_bytes().to_vec());
+                                let echo = expected_echo(request.headers());
                                 // Same rule as the axum server: a request that
                                 // names its method proves the method arrived
                                 let expect = request
