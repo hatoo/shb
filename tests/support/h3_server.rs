@@ -1,5 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Only the mixed-result accounting test uses this route and peer ledger.
+pub static ACCOUNTING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Hex permits the independent peers to check NUL, CR/LF and non-UTF-8 bytes.
 pub(super) fn expected_echo(headers: &http::HeaderMap) -> Option<Vec<u8>> {
@@ -87,6 +91,29 @@ pub fn h3_server_addr() -> SocketAddr {
                                 else {
                                     return;
                                 };
+                                if request.uri().path() == "/latency-accounting" {
+                                    assert!(stream.recv_data().await.unwrap().is_none());
+                                    let index = ACCOUNTING_REQUESTS.fetch_add(1, Ordering::SeqCst);
+                                    if index % 3 == 2 {
+                                        stream.stop_stream(
+                                            h3::error::Code::H3_GENERAL_PROTOCOL_ERROR,
+                                        );
+                                    } else {
+                                        let status =
+                                            if index.is_multiple_of(3) { 200 } else { 503 };
+                                        stream
+                                            .send_response(
+                                                http::Response::builder()
+                                                    .status(status)
+                                                    .body(())
+                                                    .unwrap(),
+                                            )
+                                            .await
+                                            .unwrap();
+                                        stream.finish().await.unwrap();
+                                    }
+                                    return;
+                                }
                                 // A response that takes longer than a run is
                                 // willing to wait for
                                 if request.uri().path() == "/slow" {

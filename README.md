@@ -296,6 +296,7 @@ for ever.
   "bytesSent": 20233272,
   "bytesSentPerSec": 10102246.188790502,
   "statusCodes": { "200": 722541 },
+  "latencySamples": 722541,
   "latencySeconds": {
     "min": 0.000030961,
     "mean": 0.0001767384621343287,
@@ -308,6 +309,12 @@ for ever.
   }
 }
 ```
+
+`latencySamples` is the number of recorded samples used for `latencySeconds`.
+It equals `requests.ok`, including completed responses with HTTP error statuses.
+Failed requests have no latency sample. With no successes it is zero and
+`latencySeconds` is `null`. The count is read from the sample storage after the
+run; it does not expose individual samples or change timestamp collection.
 
 ## Comparison with wrk and h2load
 

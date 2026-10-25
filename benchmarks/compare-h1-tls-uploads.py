@@ -9,6 +9,8 @@ import select
 import statistics
 import subprocess
 
+from report_accounting import validate_sample_accounting
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -70,6 +72,7 @@ def main():
                             (out / (stem + '.stderr')).write_text(run.stderr)
                             assert run.returncode == 0, run.stderr
                             report = json.loads(run.stdout)
+                            validate_sample_accounting(report)
                             assert report['requests'] == dict(ok=count, errors=0,
                                                               connectErrors=0, total=count)
                             assert report['statusCodes'] == {'200': count}

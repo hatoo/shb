@@ -57,6 +57,7 @@ jobs:
 
       - name: HTTP/2 complete request bodies (hyper-h2)
         run: |
+          python3 -m unittest discover -s benchmarks -p 'test_report_accounting.py'
           cargo build --release --locked --example h2-upload-server
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h2-complete-uploads.py --shb ./target/release/shb --peer ./target/release/examples/h2-upload-server
 

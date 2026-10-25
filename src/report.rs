@@ -119,6 +119,7 @@ pub fn print_json_report(
         "bytesSent": stats.bytes_sent,
         "bytesSentPerSec": stats.bytes_sent as f64 / secs,
         "statusCodes": status_codes,
+        "latencySamples": stats.latencies_ns.len(),
         "latencySeconds": latency,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
