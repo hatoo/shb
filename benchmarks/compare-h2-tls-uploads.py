@@ -9,6 +9,8 @@ import statistics
 import subprocess
 import time
 
+from report_accounting import validate_sample_accounting
+
 
 def log_lines(path):
     # A regular-file read can end in the middle of a concurrent stderr write.
@@ -94,6 +96,7 @@ def main():
                             (out / (stem + '.stderr')).write_text(run.stderr)
                             assert run.returncode == 0, run.stderr
                             report = json.loads(run.stdout)
+                            validate_sample_accounting(report)
                             assert report['requests'] == dict(ok=count, errors=0, connectErrors=0, total=count)
                             assert report['statusCodes'] == {'200': count}
                             assert report['bytesSent'] >= count * 16384

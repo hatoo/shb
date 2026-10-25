@@ -21,6 +21,8 @@ import h2.connection
 import h2.events
 import h2.settings
 
+from report_accounting import validate_sample_accounting
+
 
 def log_lines(path):
     # A regular-file read can end in the middle of a concurrent stderr write.
@@ -157,6 +159,7 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
     assert not failures, (name, failures)
     assert result.returncode == 0, (name, result.stderr)
     report = json.loads(result.stdout)
+    validate_sample_accounting(report)
     assert report['requests']['ok'] == count, (name, report)
     assert report['requests']['errors'] == report['requests']['connectErrors'] == 0
     assert report['statusCodes'] == {'200': count}

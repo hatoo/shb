@@ -8,8 +8,8 @@ body-completion ledger.
 
 `check-h2-complete-uploads.py` uses hyper-h2 4.3.0 to validate real shb requests.
 It checks every byte against a nonconstant ASCII body, content length,
-END_STREAM, response/error totals and, for cleartext, the complete TCP send
-count (excluding the existing best-effort teardown GOAWAY). Cases cover:
+END_STREAM, response/error/latency sample totals and, for cleartext, the complete
+TCP send count (excluding the existing best-effort teardown GOAWAY). Cases cover:
 
 - 16,383-byte, 16 KiB and 1 MiB bodies, with two connections and eight streams.
 - 64 KiB frames, a frame-size SETTINGS change, and 3,072-byte stream credit.
@@ -67,7 +67,8 @@ taskset -c 2 target/release/shb --http2 -n 8192 -c 8 -p 8 -t 1 \
 ```
 
 A valid timing run requires zero unexpected errors, exactly 8,192 successes,
-and a peer ledger totaling 8,192 requests, 8,589,934,592 body bytes and zero
+`latencySamples: 8192`, and a peer ledger totaling 8,192 requests,
+8,589,934,592 body bytes and zero
 pending tasks. Preserve the ledger with the client report. Freeze the peer
 binary when comparing clients; alternate immutable release clients with
 identical bodies, settings and counts. This fixture adds no production client
@@ -91,6 +92,18 @@ and records CPU time separately for the client and peer (whole-process CPU,
 including startup and teardown). Throughput, p99 and p99.9 come from shb's
 unchanged reports. Warmups use separate processes. Output directories must be
 new, and input hashes are checked before and after the run.
+
+Both this validator and the HTTP/1 and HTTP/2 TLS comparison scripts require
+an explicit `latencySamples` count equal to successful completions and the sum
+of status counts. Missing, extra or lost samples invalidate the run. Clients
+built before this field was added need the same reporting-only change applied
+to both baseline and candidate before comparison; the scripts do not infer a
+count for older binaries. This checks the live count, not individual raw samples.
+Run the fault checks with:
+
+```sh
+python3 -m unittest discover -s benchmarks -p 'test_report_accounting.py'
+```
 
 ```sh
 python3 benchmarks/compare-h2-tls-uploads.py \

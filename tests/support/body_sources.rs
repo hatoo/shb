@@ -91,6 +91,7 @@ fn body_sources_preserve_exact_bytes_for_every_protocol_and_worker() {
                     assert!(output.status.success(), "{command:?}: {output:?}");
                     assert!(output.stderr.is_empty(), "{command:?}: {output:?}");
                     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    super::latency_accounting::assert_samples(&report);
                     assert_eq!(
                         report["requests"],
                         serde_json::json!({

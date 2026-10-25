@@ -21,6 +21,9 @@ use axum::routing::any;
 #[path = "support/body_sources.rs"]
 mod body_sources;
 
+#[path = "support/latency_accounting.rs"]
+mod latency_accounting;
+
 #[path = "support/h2_timeout.rs"]
 mod h2_timeout;
 
@@ -173,7 +176,9 @@ fn shb_json(args: &[&str]) -> serde_json::Value {
         "shb failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("JSON report")
+    let report = serde_json::from_slice(&output.stdout).expect("JSON report");
+    latency_accounting::assert_samples(&report);
+    report
 }
 
 /// Run shb expecting failure and return stderr
@@ -1019,10 +1024,9 @@ fn shb_json_and_stderr(args: &[&str]) -> (serde_json::Value, String) {
         .expect("run shb");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "shb failed: {stderr}");
-    (
-        serde_json::from_slice(&output.stdout).expect("JSON report"),
-        stderr,
-    )
+    let report = serde_json::from_slice(&output.stdout).expect("JSON report");
+    latency_accounting::assert_samples(&report);
+    (report, stderr)
 }
 
 /// Answer whatever arrives with an HTTP/1.1 400 and wait for the peer to
@@ -1822,6 +1826,7 @@ fn h3_without_kernel_gro_support_preserves_success_and_timeout_accounting() {
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        latency_accounting::assert_samples(&report);
         assert_eq!(report["requests"]["total"], 100, "{report}");
         assert_eq!(report["requests"]["ok"], ok, "{report}");
         assert_eq!(report["requests"]["errors"], errors, "{report}");
