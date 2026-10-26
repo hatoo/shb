@@ -1,0 +1,455 @@
+{
+  "seconds": 10,
+  "repetitions": 3,
+  "library_path": "/home/hatoo/h3build/prefix/lib",
+  "cases": [
+    {
+      "protocol": "h1",
+      "threads": 16,
+      "connections": 1000,
+      "streams": 1,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "1000",
+          "-t",
+          "16",
+          "http://127.0.0.1:3010/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "1000",
+          "-t",
+          "16",
+          "--h1",
+          "http://127.0.0.1:3010/"
+        ],
+        "wrk": [
+          "wrk",
+          "-d",
+          "10s",
+          "-c",
+          "1000",
+          "-t",
+          "16",
+          "http://127.0.0.1:3010/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          1010611.9231761943,
+          943935.5454578939,
+          944548.4322334684
+        ],
+        "h2load": [
+          757914.1,
+          753314.5,
+          752706.8
+        ],
+        "wrk": [
+          833171.79,
+          847381.36,
+          832967.07
+        ]
+      },
+      "median": {
+        "shb": 944548.4322334684,
+        "h2load": 753314.5,
+        "wrk": 833171.79
+      }
+    },
+    {
+      "protocol": "h2",
+      "threads": 16,
+      "connections": 32,
+      "streams": 32,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "32",
+          "-t",
+          "16",
+          "--http2",
+          "-p",
+          "32",
+          "http://127.0.0.1:3010/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "32",
+          "-t",
+          "16",
+          "-m",
+          "32",
+          "http://127.0.0.1:3010/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          1054382.288520393,
+          1086738.1589529263,
+          1090190.2895372752
+        ],
+        "h2load": [
+          826898.0,
+          859829.4,
+          847809.1
+        ]
+      },
+      "median": {
+        "shb": 1086738.1589529263,
+        "h2load": 847809.1
+      }
+    },
+    {
+      "protocol": "h2",
+      "threads": 16,
+      "connections": 100,
+      "streams": 100,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "100",
+          "-t",
+          "16",
+          "--http2",
+          "-p",
+          "100",
+          "http://127.0.0.1:3010/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "100",
+          "-t",
+          "16",
+          "-m",
+          "100",
+          "http://127.0.0.1:3010/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          1483193.466838858,
+          1485154.9096812613,
+          1476238.2644843482
+        ],
+        "h2load": [
+          1153519.9,
+          1176514.5,
+          1194960.8
+        ]
+      },
+      "median": {
+        "shb": 1483193.466838858,
+        "h2load": 1176514.5
+      }
+    },
+    {
+      "protocol": "h3",
+      "threads": 16,
+      "connections": 32,
+      "streams": 32,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "32",
+          "-t",
+          "16",
+          "--http3",
+          "-p",
+          "32",
+          "https://127.0.0.1:3453/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "32",
+          "-t",
+          "16",
+          "-m",
+          "32",
+          "--h3",
+          "https://127.0.0.1:3453/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          2297341.7723278324,
+          2426210.638909958,
+          2469573.832114221
+        ],
+        "h2load": [
+          1288517.2,
+          1338675.8,
+          1251396.9
+        ]
+      },
+      "median": {
+        "shb": 2426210.638909958,
+        "h2load": 1288517.2
+      }
+    },
+    {
+      "protocol": "h3",
+      "threads": 16,
+      "connections": 16,
+      "streams": 128,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "16",
+          "-t",
+          "16",
+          "--http3",
+          "-p",
+          "128",
+          "https://127.0.0.1:3453/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "16",
+          "-t",
+          "16",
+          "-m",
+          "128",
+          "--h3",
+          "https://127.0.0.1:3453/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          1780728.4320072457,
+          1743759.117610263,
+          1514032.216397539
+        ],
+        "h2load": [
+          1041457.3,
+          1075641.0,
+          1031973.4
+        ]
+      },
+      "median": {
+        "shb": 1743759.117610263,
+        "h2load": 1041457.3
+      }
+    },
+    {
+      "protocol": "h1",
+      "threads": 1,
+      "connections": 64,
+      "streams": 1,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "64",
+          "-t",
+          "1",
+          "http://127.0.0.1:3010/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "64",
+          "-t",
+          "1",
+          "--h1",
+          "http://127.0.0.1:3010/"
+        ],
+        "wrk": [
+          "wrk",
+          "-d",
+          "10s",
+          "-c",
+          "64",
+          "-t",
+          "1",
+          "http://127.0.0.1:3010/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          40112.2860834754,
+          40834.658976747254,
+          41681.53734008542
+        ],
+        "h2load": [
+          28072.6,
+          27804.9,
+          29080.6
+        ],
+        "wrk": [
+          29717.24,
+          31129.05,
+          30953.29
+        ]
+      },
+      "median": {
+        "shb": 40834.658976747254,
+        "h2load": 28072.6,
+        "wrk": 30953.29
+      }
+    },
+    {
+      "protocol": "h2",
+      "threads": 1,
+      "connections": 4,
+      "streams": 32,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "4",
+          "-t",
+          "1",
+          "--http2",
+          "-p",
+          "32",
+          "http://127.0.0.1:3010/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "4",
+          "-t",
+          "1",
+          "-m",
+          "32",
+          "http://127.0.0.1:3010/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          330333.8225681245,
+          233140.90787960228,
+          329972.4264875283
+        ],
+        "h2load": [
+          252523.0,
+          248924.5,
+          247713.1
+        ]
+      },
+      "median": {
+        "shb": 329972.4264875283,
+        "h2load": 248924.5
+      }
+    },
+    {
+      "protocol": "h3",
+      "threads": 1,
+      "connections": 4,
+      "streams": 32,
+      "commands": {
+        "shb": [
+          "target/release/shb",
+          "-j",
+          "-z",
+          "10s",
+          "-c",
+          "4",
+          "-t",
+          "1",
+          "--http3",
+          "-p",
+          "32",
+          "https://127.0.0.1:3453/"
+        ],
+        "h2load": [
+          "/home/hatoo/nghttp2/src/h2load",
+          "-D",
+          "10",
+          "-c",
+          "4",
+          "-t",
+          "1",
+          "-m",
+          "32",
+          "--h3",
+          "https://127.0.0.1:3453/"
+        ]
+      },
+      "runs": {
+        "shb": [
+          650852.8881573222,
+          594682.5657828713,
+          587215.7707988612
+        ],
+        "h2load": [
+          215222.4,
+          218918.4,
+          220700.8
+        ]
+      },
+      "median": {
+        "shb": 594682.5657828713,
+        "h2load": 218918.4
+      }
+    }
+  ],
+  "environment": {
+    "date": "2026-10-26",
+    "shb_commit": "f5451ae5dc5965522215c1dcb3f9e4c426df543e",
+    "shb_build": "cargo build --release --locked",
+    "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "kernel": "6.18.54.1-microsoft-standard-WSL2",
+    "cpu": "AMD Ryzen 9 3950X, 16 cores / 32 threads",
+    "os": "Ubuntu 24.04.5 LTS on WSL2",
+    "nginx": "nginx version: nginx/1.31.8\nbuilt by gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1) \nbuilt with OpenSSL 1.1.1 (compatible; BoringSSL) (running with BoringSSL)\nTLS SNI support enabled\nconfigure arguments: --prefix=/home/hatoo/workspace/nginx-h3 --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-cc-opt='-O2 -I../boringssl/include' --with-ld-opt='-L../boringssl/build -Wl,--no-as-needed -lstdc++'",
+    "nginx_workers": 32,
+    "boringssl_commit": "533902fb2e8fd0586db7d58879d697721726605a",
+    "h2load_commit": "b6729c46cf134a59940a20de534b7f44fdb0e877",
+    "h2load_version": "nghttp2/1.71.0-DEV",
+    "wrk_version": "4.1.0 (Ubuntu 4.1.0-4build2)",
+    "affinity": "OS scheduler defaults; no CPU pinning",
+    "warmup": "No separate warmup; connection establishment included",
+    "shb_sha256": "a39adf5a7d3ef4ef9161d52af3d6b46e141b311f879bcfb7b9ef907e08461545",
+    "nginx_sha256": "cf8a29d26fea1080f2d11b4d895751f1821c29a59c3a0f89eb1e72772dfe461a",
+    "h2load_ngtcp2_version": "1.25.90",
+    "h2load_nghttp3_version": "1.18.90"
+  }
+}
