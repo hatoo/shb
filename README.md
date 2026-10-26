@@ -10,9 +10,9 @@ Against nginx on one 16-core machine, sixteen threads to every tool:
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **962,101** | 833,932 | 743,814 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,505,202** | — | 1,184,362 |
-| HTTP/3 | 32 conns × 32 streams | **2,412,605** | — | 1,294,761 |
+| HTTP/1.1 | 1000 connections | **944,548** | 833,172 | 753,314 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,483,193** | — | 1,176,514 |
+| HTTP/3 | 32 conns × 32 streams | **2,426,211** | — | 1,288,517 |
 
 Requests per second, measured on loopback with client and server sharing the
 machine. See [Comparison](#comparison-with-wrk-and-h2load) for the full
@@ -322,11 +322,11 @@ requests/sec; higher is better. Per-run rates and commands are recorded in
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **962,101** | 833,932 | 743,814 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **1,047,612** | — | 859,901 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,505,202** | — | 1,184,362 |
-| HTTP/3 | 32 conns × 32 streams | **2,412,605** | — | 1,294,761 |
-| HTTP/3 | 16 conns × 128 streams | **1,800,190** | — | 1,049,777 |
+| HTTP/1.1 | 1000 connections | **944,548** | 833,172 | 753,314 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **1,086,738** | — | 847,809 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,483,193** | — | 1,176,514 |
+| HTTP/3 | 32 conns × 32 streams | **2,426,211** | — | 1,288,517 |
+| HTTP/3 | 16 conns × 128 streams | **1,743,759** | — | 1,041,457 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -349,15 +349,14 @@ runs per tool:
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | **40,997** | 30,093 | 27,612 |
-| HTTP/2 (h2c) | 4 conns × 32 streams | **333,345** | — | 224,449 |
-| HTTP/3 | 4 conns × 32 streams | **634,545** | — | 221,040 |
+| HTTP/1.1 | 64 connections | **40,835** | 30,953 | 28,073 |
+| HTTP/2 (h2c) | 4 conns × 32 streams | **329,972** | — | 248,924 |
+| HTTP/3 | 4 conns × 32 streams | **594,683** | — | 218,918 |
 
 The lower client thread count leaves more CPU available to nginx. This is a
 separate workload, with fewer connections, rather than a scaling ratio for
-the sixteen-thread table. No CPU affinity was set. In the single-thread
-HTTP/2 case, shb ranged from 242,158 to 334,744 requests/sec across the three
-runs; the table reports the median, not the fastest run.
+the sixteen-thread table. No CPU affinity was set; consult the recorded
+per-run rates for the spread within each configuration.
 
 <details>
 <summary>Environment and caveats</summary>
@@ -374,7 +373,7 @@ runs; the table reports the median, not the fastest run.
 
 **Tools**
 
-- shb at `9503fe9`, built with `cargo build --release --locked` (full LTO, one
+- shb at `f5451ae`, built with `cargo build --release --locked` (full LTO, one
   codegen unit). The `dist` profile additionally strips symbols. Released
   binaries add profile-guided optimisation; these measurements do not use PGO.
 - wrk 4.1.0 (Ubuntu package).
