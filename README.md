@@ -10,17 +10,13 @@ Against nginx on one 16-core machine, sixteen threads to every tool:
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **1,066,331** | 927,193 | 828,126 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,541,462** | — | 1,265,795 |
-| HTTP/3 | 32 conns × 32 streams | **2,478,132** | — | 1,322,319 |
+| HTTP/1.1 | 1000 connections | **962,101** | 833,932 | 743,814 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,505,202** | — | 1,184,362 |
+| HTTP/3 | 32 conns × 32 streams | **2,412,605** | — | 1,294,761 |
 
-Requests a second: 15 % over wrk and 29 % over h2load on HTTP/1.1, 22 % over
-h2load on HTTP/2, and 87 % on HTTP/3. There the machine runs out before any of
-the clients do — nginx takes several times the CPU shb does, and three clients
-sharing what is left read closer together than they are. Give each of them one
-thread and the margins roughly double, to 32 %, 44 % and 183 %. Both tables,
-and what the gap between them means, are under
-[Comparison](#comparison-with-wrk-and-h2load).
+Requests per second, measured on loopback with client and server sharing the
+machine. See [Comparison](#comparison-with-wrk-and-h2load) for the full
+results, single-thread measurements and reproduction commands.
 
 The speed is in the shape of it. Protocol handling is Sans-I/O throughout, so
 the whole client is one completion-driven event loop per thread with no async
@@ -318,17 +314,19 @@ run; it does not expose individual samples or change timestamp collection.
 
 ## Comparison with wrk and h2load
 
-Measured against nginx 1.31.4 returning a 13-byte body, with 10 s per run,
-median of 3 runs (5 for HTTP/2 and 10 for HTTP/3, where the spread is widest),
-and 16 threads for every tool. Numbers are requests/sec; higher is better.
+Measured on 2026-10-26 against nginx 1.31.8 returning a 13-byte body, with
+10 s per run, median of 3 runs, and 16 threads for every tool. Clients run
+sequentially, with their order rotated between rounds. Numbers are
+requests/sec; higher is better. Per-run rates and commands are recorded in
+[the measurement data](benchmarks/2026-10-26.json).
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 1000 connections | **1,066,331** | 927,193 | 828,126 |
-| HTTP/2 (h2c) | 32 conns × 32 streams | **1,080,232** | — | 924,917 |
-| HTTP/2 (h2c) | 100 conns × 100 streams | **1,541,462** | — | 1,265,795 |
-| HTTP/3 | 32 conns × 32 streams | **2,478,132** | — | 1,322,319 |
-| HTTP/3 | 16 conns × 128 streams | **1,594,083** | — | 1,043,672 |
+| HTTP/1.1 | 1000 connections | **962,101** | 833,932 | 743,814 |
+| HTTP/2 (h2c) | 32 conns × 32 streams | **1,047,612** | — | 859,901 |
+| HTTP/2 (h2c) | 100 conns × 100 streams | **1,505,202** | — | 1,184,362 |
+| HTTP/3 | 32 conns × 32 streams | **2,412,605** | — | 1,294,761 |
+| HTTP/3 | 16 conns × 128 streams | **1,800,190** | — | 1,049,777 |
 
 [wrk]: https://github.com/wg/wrk
 [h2load]: https://nghttp2.org/documentation/h2load-howto.html
@@ -339,56 +337,27 @@ $ wrk    -d 10s -c 1000 -t 16 http://127.0.0.1:3010/
 $ h2load --h1 -D 10 -c 1000 -t 16 http://127.0.0.1:3010/
 ```
 
-**On HTTP/1.1 shb is ahead of both** — 15 % over wrk and 29 % over h2load. Its
-response path is a boundary scanner rather than a parser (see
-[How it works](#how-it-works)), which is worth ~10 % on its own. The three land
-closer together at low connection counts, where the ceiling is a round trip
-rather than the client: at 64 connections it is 502k / 471k / 435k.
+Client and server share the same CPU budget. These figures measure the
+combined system on this host; they do not isolate the client's maximum
+throughput or CPU cost. The server configuration and TLS library also affect
+the result, so comparisons need the same server for every client.
 
-**On HTTP/2 shb is 17 % ahead** at 32 × 32 and 22 % at 100 × 100. Like the
-HTTP/1.1 path, its HTTP/2 stack is written for this one job: requests are a
-single HPACK block encoded once at start-up, and responses are walked for
-`:status` with every other field measured and skipped. The larger share comes
-from how it writes: every stream shares one socket, so the loop collects a
-batch of completions and writes the connection once afterwards, and the
-requests that batch produced leave together. Sending from each completion
-instead put the first request of a batch on the wire alone and left the rest
-behind it, which is what 93 % of HTTP/2's CPU sitting in the kernel looked
-like.
+### Single-thread comparison
 
-**On HTTP/3 shb is 87 % ahead** at 32 × 32 and 53 % at 16 × 128. Three things
-get it there: QPACK, where a profile of a saturated worker used to spend 47 %
-of its time Huffman-decoding response header values that the scanner now steps
-over; turning the QUIC state machine once per batch of datagrams rather than
-once per datagram; and keeping the streams that have something to send in a
-queue, so building a packet costs what the connection is actually sending
-rather than what it has open.
-
-An earlier version of this table measured against a server that saturated
-before any of the clients did, which flattered every number and reversed some
-of these results. Picking a server with headroom is what made the comparison
-mean anything.
-
-### Where the client is the ceiling
-
-Those numbers are what a run against nginx on this machine looks like, and the
-machine is what runs out rather than any of the clients: the HTTP/1.1 row has
-28 of its 32 hardware threads busy, and on the multiplexed rows nginx takes
-2.8 to 3.9 times the CPU shb does. Three clients contending for what is left
-compress into each other. Give each of them one thread, where a client's own
-CPU is the ceiling and nginx has the rest of the machine spare, and they spread
-back out.
+With one worker thread per client, using the same server and three 10-second
+runs per tool:
 
 | Protocol | Config | shb | [wrk] | [h2load] |
 | --- | --- | ---: | ---: | ---: |
-| HTTP/1.1 | 64 connections | **42,360** | 31,988 | 30,524 |
-| HTTP/2 (h2c) | 4 conns × 32 streams | **340,990** | — | 236,198 |
-| HTTP/3 | 4 conns × 32 streams | **667,649** | — | 235,885 |
+| HTTP/1.1 | 64 connections | **40,997** | 30,093 | 27,612 |
+| HTTP/2 (h2c) | 4 conns × 32 streams | **333,345** | — | 224,449 |
+| HTTP/3 | 4 conns × 32 streams | **634,545** | — | 221,040 |
 
-Same nginx, same 10 s runs, median of 5. That is 32 % over wrk and 39 % over
-h2load on HTTP/1.1, 44 % over h2load on HTTP/2 and 183 % on HTTP/3 - about
-twice the margins above. Read the two together: the first table is what a run
-gets you, the second is what the client costs to get it.
+The lower client thread count leaves more CPU available to nginx. This is a
+separate workload, with fewer connections, rather than a scaling ratio for
+the sixteen-thread table. No CPU affinity was set. In the single-thread
+HTTP/2 case, shb ranged from 242,158 to 334,744 requests/sec across the three
+runs; the table reports the median, not the fastest run.
 
 <details>
 <summary>Environment and caveats</summary>
@@ -399,27 +368,25 @@ gets you, the second is what the client costs to get it.
 | --- | --- |
 | CPU | AMD Ryzen 9 3950X — 16 cores / 32 threads |
 | Memory | 31 GiB |
-| OS | Ubuntu 24.04.4 LTS on **WSL2** (WSL 2.7.11.0) |
-| Kernel | 6.18.33.2-microsoft-standard-WSL2 |
-| Rust | 1.98.0 |
+| OS | Ubuntu 24.04.5 LTS on **WSL2** |
+| Kernel | 6.18.54.1-microsoft-standard-WSL2 |
+| Rust | 1.99.1 |
 
 **Tools**
 
-- shb (this repo), built with `cargo build --profile dist` (LTO, one codegen
-  unit), which measures within about 2 % of a plain `--release` build. The
-  released binaries add profile-guided optimisation on top of that, worth
-  another 12 % of userspace CPU; the table is measured without it, so what it
-  reports is what `cargo install` gives you.
+- shb at `9503fe9`, built with `cargo build --release --locked` (full LTO, one
+  codegen unit). The `dist` profile additionally strips symbols. Released
+  binaries add profile-guided optimisation; these measurements do not use PGO.
 - wrk 4.1.0 (Ubuntu package).
-- h2load from nghttp2 1.71.0-DEV, built against ngtcp2 + nghttp3 + BoringSSL —
-  the distro build of h2load has no HTTP/3 support.
+- h2load from nghttp2 1.71.0-DEV, built against ngtcp2 1.25.90,
+  nghttp3 1.18.90 and BoringSSL — the distro build of h2load has no HTTP/3 support.
 
-**Server** — nginx 1.31.4 (mainline) built from source with
+**Server** — nginx 1.31.8 (mainline) built from source with
 `--with-http_v3_module` against BoringSSL, on the same host, serving HTTP/1.1
 and h2c on one cleartext socket and HTTP/3 on a QUIC socket with a self-signed
-certificate. The TLS library is worth naming: the same nginx built against
-OpenSSL 3.0 serves shb's HTTP/3 about 8 % slower, while h2load's is unchanged.
-`return 200` keeps it off the disk entirely:
+certificate. `worker_processes auto` starts 32 nginx workers on this host.
+GSO uses nginx's default (`quic_gso off`). `return 200` keeps it off the disk
+entirely; the complete config is [benchmarks/nginx.conf](benchmarks/nginx.conf):
 
 ```nginx
 worker_processes auto;
@@ -458,6 +425,47 @@ comparison under identical conditions, not as an absolute rate any of these
 tools can sustain against a real server over a real network.
 
 </details>
+
+### Reproducing the comparison
+
+Run these commands from the repository root. The build script installs nginx
+1.31.8 with HTTP/2 and HTTP/3 into `../nginx-h3`, alongside this checkout.
+It pins BoringSSL to commit `533902fb2e8fd0586db7d58879d697721726605a`
+and verifies the nginx source archive's SHA-256. This follows nginx's
+[QUIC build instructions](https://nginx.org/en/docs/quic.html).
+
+Build prerequisites on Ubuntu: `build-essential`, `cmake`, `ninja-build`,
+`golang-go`, `git`, `curl`, `libpcre2-dev`, `zlib1g-dev` and `openssl`.
+Python 3 runs the comparison script. Install `wrk` and an HTTP/3-enabled
+[h2load] separately; check that `h2load --help` includes `--h3`.
+
+```sh
+bash scripts/build-benchmark-nginx.sh ../nginx-h3
+cargo build --release --locked
+
+# Self-signed certificate and the exact configuration used for the tables.
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=localhost \
+  -keyout ../nginx-h3/key.pem -out ../nginx-h3/cert.pem
+cp benchmarks/nginx.conf ../nginx-h3/benchmark.conf
+../nginx-h3/sbin/nginx -p "$(realpath ../nginx-h3)/" -c benchmark.conf -t
+../nginx-h3/sbin/nginx -p "$(realpath ../nginx-h3)/" -c benchmark.conf
+
+python3 scripts/benchmark.py --h2load /path/to/http3-enabled/h2load \
+  --output ../nginx-h3/results
+
+# Stop only this benchmark server after measuring.
+../nginx-h3/sbin/nginx -p "$(realpath ../nginx-h3)/" -c benchmark.conf -s quit
+```
+
+The server binds loopback TCP port 3010 and UDP port 3453. Leave both ports
+free before starting it. If h2load uses shared ngtcp2/nghttp3 libraries outside
+the system library path, set `LD_LIBRARY_PATH` to their directory.
+
+The script runs all eight table configurations, rotates client order between
+rounds, checks for request errors, and saves each command's stdout/stderr plus
+per-run rates and medians in `summary.json`. It requires a new output directory
+to preserve previous measurements. The defaults are three 10-second runs per
+client and configuration; allow roughly ten minutes on an otherwise idle host.
 
 ## How it works
 
