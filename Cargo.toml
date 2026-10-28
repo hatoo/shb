@@ -80,3 +80,7 @@ path = "benchmarks/h3-request-encoding.rs"
 [[example]]
 name = "h2-upload-server"
 path = "benchmarks/h2-upload-server.rs"
+
+[[example]]
+name = "h3-response-flight-peer"
+path = "benchmarks/h3-response-flight-peer.rs"

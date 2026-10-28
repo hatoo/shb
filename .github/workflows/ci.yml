@@ -81,6 +81,20 @@ jobs:
           cargo build --release --locked --example h2-request-encoding
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h2-request-encoding.py --probe ./target/release/examples/h2-request-encoding --shb ./target/release/shb
 
+      - name: Native HTTP/3 response receipts and complete bodies (Quinn and aioquic)
+        run: |
+          python3 -m unittest discover -s benchmarks -p 'test_h3_response_flight.py'
+          cargo build --release --locked --example h3-response-flight-peer
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-response-flight.py --peer ./target/release/examples/h3-response-flight-peer --shb ./target/release/shb --output "$RUNNER_TEMP/h3-response-flight"
+
+      - name: Retain native HTTP/3 response-flight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-response-flight
+          path: ${{ runner.temp }}/h3-response-flight
+          if-no-files-found: ignore
+
       - name: HTTP/2 complete request bodies (hyper-h2)
         run: |
           python3 -m unittest discover -s benchmarks -p 'test_report_accounting.py'
