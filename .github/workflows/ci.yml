@@ -49,6 +49,19 @@ jobs:
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-limits.py --shb ./target/release/shb
 
+      - name: QUIC receive history, ACK pruning and key updates (aioquic)
+        run: |
+          "$RUNNER_TEMP/h3-status-venv/bin/python" -m unittest discover -s benchmarks -p 'test_quic_receive_history.py'
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-history.py --shb ./target/release/shb > "$RUNNER_TEMP/quic-receive-history.json"
+
+      - name: Retain QUIC receive-history wire ledgers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-receive-history
+          path: ${{ runner.temp }}/quic-receive-history.json
+          if-no-files-found: ignore
+
       - name: HTTP/2 request header encoding (python-hpack and hyper-h2)
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/pip" install h2==4.3.0
