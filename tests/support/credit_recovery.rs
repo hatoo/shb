@@ -3,8 +3,8 @@
 //! recovery must retransmit bytes without waiting for fresh MAX_DATA credit.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const BODY_LEN: usize = 8_007;
@@ -12,8 +12,30 @@ const BODY_LEN: usize = 8_007;
 pub struct Server {
     pub addr: SocketAddr,
     pub completed: Arc<AtomicUsize>,
+    completion: Arc<(Mutex<()>, Condvar)>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    /// The response FIN can reach the client before the serving task records
+    /// its successful finish. Wait outside the client run, retaining an exact
+    /// count and a deadline: missing or extra completions still fail the test.
+    pub fn wait_completed(&self, expected: usize, timeout: Duration) -> Result<(), usize> {
+        let (lock, changed) = &*self.completion;
+        let guard = lock.lock().unwrap();
+        let (_guard, _) = changed
+            .wait_timeout_while(guard, timeout, |_| {
+                self.completed.load(Ordering::SeqCst) < expected
+            })
+            .unwrap();
+        let actual = self.completed.load(Ordering::SeqCst);
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(actual)
+        }
+    }
 }
 
 impl Drop for Server {
@@ -37,10 +59,24 @@ pub fn server_with_windows(
     connection_window: u32,
     stop_body: bool,
 ) -> Server {
+    server_with_completion_gate(body, stream_window, connection_window, stop_body, None)
+}
+
+// The optional gate lets the regression pause accounting after a real response
+// FIN. It is never enabled by the ordinary recovery or benchmark fixtures.
+fn server_with_completion_gate(
+    body: Vec<u8>,
+    stream_window: u32,
+    connection_window: u32,
+    stop_body: bool,
+    completion_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Server {
     let (tx, rx) = std::sync::mpsc::channel();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let completed = Arc::new(AtomicUsize::new(0));
     let finished = completed.clone();
+    let completion = Arc::new((Mutex::new(()), Condvar::new()));
+    let progress = completion.clone();
     let expected = Arc::new(body);
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -72,7 +108,9 @@ pub fn server_with_windows(
             let serve = async {
                 while let Some(incoming) = endpoint.accept().await {
                     let finished = finished.clone();
+                    let progress = progress.clone();
                     let expected = expected.clone();
+                    let completion_gate = completion_gate.clone();
                     tokio::spawn(async move {
                         let Ok(conn) = incoming.await else { return };
                         let Ok(mut conn) = h3::server::Connection::<_, bytes::Bytes>::new(
@@ -84,7 +122,9 @@ pub fn server_with_windows(
                         };
                         while let Ok(Some(resolver)) = conn.accept().await {
                             let finished = finished.clone();
+                            let progress = progress.clone();
                             let expected = expected.clone();
+                            let completion_gate = completion_gate.clone();
                             tokio::spawn(async move {
                                 let Ok((request, mut stream)) = resolver.resolve_request().await
                                 else {
@@ -122,7 +162,12 @@ pub fn server_with_windows(
                                     && stream.finish().await.is_ok()
                                     && valid
                                 {
+                                    if let Some(gate) = completion_gate {
+                                        gate.notified().await;
+                                    }
+                                    let _guard = progress.0.lock().unwrap();
                                     finished.fetch_add(1, Ordering::SeqCst);
+                                    progress.1.notify_all();
                                 }
                             });
                         }
@@ -135,6 +180,7 @@ pub fn server_with_windows(
     Server {
         addr: rx.recv().unwrap(),
         completed,
+        completion,
         stop: Some(stop),
         thread: Some(thread),
     }
@@ -274,7 +320,7 @@ fn exercise_body(late_duplicate: bool, body: Vec<u8>, stream_window: u32, parall
     assert_eq!(stats.latencies_ns.len(), 8);
     assert_eq!(stats.status_counts[200], 8);
     assert_eq!(stats.status_counts.iter().sum::<u64>(), 8);
-    assert_eq!(server.completed.load(Ordering::SeqCst), 8);
+    server.wait_completed(8, Duration::from_secs(5)).unwrap();
 }
 
 #[test]
@@ -356,7 +402,7 @@ fn h3_shares_patterned_body_across_many_flow_controlled_streams() {
     assert_eq!(stats.latencies_ns.len(), 128);
     assert_eq!(stats.status_counts[200], 128);
     assert_eq!(stats.status_counts.iter().sum::<u64>(), 128);
-    assert_eq!(server.completed.load(Ordering::SeqCst), 128);
+    server.wait_completed(128, Duration::from_secs(5)).unwrap();
 }
 
 #[test]
@@ -386,5 +432,45 @@ fn h3_counts_early_responses_after_the_peer_stops_blocked_bodies() {
     assert_eq!(stats.latencies_ns.len(), 32);
     assert_eq!(stats.status_counts[200], 32);
     assert_eq!(stats.status_counts.iter().sum::<u64>(), 32);
-    assert_eq!(server.completed.load(Ordering::SeqCst), 32);
+    server.wait_completed(32, Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn h3_response_fin_can_arrive_before_peer_accounting() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let body = vec![b'x'; 65_543];
+    let server = server_with_completion_gate(body.clone(), 2048, 4096, true, Some(gate.clone()));
+    let target = crate::target::parse_target(
+        &format!("https://{}/", server.addr),
+        "POST",
+        &[],
+        Some(&body),
+        false,
+    )
+    .unwrap();
+    let stats = crate::http3::run_worker(
+        &target,
+        1,
+        crate::budget::Budget::Requests(1),
+        Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        (stats.completed, stats.errors, stats.connect_errors),
+        (1, 0, 0)
+    );
+    assert_eq!(stats.latencies_ns.len(), 1);
+    assert_eq!(stats.status_counts[200], 1);
+    assert_eq!(stats.status_counts.iter().sum::<u64>(), 1);
+    // FIN is visible to the client, but deliberately hold back the server's
+    // accounting. The previous immediate equality check failed here at 0/1.
+    assert_eq!(server.completed.load(Ordering::SeqCst), 0);
+    assert_eq!(server.wait_completed(1, Duration::ZERO), Err(0));
+    gate.notify_one();
+    server.wait_completed(1, Duration::from_secs(5)).unwrap();
+    assert_eq!(server.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(server.wait_completed(2, Duration::ZERO), Err(1));
+    assert_eq!(server.wait_completed(0, Duration::ZERO), Err(1));
 }
