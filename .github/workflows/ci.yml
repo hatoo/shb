@@ -75,6 +75,22 @@ jobs:
           path: ${{ runner.temp }}/quic-response-recovery.json
           if-no-files-found: ignore
 
+      - name: QUIC loss timer with independent encrypted packets (aioquic)
+        run: |
+          "$RUNNER_TEMP/h3-status-venv/bin/python" -m unittest discover -s benchmarks -p 'test_quic_timer.py'
+          cargo build --locked --example quic-timer-peer
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-timer.py --adapter ./target/debug/examples/quic-timer-peer --output "$RUNNER_TEMP/quic-timer/debug"
+          cargo build --release --locked --example quic-timer-peer
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-timer.py --adapter ./target/release/examples/quic-timer-peer --output "$RUNNER_TEMP/quic-timer/release"
+
+      - name: Retain QUIC timer encrypted datagrams and commands
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-timer
+          path: ${{ runner.temp }}/quic-timer
+          if-no-files-found: ignore
+
       - name: HTTP/2 request header encoding (python-hpack and hyper-h2)
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/pip" install h2==4.3.0

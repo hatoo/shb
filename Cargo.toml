@@ -84,3 +84,7 @@ path = "benchmarks/h2-upload-server.rs"
 [[example]]
 name = "h3-response-flight-peer"
 path = "benchmarks/h3-response-flight-peer.rs"
+
+[[example]]
+name = "quic-timer-peer"
+path = "benchmarks/quic-timer-peer.rs"
