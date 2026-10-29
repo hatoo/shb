@@ -2305,28 +2305,27 @@ impl Connection {
         if self.closed.is_some() {
             return None;
         }
-        let spaces = [
-            &self.spaces[0].sent,
-            &self.spaces[1].sent,
-            &self.spaces[2].sent,
-        ];
-        let pto = pto_deadline(
-            &spaces,
-            &self.rtt,
-            Duration::from_millis(self.params.max_ack_delay_ms),
-            self.pto_count,
-            self.pto_fallback(),
-        )
-        .map(|(_, at)| at);
-        [
-            self.loss_deadline(),
-            pto,
-            self.idle_deadline,
-            self.keepalive_deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        // RFC 9002 Section 6.2.1: pending time-threshold loss suppresses PTO,
+        // even when low RTT variance would make the probe deadline earlier.
+        let recovery = self.loss_deadline().or_else(|| {
+            let spaces = [
+                &self.spaces[0].sent,
+                &self.spaces[1].sent,
+                &self.spaces[2].sent,
+            ];
+            pto_deadline(
+                &spaces,
+                &self.rtt,
+                Duration::from_millis(self.params.max_ack_delay_ms),
+                self.pto_count,
+                self.pto_fallback(),
+            )
+            .map(|(_, at)| at)
+        });
+        [recovery, self.idle_deadline, self.keepalive_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Where to probe when nothing is in flight, while that still has to be
@@ -2363,7 +2362,12 @@ impl Connection {
             self.needs_send = true;
             return;
         }
-        if self.loss_deadline().is_some_and(|d| now >= d) {
+        if let Some(at) = self.loss_deadline() {
+            // A caller can wake before this deadline (for example, for a
+            // different connection). That cannot switch recovery to PTO.
+            if now < at {
+                return;
+            }
             let loss_delay = self.rtt.loss_delay();
             for space in Space::ALL {
                 let (mut lost, deadline) = self.spaces[space as usize]
@@ -2477,6 +2481,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     mod loss_deadlines;
+    mod timer_mode;
 
     use super::*;
 
