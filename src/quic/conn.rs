@@ -134,6 +134,9 @@ struct SpaceState {
     received: ReceivedPackets,
     ack: AckState,
     sent: SentPackets,
+    /// Next time-threshold loss in this space. An ACK in another space must
+    /// not replace it (RFC 9002 Appendix A.8).
+    loss_deadline: Option<Instant>,
     /// Handshake bytes the peer has not acknowledged. Held rather than
     /// dropped when sent: until an acknowledgement arrives there is no other
     /// copy, and a probe timeout has to be able to send them again. Never
@@ -289,7 +292,6 @@ pub struct Connection {
     /// in the space that timed out, and a PING in another space draws an
     /// acknowledgement that says nothing about the packets waited on
     pto_space: Space,
-    loss_deadline: Option<Instant>,
     idle_deadline: Option<Instant>,
     events: VecDeque<Event>,
     /// Set when something needs sending that is not stream data
@@ -418,7 +420,6 @@ impl Connection {
             pto_count: 0,
             pto_probes: 0,
             pto_space: Space::Initial,
-            loss_deadline: None,
             idle_deadline: None,
             events: VecDeque::new(),
             needs_send: true,
@@ -439,6 +440,7 @@ impl Connection {
         s.received = ReceivedPackets::default();
         s.ack = AckState::default();
         s.sent = SentPackets::default();
+        s.loss_deadline = None;
         s.crypto_out.clear();
         s.crypto_sent = 0;
         s.crypto_in = RecvStream::default();
@@ -1612,7 +1614,7 @@ impl Connection {
             .sent
             .detect_lost(now, loss_delay);
         self.on_lost_packets(space, &lost, now);
-        self.loss_deadline = deadline;
+        self.spaces[space as usize].loss_deadline = deadline;
         if !lost.is_empty() {
             self.needs_send = true;
         }
@@ -1800,6 +1802,7 @@ impl Connection {
         // protected them are gone
         self.spaces[Space::Initial as usize].crypto_sent = 0;
         self.spaces[Space::Initial as usize].sent = SentPackets::default();
+        self.spaces[Space::Initial as usize].loss_deadline = None;
         self.pto_count = 0;
         self.pto_probes = 0;
         self.needs_send = true;
@@ -2292,6 +2295,10 @@ impl Connection {
 // -------------------------------------------------------------------------
 
 impl Connection {
+    fn loss_deadline(&self) -> Option<Instant> {
+        self.spaces.iter().filter_map(|s| s.loss_deadline).min()
+    }
+
     pub fn poll_timeout(&self) -> Option<Instant> {
         // A connection that is over has nothing left to wait for, and a
         // deadline left standing here would be serviced again on every pass
@@ -2312,7 +2319,7 @@ impl Connection {
         )
         .map(|(_, at)| at);
         [
-            self.loss_deadline,
+            self.loss_deadline(),
             pto,
             self.idle_deadline,
             self.keepalive_deadline(),
@@ -2356,14 +2363,14 @@ impl Connection {
             self.needs_send = true;
             return;
         }
-        if self.loss_deadline.is_some_and(|d| now >= d) {
+        if self.loss_deadline().is_some_and(|d| now >= d) {
             let loss_delay = self.rtt.loss_delay();
             for space in Space::ALL {
                 let (mut lost, deadline) = self.spaces[space as usize]
                     .sent
                     .detect_lost(now, loss_delay);
                 self.on_lost_packets(space, &lost, now);
-                self.loss_deadline = deadline;
+                self.spaces[space as usize].loss_deadline = deadline;
                 self.recycle(&mut lost);
             }
             self.needs_send = true;
@@ -2469,6 +2476,8 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
+    mod loss_deadlines;
+
     use super::*;
 
     mod credit;
