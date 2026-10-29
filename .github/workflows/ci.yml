@@ -91,6 +91,20 @@ jobs:
           path: ${{ runner.temp }}/quic-timer
           if-no-files-found: ignore
 
+      - name: QUIC exact receive reassembly with encrypted duplicates and overlaps
+        run: |
+          "$RUNNER_TEMP/h3-status-venv/bin/python" -m unittest discover -s benchmarks -p 'test_quic_receive_reassembly.py'
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-reassembly.py --adapter ./target/debug/examples/quic-timer-peer --output "$RUNNER_TEMP/quic-reassembly/debug"
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-reassembly.py --adapter ./target/release/examples/quic-timer-peer --output "$RUNNER_TEMP/quic-reassembly/release"
+
+      - name: Retain QUIC reassembly encrypted datagrams and commands
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-reassembly
+          path: ${{ runner.temp }}/quic-reassembly
+          if-no-files-found: ignore
+
       - name: HTTP/2 request header encoding (python-hpack and hyper-h2)
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/pip" install h2==4.3.0
