@@ -103,7 +103,8 @@ pub fn latency_summary(latencies_ns: &mut [u64]) -> Option<LatencySummary> {
     }
     let lat = latencies_ns;
     let len = lat.len();
-    let mean = lat.iter().sum::<u64>() as f64 / len as f64 / 1e9;
+    // The total can exceed u64 even when every individual sample fits.
+    let mean = lat.iter().map(|&ns| u128::from(ns)).sum::<u128>() as f64 / len as f64 / 1e9;
     // Same index formula as oha: floor(p/100 * len), clamped to the last element.
     let ranks = PERCENTILES.map(|p| ((p / 100.0 * len as f64) as usize).min(len - 1));
 
@@ -180,10 +181,18 @@ mod tests {
         let len = sorted.len();
         assert_eq!(got.min.to_bits(), (sorted[0] as f64 / 1e9).to_bits());
         assert_eq!(got.max.to_bits(), (sorted[len - 1] as f64 / 1e9).to_bits());
+        let total = sorted.iter().fold(0u128, |sum, &ns| sum + u128::from(ns));
         assert_eq!(
             got.mean.to_bits(),
-            (sorted.iter().sum::<u64>() as f64 / len as f64 / 1e9).to_bits()
+            (total as f64 / len as f64 / 1e9).to_bits()
         );
+        if let Ok(total) = u64::try_from(total) {
+            assert_eq!(
+                got.mean.to_bits(),
+                (total as f64 / len as f64 / 1e9).to_bits(),
+                "means within the old accumulator's range must retain their exact bits"
+            );
+        }
         for (p, actual) in PERCENTILES.iter().zip(got.percentiles) {
             let idx = ((p / 100.0 * len as f64) as usize).min(len - 1);
             assert_eq!(
@@ -272,11 +281,69 @@ mod tests {
 
     #[test]
     fn selection_preserves_large_values_and_integer_mean() {
-        // Stay within the existing u64 sum contract, including its boundary.
+        // Preserve the existing conversion order even near f64's precision limit.
         assert_matches_sort(vec![u64::MAX]);
         assert_matches_sort(vec![0, u64::MAX, 0, 0]);
         assert_matches_sort(vec![u64::MAX / 2, 0, u64::MAX / 2, 1]);
         assert_matches_sort(vec![1 << 53, (1 << 53) + 1, (1 << 53) + 3, 0]);
+    }
+
+    #[test]
+    fn mean_handles_totals_below_at_and_above_u64_limit() {
+        for samples in [
+            vec![u64::MAX - 1, 0],
+            vec![u64::MAX, 0],
+            vec![u64::MAX, 1],
+            vec![u64::MAX, 2],
+            vec![u64::MAX, u64::MAX],
+            vec![0, u64::MAX, 1, 2, u64::MAX, 0, 7],
+        ] {
+            assert_matches_sort(samples);
+        }
+    }
+
+    #[test]
+    fn mean_of_many_equal_samples_stays_equal_across_sum_overflow() {
+        // At 2^20 samples the total is exactly 2^64 ns. Derive the expected
+        // mean from one sample, independently of any summation algorithm.
+        let value = 1u64 << 44;
+        let expected = (value as f64 / 1e9).to_bits();
+        for len in [(1 << 20) - 1, 1 << 20, (1 << 20) + 1] {
+            let mut samples = vec![value; len];
+            let got = latency_summary(&mut samples).unwrap();
+            assert_eq!(got.mean.to_bits(), expected, "{len} equal samples");
+            assert_eq!(got.min.to_bits(), expected);
+            assert_eq!(got.max.to_bits(), expected);
+            assert_eq!(got.percentiles.map(f64::to_bits), [expected; 9]);
+            assert_eq!(samples.len(), len);
+            assert!(samples.iter().all(|&ns| ns == value));
+        }
+    }
+
+    #[test]
+    fn wide_totals_preserve_selection_in_every_input_order() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        for len in [1024, 1025, 4096] {
+            let samples: Vec<_> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state
+                })
+                .collect();
+            let ties = samples
+                .iter()
+                .map(|ns| [0, 1 << 53, u64::MAX][(ns % 3) as usize])
+                .collect();
+            for mut values in [samples, ties] {
+                assert_matches_sort(values.clone());
+                values.sort_unstable();
+                assert_matches_sort(values.clone());
+                values.reverse();
+                assert_matches_sort(values);
+            }
+        }
     }
 
     #[test]
