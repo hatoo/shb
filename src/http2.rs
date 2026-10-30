@@ -1010,4 +1010,7 @@ mod tests {
 mod flush_tests;
 
 #[cfg(test)]
+mod pending_tests;
+
+#[cfg(test)]
 mod lifetime_tests;
