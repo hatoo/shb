@@ -33,6 +33,9 @@ mod body_normalization;
 #[path = "../tests/support/credit_recovery.rs"]
 mod credit_recovery;
 #[cfg(test)]
+#[path = "../tests/support/h2_completion_accounting.rs"]
+mod h2_completion_accounting;
+#[cfg(test)]
 #[path = "../tests/support/h2_continuation.rs"]
 mod h2_continuation;
 #[cfg(test)]

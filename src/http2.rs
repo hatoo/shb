@@ -1014,3 +1014,6 @@ mod pending_tests;
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(test)]
+mod completion_tests;
