@@ -38,6 +38,48 @@ pub type H2Ring<T> = Ring<T, 1, 1>;
 /// HTTP/3 client bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1)
 pub type H3Ring<T> = Ring<T, 2, 0>;
 
+impl<T> H2Ring<T> {
+    /// Retire streams above a GOAWAY's last-stream id, in ascending order.
+    /// The boundary can be even (or zero), although our stream ids are odd.
+    /// Keep the suffix's empty slots while a prefix survives: subsequent ids
+    /// must still land at their original positions.
+    pub fn retire_after(&mut self, last: u32, mut retire: impl FnMut(T)) {
+        let first = u64::from(last).div_ceil(2);
+        let offset = first.saturating_sub(self.base).min(self.live() as u64) as usize;
+        if offset == 0 {
+            // Clear the storage even if a callback unwinds, keeping the
+            // allocation for reuse. Only visit the live suffix: an almost
+            // empty ring can still hold a large already-retired prefix.
+            struct ClearOnDrop<'a, T>(&'a mut Vec<Option<T>>);
+            impl<T> Drop for ClearOnDrop<'_, T> {
+                fn drop(&mut self) {
+                    self.0.clear();
+                }
+            }
+            let retired_prefix = self.head;
+            self.base += self.live() as u64;
+            self.head = 0;
+            self.open = 0;
+            self.compact_at = COMPACT_FLOOR;
+            let clear = ClearOnDrop(&mut self.slots);
+            for slot in &mut clear.0[retired_prefix..] {
+                if let Some(item) = slot.take() {
+                    retire(item);
+                }
+            }
+        } else {
+            // The oldest live slot survives, so no front settlement or
+            // compaction is needed. In particular, don't scan that prefix.
+            for slot in &mut self.slots[self.head + offset..] {
+                if let Some(item) = slot.take() {
+                    self.open -= 1;
+                    retire(item);
+                }
+            }
+        }
+    }
+}
+
 impl<T, const SHIFT: u32, const OFFSET: u64> Ring<T, SHIFT, OFFSET> {
     /// An id that leaves anything but `OFFSET` below the shift has no slot: it
     /// belongs to the peer or to the connection, and shifting it would land it
@@ -197,6 +239,10 @@ impl<T, const SHIFT: u32, const OFFSET: u64> Ring<T, SHIFT, OFFSET> {
         self.slots.get(self.head + i)?.as_ref()
     }
 }
+
+#[cfg(test)]
+#[path = "inflight_goaway_tests.rs"]
+mod goaway_tests;
 
 #[cfg(test)]
 mod tests {
