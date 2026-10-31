@@ -673,16 +673,11 @@ impl Connection {
         // The error code follows; a load generator has no different answer
         // to a GOAWAY that blames it than to one that does not
         self.goaway = true;
-        let unprocessed: Vec<u32> = self
-            .open
-            .iter()
-            .filter(|s| s.id > last)
-            .map(|s| s.id)
-            .collect();
-        for id in unprocessed {
-            self.open.take(id as u64);
-            events.push(Event::Unprocessed { stream_id: id });
-        }
+        self.open.retire_after(last, |stream| {
+            events.push(Event::Unprocessed {
+                stream_id: stream.id,
+            });
+        });
         events.push(Event::Goaway);
         Ok(())
     }

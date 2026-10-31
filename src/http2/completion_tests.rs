@@ -4,6 +4,9 @@
 use super::*;
 use std::collections::BTreeMap;
 
+#[path = "goaway_tests.rs"]
+mod goaway_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Notice {
     Status(u32, u16),
@@ -112,6 +115,10 @@ impl Ledger {
 }
 
 fn run_schedule(frames: &[Frame], cuts: &[usize]) {
+    run_schedule_with_ids(frames, cuts, &[1, 3, 5, 7]);
+}
+
+fn run_schedule_with_ids(frames: &[Frame], cuts: &[usize], ids: &[u32]) {
     let mut conn = Conn::new();
     let mut protocol = Connection::new();
     protocol.initiate();
@@ -119,7 +126,7 @@ fn run_schedule(frames: &[Frame], cuts: &[usize]) {
         .feed(&frame(4, 0, 0, &[], &[]).bytes, &mut Vec::new())
         .unwrap();
     let mut starts = BTreeMap::new();
-    for id in [1, 3, 5, 7] {
+    for &id in ids {
         assert_eq!(protocol.start_stream(&[0x82], b""), Some(id));
         let start = Instant::now();
         starts.insert(id, start);
@@ -134,9 +141,9 @@ fn run_schedule(frames: &[Frame], cuts: &[usize]) {
         bytes_received: 41,
         ..Stats::default()
     };
-    let mut started = 4;
+    let mut started = ids.len() as u64;
     let mut model = Ledger {
-        live: [1, 3, 5, 7].into_iter().map(|id| (id, 0)).collect(),
+        live: ids.iter().map(|&id| (id, 0)).collect(),
         successes: Vec::new(),
         errors: 0,
         started,
@@ -179,6 +186,9 @@ fn run_schedule(frames: &[Frame], cuts: &[usize]) {
         process_events(&mut conn, &events, &mut stats, &mut started);
         let after = Instant::now();
         model.check(&mut conn, &stats, started);
+        for &id in model.live.keys() {
+            assert_eq!(conn.streams.get_mut(id.into()).unwrap().start, starts[&id]);
+        }
         for (index, &(id, _)) in model.successes.iter().enumerate().skip(samples_before) {
             let low = before.duration_since(starts[&id]).as_nanos() as u64;
             let high = after.duration_since(starts[&id]).as_nanos() as u64;
