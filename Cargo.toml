@@ -88,3 +88,7 @@ path = "benchmarks/h3-response-flight-peer.rs"
 [[example]]
 name = "quic-timer-peer"
 path = "benchmarks/quic-timer-peer.rs"
+
+[[example]]
+name = "h2-goaway-peer"
+path = "benchmarks/h2-goaway-peer.rs"

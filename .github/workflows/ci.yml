@@ -39,6 +39,9 @@ jobs:
       - name: Test (release)
         run: cargo test --release
 
+      - name: HTTP/2 GOAWAY cohort accounting
+        run: python3 -m unittest discover -s benchmarks -p 'test_h2_goaway_cohort.py'
+
       - name: Literal QPACK status names (aioquic)
         run: |
           python3 -m venv "$RUNNER_TEMP/h3-status-venv"
