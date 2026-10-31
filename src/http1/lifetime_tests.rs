@@ -25,6 +25,7 @@ impl Fixture {
         let buffers = BufRing::new(entries).unwrap();
         let mut conn = Conn::new();
         conn.fd = socket.into_raw_fd();
+        conn.connected = true;
         let mut ring = uring::build_worker_ring(1).unwrap();
         let (submitter, _, _) = ring.split();
         let submitter = uring::register_worker(submitter, 1, &buffers).unwrap();
@@ -40,8 +41,7 @@ impl Fixture {
 
     fn arm(&mut self, submit: bool) {
         let (submitter, mut sq, _) = self.ring.split();
-        uring::push_recv_multi(&submitter, &mut sq, 0, self.conn.generation).unwrap();
-        self.conn.recv_armed = true;
+        push_recv(&submitter, &mut sq, 0, &mut self.conn).unwrap();
         if submit {
             sq.sync();
             submitter.submit().unwrap();
@@ -88,20 +88,29 @@ impl Fixture {
             .unwrap();
         }
         let mut connected = false;
+        let mut timeout_finished = false;
         for _ in 0..100 {
             let cqes = self.completions();
             for cqe in &cqes {
                 if cqe.user_data() == uring::user_data(0, self.conn.generation, OP_CONNECT) {
                     assert_eq!(cqe.result(), 0);
                     connected = true;
+                    self.conn.connected = true;
+                }
+                if cqe.user_data() == uring::user_data(0, self.conn.generation, OP_CONNECT_TIMEOUT)
+                {
+                    assert_eq!(cqe.result(), -libc::ECANCELED);
+                    timeout_finished = true;
                 }
             }
             self.recycle(&cqes);
-            if connected {
+            // Deferred task work may publish the linked timeout after the
+            // Connect CQE. Leave no setup CQEs for the next receive assertion.
+            if connected && timeout_finished {
                 break;
             }
         }
-        assert!(connected);
+        assert!(connected && timeout_finished);
         let (peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         std::mem::replace(&mut self.peer, peer)
@@ -267,6 +276,7 @@ fn connect_completions(f: &mut Fixture) -> Vec<io_uring::cqueue::Entry> {
 #[test]
 fn retirement_finishes_a_queued_connect_and_its_linked_timeout() {
     let mut f = Fixture::new();
+    f.conn.recv_single = true;
     f.retire();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -300,6 +310,7 @@ fn retirement_finishes_a_queued_connect_and_its_linked_timeout() {
 #[test]
 fn retirement_cancels_a_pending_connect_and_its_linked_timeout() {
     let mut f = Fixture::new();
+    f.conn.recv_single = true;
     f.retire();
     let listener =
         socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
@@ -340,7 +351,14 @@ fn retirement_cancels_a_pending_connect_and_its_linked_timeout() {
 
 #[test]
 fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
+    for single in [false, true] {
+        blocked_send_retirement(single);
+    }
+}
+
+fn blocked_send_retirement(single: bool) {
     let mut f = Fixture::new();
+    f.conn.recv_single = single;
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(f.conn.fd) };
     let socket = socket2::SockRef::from(&borrowed);
     socket.set_send_buffer_size(4096).unwrap();
@@ -366,8 +384,10 @@ fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
             break;
         }
     }
-    f.conn.tls =
-        Some(TlsSession::new(&crate::tls::setup("localhost", b"http/1.1").unwrap()).unwrap());
+    if !single {
+        f.conn.tls =
+            Some(TlsSession::new(&crate::tls::setup("localhost", b"http/1.1").unwrap()).unwrap());
+    }
     f.conn.out = vec![0x76; 4 * 1024 * 1024];
     f.conn.sending = true;
     loop {
@@ -433,13 +453,18 @@ fn request_then_eof(peer: &mut (impl Read + Write), expected: &[u8], answer: boo
     assert_eq!(peer.read(&mut byte).unwrap(), 0, "retired socket retained");
 }
 
-fn close_worker(tls: bool, expire_first: bool) {
+fn close_worker(tls: bool, expire_first: bool, disable_keepalive: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let scheme = if tls { "https" } else { "http" };
-    let target =
-        crate::target::parse_target(&format!("{scheme}://{address}/"), "GET", &[], None, false)
-            .unwrap();
+    let target = crate::target::parse_target(
+        &format!("{scheme}://{address}/"),
+        "GET",
+        &[],
+        None,
+        disable_keepalive,
+    )
+    .unwrap();
     let expected = target.request_bytes.clone();
     let config = tls.then(server_config);
     let server = std::thread::spawn(move || {
@@ -488,18 +513,19 @@ fn close_worker(tls: bool, expire_first: bool) {
 
 #[test]
 fn close_releases_each_plain_socket_before_the_replacement_answers() {
-    close_worker(false, false);
+    close_worker(false, false, false);
 }
 
 #[test]
 fn close_notify_and_tcp_fin_precede_the_replacement_tls_response() {
-    close_worker(true, false);
+    close_worker(true, false, false);
 }
 
 #[test]
 fn timeout_releases_each_socket_and_preserves_the_request_budget() {
     for tls in [false, true] {
-        close_worker(tls, true);
+        close_worker(tls, true, false);
+        close_worker(tls, true, true);
     }
 }
 
@@ -876,3 +902,6 @@ fn complete_tls_uploads_preserve_keepalive_bytes_and_every_sample() {
         }
     }
 }
+
+#[path = "oneshot_tests.rs"]
+mod oneshot_tests;

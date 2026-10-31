@@ -515,6 +515,26 @@ pub fn push_send_slice(
     push_sqe(submitter, sq, entry)
 }
 
+/// Receive once into a provided buffer. Every CQE is terminal, including
+/// ENOBUFS; the caller must recycle any selected buffer and rearm as needed.
+pub fn push_recv_single(
+    submitter: &Submitter<'_>,
+    sq: &mut squeue::SubmissionQueue<'_>,
+    conn_idx: usize,
+    generation: u64,
+) -> Result<()> {
+    let entry = opcode::Recv::new(
+        types::Fixed(conn_idx as u32),
+        std::ptr::null_mut(),
+        crate::buf_ring::RECV_BUF_SIZE as u32,
+    )
+    .buf_group(BUF_GROUP)
+    .build()
+    .flags(squeue::Flags::BUFFER_SELECT)
+    .user_data(user_data(conn_idx, generation, OP_RECV));
+    push_sqe(submitter, sq, entry)
+}
+
 /// Arm a multishot recv
 ///
 /// A single submission keeps delivering a CQE per receive while the MORE flag

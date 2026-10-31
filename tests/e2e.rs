@@ -1394,21 +1394,29 @@ fn h1_a_response_before_the_body_is_sent_does_not_corrupt_the_next_request() {
     // More than the socket buffers on both sides hold, so the response is on
     // its way while the send still has most of the body to go
     std::fs::write(&path, vec![b'a'; 32 << 20]).unwrap();
-    let report = shb_json(&[
-        "--timeout",
-        "5s",
-        "-d",
-        &format!("@{}", path.display()),
-        "-n",
-        "5",
-        "-c",
-        "1",
-        "-t",
-        "1",
-        &url,
-    ]);
+    let body_arg = format!("@{}", path.display());
+    for disable_keepalive in [false, true] {
+        let mut args = vec![
+            "--timeout",
+            "5s",
+            "-d",
+            &body_arg,
+            "-n",
+            "5",
+            "-c",
+            "1",
+            "-t",
+            "1",
+            &url,
+        ];
+        if disable_keepalive {
+            args.push("--disable-keepalive");
+        }
+        let report = shb_json(&args);
+        assert_all_ok(&report, 5, "200");
+        assert_eq!(report["latencySamples"], 5);
+    }
     let _ = std::fs::remove_file(&path);
-    assert_all_ok(&report, 5, "200");
 }
 
 /// A server that accepts and then says nothing at all

@@ -37,9 +37,12 @@ use crate::uring::{
 };
 
 struct Conn {
-    /// -1 when there is no connection: [`Conn::close`] puts it back, and a
-    /// successful Connect CQE is what makes it a socket again
+    /// -1 when there is no connection. start_connect installs a socket before
+    /// its Connect CQE arrives; [`Conn::close`] releases it.
     fd: RawFd,
+    /// A successful Connect CQE has been consumed. An installed fd alone
+    /// does not prove that the queued/submitted connect has finished.
+    connected: bool,
     parser: Parser,
     /// TLS session (https URLs only; recreated per TCP connection)
     tls: Option<TlsSession>,
@@ -53,7 +56,10 @@ struct Conn {
     /// location that returns a fixed status - and the request after it must
     /// still follow the end of this one on the wire
     queued: bool,
-    /// Whether a multishot recv is active (cleared by a CQE without the MORE flag)
+    /// Plain close-after-one requests use terminal receives, rearmed only
+    /// while a response is incomplete. Fixed for this worker's lifetime.
+    recv_single: bool,
+    /// A receive is queued or active (cleared by a CQE without the MORE flag)
     recv_armed: bool,
     /// Reconnect generation. Incremented on every close; CQEs from an old
     /// generation (e.g. a cancelled multishot recv) are identified via
@@ -85,12 +91,14 @@ impl Conn {
     fn new() -> Self {
         Conn {
             fd: -1,
+            connected: false,
             parser: Parser::new(),
             tls: None,
             out: Vec::new(),
             out_off: 0,
             sending: false,
             queued: false,
+            recv_single: false,
             recv_armed: false,
             generation: 0,
             request_start: Instant::now(),
@@ -119,6 +127,7 @@ impl Conn {
             drop(unsafe { TcpStream::from_raw_fd(self.fd) });
             self.fd = -1;
         }
+        self.connected = false;
         self.recv_armed = false;
         self.sending = false;
         self.queued = false;
@@ -127,6 +136,13 @@ impl Conn {
         self.out_off = 0;
         // Bump the generation so CQEs of operations on the old connection are ignored
         self.generation = (self.generation + 1) & uring::GENERATION_MASK;
+    }
+
+    /// Only terminal CQEs prove that no operation can still resolve this
+    /// fixed slot or borrow send storage. Keep the existing barrier for all
+    /// other modes, as well as early responses, rearmed receives and connects.
+    fn io_quiescent(&self) -> bool {
+        self.recv_single && self.connected && !self.recv_armed && !self.sending
     }
 
     /// Best-effort close_notify before the socket goes, so a TLS server sees
@@ -203,28 +219,32 @@ fn retire(
     conn: &mut Conn,
 ) -> Result<()> {
     if conn.fd >= 0 {
-        // Fixed-file SQEs resolve their socket at submission. A partial send
-        // or ENOBUFS rearm queued in this batch must still bind to the old slot.
-        sq.sync();
-        while !sq.is_empty() {
-            match submitter.submit() {
-                Ok(0) => bail!("io_uring made no progress before HTTP/1.1 socket retirement"),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e).context("submit before HTTP/1.1 socket retirement failed"),
-            }
+        if !conn.io_quiescent() {
+            // Fixed-file SQEs resolve their socket at submission. A partial send
+            // or ENOBUFS rearm queued in this batch must still bind to the old slot.
             sq.sync();
-        }
-        // Synchronous cancellation (Linux 6.0, like RecvMulti) covers sends,
-        // receives and connects on this slot. A canceled connect also ends its
-        // linked timeout. Do not clear out until a blocked Send has stopped
-        // reading it; consuming an SQE alone is not sufficient.
-        let cancel = types::CancelBuilder::fd(types::Fixed(conn_idx as u32)).all();
-        match submitter.register_sync_cancel(Some(Duration::from_secs(1).into()), cancel) {
-            Ok(()) => {}
-            // Operations may already have completed with CQEs still unreaped.
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(e) => return Err(e).context("cancel retired HTTP/1.1 I/O failed"),
+            while !sq.is_empty() {
+                match submitter.submit() {
+                    Ok(0) => bail!("io_uring made no progress before HTTP/1.1 socket retirement"),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        return Err(e).context("submit before HTTP/1.1 socket retirement failed");
+                    }
+                }
+                sq.sync();
+            }
+            // Synchronous cancellation (Linux 6.0, like RecvMulti) covers sends,
+            // receives and connects on this slot. A canceled connect also ends its
+            // linked timeout. Do not clear out until a blocked Send has stopped
+            // reading it; consuming an SQE alone is not sufficient.
+            let cancel = types::CancelBuilder::fd(types::Fixed(conn_idx as u32)).all();
+            match submitter.register_sync_cancel(Some(Duration::from_secs(1).into()), cancel) {
+                Ok(()) => {}
+                // Operations may already have completed with CQEs still unreaped.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(e) => return Err(e).context("cancel retired HTTP/1.1 I/O failed"),
+            }
         }
         submitter
             .register_files_update(conn_idx as u32, &[-1])
@@ -342,13 +362,17 @@ fn finish_at_eof(conn: &mut Conn, stats: &mut Stats) {
     conn.end_request();
 }
 
-fn push_recv_multi(
+fn push_recv(
     submitter: &Submitter<'_>,
     sq: &mut squeue::SubmissionQueue<'_>,
     conn_idx: usize,
     conn: &mut Conn,
 ) -> Result<()> {
-    uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
+    if conn.recv_single {
+        uring::push_recv_single(submitter, sq, conn_idx, conn.generation)?;
+    } else {
+        uring::push_recv_multi(submitter, sq, conn_idx, conn.generation)?;
+    }
     conn.recv_armed = true;
     Ok(())
 }
@@ -386,6 +410,7 @@ pub fn run_worker(
     let mut conns: Vec<Conn> = Vec::with_capacity(connections);
     for _ in 0..connections {
         let mut conn = Conn::new();
+        conn.recv_single = target.disable_keepalive && tls_setup.is_none();
         // The method never changes during a run, so the parser is told once
         conn.parser.set_head_request(is_head);
         conns.push(conn);
@@ -506,6 +531,7 @@ pub fn run_worker(
 
             match op {
                 OP_CONNECT => {
+                    conns[conn_idx].connected = res >= 0;
                     if res < 0 {
                         // e.g. ECONNREFUSED, or ECANCELED when the LinkTimeout fired
                         stats.errors += 1;
@@ -514,8 +540,8 @@ pub fn run_worker(
                         keep_conn = false;
                     } else {
                         let conn = &mut conns[conn_idx];
-                        // Arm a connection-lifetime multishot recv right away
-                        push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                        // Arm a receive before sending the first request
+                        push_recv(&submitter, &mut sq, conn_idx, conn)?;
                         if let Some(setup) = tls_setup {
                             conn.tls = Some(TlsSession::new(setup)?);
                         }
@@ -567,15 +593,15 @@ pub fn run_worker(
                             // TLS may have produced more ciphertext meanwhile
                             flush(&submitter, &mut sq, conn_idx, conn, &target.request_bytes)?;
                             if !conn.recv_armed {
-                                // Re-arm if the multishot ended (e.g. due to ENOBUFS)
-                                push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                                // Re-arm if the receive ended (e.g. due to ENOBUFS)
+                                push_recv(&submitter, &mut sq, conn_idx, conn)?;
                             }
                         }
                     }
                 }
                 OP_RECV => {
                     let conn = &mut conns[conn_idx];
-                    // A CQE without the MORE flag means this multishot recv ended
+                    // No MORE means this receive has released the socket.
                     if !cqueue::more(flags) {
                         conn.recv_armed = false;
                     }
@@ -585,10 +611,10 @@ pub fn run_worker(
                             buf_ring.recycle(bid);
                         }
                         if res == -libc::ENOBUFS {
-                            // The multishot merely stopped because the pool ran
+                            // The receive merely stopped because the pool ran
                             // dry; buffers are returned while processing this
                             // batch, so just re-arm
-                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                            push_recv(&submitter, &mut sq, conn_idx, conn)?;
                         } else {
                             conn.fail_request(&mut stats);
                             request_finished = true;
@@ -636,7 +662,7 @@ pub fn run_worker(
                             }
                             Ok(0) => {
                                 if !conn.recv_armed {
-                                    push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                                    push_recv(&submitter, &mut sq, conn_idx, conn)?;
                                 }
                                 // The TLS handshake may need to send its next
                                 // flight even though no request completed
@@ -672,7 +698,7 @@ pub fn run_worker(
                     debug_assert!(!keep_conn || conn.fd >= 0, "reusing a closed connection");
                     if keep_conn {
                         if !conn.recv_armed {
-                            push_recv_multi(&submitter, &mut sq, conn_idx, conn)?;
+                            push_recv(&submitter, &mut sq, conn_idx, conn)?;
                         }
                         queue_and_flush_request(
                             &submitter,
