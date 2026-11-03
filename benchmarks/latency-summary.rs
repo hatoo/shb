@@ -4,12 +4,15 @@
 //! Run: `/tmp/latency-summary random 1000000 10 73` (pattern, length, repeats, seed).
 //! Each JSON line measures one summary; input generation/reset, validation, and
 //! printing are outside the interval. Three warmups use the same input.
+//! SUMMARY_SAVE_INPUT writes a new little-endian u64 corpus; SUMMARY_INPUT replays
+//! one with exactly `length` samples. See latency-summary.md for the format/tests.
 //! For instruction counts: SUMMARY_WARMUPS=0 valgrind --tool=callgrind --collect-atstart=no
 //! --toggle-collect=measured_summary /tmp/latency-summary random 1000000 1 73
 //! Use the identical harness for both revisions.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -98,32 +101,77 @@ fn main() {
     let repeats: usize = args[3].parse().unwrap();
     let seed: u64 = args[4].parse().unwrap();
     let warmups: usize = std::env::var("SUMMARY_WARMUPS").map_or(3, |s| s.parse().unwrap());
-    assert_ne!(seed, 0);
-    let mut state = seed;
-    let original: Vec<_> = (0..len)
-        .map(|i| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            match pattern.as_str() {
-                "random" => state % 1_000_000_000,
-                "duplicates" => state % 32 * 1000,
-                "sorted" => i as u64,
-                "reverse" => (len - i) as u64,
-                "equal" => 123_456,
-                "skewed" => {
-                    if state % 1000 == 0 {
-                        state % 1_000_000_000
-                    } else {
-                        state % 1000
-                    }
-                }
-                "runs" => (i % (len / 16).max(1)) as u64,
-                _ => panic!("unknown pattern"),
-            }
-        })
-        .collect();
-    // Full-sort oracle, kept outside all measured intervals.
+    assert_ne!(seed, 0, "seed must be nonzero");
+    // Validate even when the input is empty or supplied by a corpus. Keeping
+    // pattern names restricted also makes the JSON string below unambiguous.
+    assert!(
+        matches!(
+            pattern.as_str(),
+            "random"
+                | "duplicates"
+                | "sorted"
+                | "reverse"
+                | "equal"
+                | "skewed"
+                | "runs"
+                | "wide"
+                | "wide-duplicates"
+                | "wide-sorted"
+                | "wide-reverse"
+                | "wide-equal"
+                | "boundaries"
+        ),
+        "unknown pattern"
+    );
+    let byte_len = len.checked_mul(8).expect("input byte length overflow");
+    assert!(
+        byte_len <= isize::MAX as usize,
+        "input exceeds Vec capacity"
+    );
+    let iterations = repeats
+        .checked_add(warmups)
+        .expect("iteration count overflow");
+    let input_path = std::env::var_os("SUMMARY_INPUT");
+    let input = if input_path.is_some() {
+        "replay"
+    } else {
+        "generated"
+    };
+    let original = if let Some(path) = input_path {
+        let file = std::fs::File::open(path).expect("open input corpus");
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            byte_len as u64,
+            "input byte length mismatch"
+        );
+        let mut bytes = Vec::new();
+        // Bound the read even if a file grows after the metadata check. The
+        // extra byte detects growth; the final check also catches truncation.
+        file.take(byte_len as u64 + 1)
+            .read_to_end(&mut bytes)
+            .expect("read input corpus");
+        assert_eq!(bytes.len(), byte_len, "input byte length mismatch");
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| u64::from_le_bytes(b))
+            .collect::<Vec<_>>()
+    } else {
+        generate(pattern, len, seed)
+    };
+    if let Some(path) = std::env::var_os("SUMMARY_SAVE_INPUT") {
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create_new(path).expect("create new output corpus"),
+        );
+        for sample in &original {
+            file.write_all(&sample.to_le_bytes())
+                .expect("write output corpus");
+        }
+        file.flush().expect("flush output corpus");
+    }
+    // Full-sort oracle, kept outside all measured intervals. u128 can hold the
+    // sum of any addressable slice of u64 samples, including full-width data.
     let mut sorted = original.clone();
     sorted.sort_unstable();
     let expected = if sorted.is_empty() {
@@ -131,14 +179,15 @@ fn main() {
     } else {
         Some(stats::LatencySummary {
             min: sorted[0] as f64 / 1e9,
-            mean: sorted.iter().sum::<u64>() as f64 / len as f64 / 1e9,
+            mean: sorted.iter().map(|&ns| u128::from(ns)).sum::<u128>() as f64 / len as f64 / 1e9,
             max: sorted[len - 1] as f64 / 1e9,
             percentiles: stats::PERCENTILES
                 .map(|p| sorted[((p / 100.0 * len as f64) as usize).min(len - 1)] as f64 / 1e9),
         })
     };
+    let expected_bits = bits(&expected);
     let mut samples = original.clone();
-    for iteration in 0..repeats + warmups {
+    for iteration in 0..iterations {
         samples.copy_from_slice(&original);
         ALLOCATIONS.store(0, Relaxed);
         BYTES.store(0, Relaxed);
@@ -151,15 +200,64 @@ fn main() {
         let cpu = cpu_ns() - cpu;
         let allocations = ALLOCATIONS.load(Relaxed);
         let allocated_bytes = BYTES.load(Relaxed);
+        assert_eq!(allocations, 0, "summary allocated");
+        assert_eq!(allocated_bytes, 0, "summary allocated bytes");
         let summary_bits = bits(&summary);
-        assert_eq!(summary_bits, bits(&expected));
+        assert_eq!(summary_bits, expected_bits, "summary bits changed");
+        // Check every call, including warmups: the next reset would otherwise
+        // conceal corruption in all but the last call. This is outside timing.
+        samples.sort_unstable();
+        assert_eq!(samples, sorted, "sample multiset changed");
         if iteration >= warmups {
             println!(
-                "{{\"pattern\":\"{pattern}\",\"len\":{len},\"seed\":{seed},\"iteration\":{},\"wall_ns\":{wall},\"cpu_ns\":{cpu},\"allocations\":{allocations},\"allocated_bytes\":{allocated_bytes},\"summary_bits\":{summary_bits:?}}}",
+                "{{\"pattern\":\"{pattern}\",\"len\":{len},\"seed\":{seed},\"input\":\"{input}\",\"iteration\":{},\"wall_ns\":{wall},\"cpu_ns\":{cpu},\"allocations\":{allocations},\"allocated_bytes\":{allocated_bytes},\"summary_bits\":{summary_bits:?}}}",
                 iteration - warmups,
             );
         }
     }
-    samples.sort_unstable();
-    assert_eq!(samples, sorted, "sample multiset changed");
+}
+
+fn generate(pattern: &str, len: usize, seed: u64) -> Vec<u64> {
+    const BOUNDARIES: [u64; 10] = [
+        0,
+        1,
+        (1 << 32) - 1,
+        1 << 32,
+        (1 << 32) + 1,
+        (1 << 53) - 1,
+        1 << 53,
+        (1 << 53) + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let mut state = seed;
+    (0..len)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match pattern {
+                "random" => state % 1_000_000_000,
+                "duplicates" => state % 32 * 1000,
+                "sorted" => i as u64,
+                "reverse" => (len - i) as u64,
+                "equal" => 123_456,
+                "wide" => state,
+                "wide-duplicates" => u64::MAX - state % 32,
+                "wide-sorted" => u64::MAX - (len - 1 - i) as u64,
+                "wide-reverse" => u64::MAX - i as u64,
+                "wide-equal" => u64::MAX,
+                "boundaries" => BOUNDARIES[i % BOUNDARIES.len()],
+                "skewed" => {
+                    if state.is_multiple_of(1000) {
+                        state % 1_000_000_000
+                    } else {
+                        state % 1000
+                    }
+                }
+                "runs" => (i % (len / 16).max(1)) as u64,
+                _ => unreachable!("pattern was validated before generation"),
+            }
+        })
+        .collect()
 }
