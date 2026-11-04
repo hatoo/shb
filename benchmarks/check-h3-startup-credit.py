@@ -3,6 +3,9 @@
 
 Checks exact control/QPACK prefixes, open critical streams, request/status/sample
 counts, and recovery after loss, replay and a connection closed during startup.
+With --cohort N, withholds all responses until N distinct TLS connections have
+complete prefixes and one queued request each. The reconnect case uses N+1
+attempts to account for the deliberately aborted startup.
 Requires aioquic==1.3.0. This is a correctness test, not a throughput benchmark.
 """
 import argparse
@@ -20,9 +23,9 @@ from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.buffer import Buffer
 from aioquic.h3.connection import H3Connection
-from aioquic.h3.events import HeadersReceived
+from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import StreamDataReceived
+from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
 from aioquic.quic.packet import pull_quic_header
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -30,6 +33,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from report_accounting import validate_sample_accounting
+from h3_startup_cohort import (
+    PREFIXES, GetCompletion, inspect_cohort, release_cohort, validate_cohort,
+)
 
 # Reuse the independent authenticated frame decoder, not shb's implementation.
 spec = importlib.util.spec_from_file_location(
@@ -37,14 +43,42 @@ spec = importlib.util.spec_from_file_location(
 recovery = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recovery)
 
-PREFIXES = {2: bytes.fromhex('000409010007000680100000'), 6: b'\x02', 10: b'\x03'}
 CASES = {'ordinary': 1024, 'one-byte': 1, 'five-bytes': 5,
          'loss-replay': 1, 'reconnect': 1}
 REQUESTS = 16
 
 
-async def check(binary, config, case, baseline):
+async def check(binary, config, case, baseline, cohort=None, barrier_timeout=5):
     peers, failures, requests = [], [], []
+    failed = asyncio.get_running_loop().create_future()
+    released = False
+    deadline = None
+    aborts = int(case == 'reconnect')
+
+    def fail(message):
+        failures.append(message)
+        if not failed.done():
+            failed.set_result(None)
+
+    def maybe_release():
+        nonlocal released
+        ledgers = [p.ledger for p in peers]
+        if released:
+            inspect_cohort(ledgers, cohort, aborts)
+            return
+        ready = release_cohort(ledgers, cohort, aborts)
+        if ready:
+            released = True
+            if deadline:
+                deadline.cancel()
+            for index in ready:
+                peer = peers[index]
+                request = peer.ledger['requests'][0]
+                peer.h3.send_headers(request['id'],
+                                     [(b':status', str(request['status']).encode())],
+                                     end_stream=True)
+                peer.ledger['responses'].append(dict(request))
+                peer.transmit()
 
     class Peer(QuicConnectionProtocol):
         def __init__(self, *args, **kwargs):
@@ -56,7 +90,10 @@ async def check(binary, config, case, baseline):
             self._quic._local_max_stream_data_uni = window
             self.h3 = H3Connection(self._quic)
             self.prefixes = {}
-            self.ledger = dict(window=window, events=[], packets=[], requests=[],
+            self.gets = GetCompletion()
+            self.ledger = dict(window=window, events=[], packets=[], requests=[], responses=[],
+                               request_events=[],
+                               cid=self._quic.original_destination_connection_id.hex(), tls=False,
                                aborted=False, dropped=None, replayed=False)
             self.held = None
             peers.append(self)
@@ -100,10 +137,13 @@ async def check(binary, config, case, baseline):
                     super().datagram_received(old, route)
                     self.ledger['replayed'] = True
             except Exception as exc:
-                failures.append(repr(exc))
+                fail(repr(exc))
 
         def quic_event_received(self, event):
             try:
+                if isinstance(event, HandshakeCompleted):
+                    assert event.alpn_protocol == 'h3'
+                    self.ledger['tls'] = True
                 if isinstance(event, StreamDataReceived) and event.stream_id % 4 == 2:
                     sid = event.stream_id
                     assert sid in PREFIXES, f'extra uni stream {sid}'
@@ -121,32 +161,66 @@ async def check(binary, config, case, baseline):
                 for event in self.h3.handle_event(event):
                     if isinstance(event, HeadersReceived):
                         assert self.prefixes == PREFIXES, 'request before complete startup'
-                        assert event.stream_ended, 'incomplete GET'
                         headers = dict(event.headers)
                         assert headers[b':method'] == b'GET' and headers[b':path'] == b'/'
+                    elif not isinstance(event, DataReceived):
+                        continue
+                    is_headers = isinstance(event, HeadersReceived)
+                    self.ledger['request_events'].append(dict(id=event.stream_id,
+                        headers=is_headers, ended=event.stream_ended,
+                        data='' if is_headers else event.data.hex()))
+                    if self.gets.receive(event.stream_id, is_headers, event.stream_ended,
+                                         b'' if is_headers else event.data):
                         key = (self.index, event.stream_id)
                         assert key not in requests, 'duplicate request'
                         requests.append(key)
                         status = 200 if len(requests) % 2 else 503
                         self.ledger['requests'].append(dict(id=event.stream_id, status=status))
-                        self.h3.send_headers(event.stream_id,
-                                             [(b':status', str(status).encode())], end_stream=True)
+                        if cohort:
+                            maybe_release()
+                        else:
+                            self.h3.send_headers(event.stream_id,
+                                                 [(b':status', str(status).encode())], end_stream=True)
+                            self.ledger['responses'].append(dict(self.ledger['requests'][-1]))
             except Exception as exc:
-                failures.append(repr(exc))
+                fail(repr(exc))
 
     server = await serve('127.0.0.1', 0, configuration=config, create_protocol=Peer)
     port = server._transport.get_extra_info('sockname')[1]
-    command = [str(binary), '--http3', '-j', '-n', str(REQUESTS), '-p', '4', '-c', '1',
-               '-t', '1', '--timeout', '3s', f'https://127.0.0.1:{port}/']
+    total = cohort + aborts if cohort else REQUESTS
+    command = [str(binary), '--http3', '-j', '-n', str(total), '-p', '1' if cohort else '4',
+               '-c', str(cohort or 1), '-t', '1', '--connect-timeout', '10s',
+               '--timeout', '10s' if cohort else '3s', f'https://127.0.0.1:{port}/']
     proc = None
+    communication = None
     try:
         proc = await asyncio.create_subprocess_exec(*command, stdout=-1, stderr=-1)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), 20)
+        if cohort and not released:
+            def expire():
+                ready = [i for i, p in enumerate(peers) if len(p.ledger['requests']) == 1
+                         and not p.ledger['aborted']]
+                fail(f'cohort barrier timed out: need {cohort}, ready {ready}, '
+                     f'observed connections {len(peers)}')
+            deadline = asyncio.get_running_loop().call_later(barrier_timeout, expire)
+        communication = asyncio.create_task(proc.communicate())
+        done, _ = await asyncio.wait([communication, failed], timeout=20,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        assert not failures, failures
+        assert communication in done, 'client did not finish within 20 seconds'
+        stdout, stderr = communication.result()
         await asyncio.sleep(.01)
         assert proc.returncode == 0, stderr.decode()
         assert not failures, failures
         report = json.loads(stdout)
         validate_sample_accounting(report)
+        assert not any(p.gets.pending for p in peers), 'incomplete GET at teardown'
+        if cohort:
+            assert released, 'cohort barrier did not release'
+            validate_cohort([p.ledger for p in peers], cohort, aborts, report)
+            if case == 'loss-replay':
+                assert all(p.ledger['dropped'] and p.ledger['replayed'] for p in peers)
+            return dict(case=case, cohort=cohort, command=command, report=report,
+                        stderr=stderr.decode(), peers=[p.ledger for p in peers])
         broken = baseline and case != 'ordinary'
         errors = REQUESTS if broken else int(case == 'reconnect')
         ok = REQUESTS - errors
@@ -172,9 +246,13 @@ async def check(binary, config, case, baseline):
                               peers=[p.ledger for p in peers])), file=sys.stderr)
         raise
     finally:
+        if deadline:
+            deadline.cancel()
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
+        if communication:
+            await communication
         server.close()
 
 
@@ -193,7 +271,8 @@ async def main(args):
             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
         config = QuicConfiguration(is_client=False, alpn_protocols=['h3'])
         config.load_cert_chain(path / 'cert', path / 'key')
-        rows = [await check(args.shb.resolve(), config, case, args.baseline)
+        rows = [await check(args.shb.resolve(), config, case, args.baseline,
+                            args.cohort, args.barrier_timeout)
                 for case in (args.case or CASES)]
         print(json.dumps(dict(aioquic=aioquic.__version__, rows=rows), indent=2))
 
@@ -203,4 +282,12 @@ if __name__ == '__main__':
     parser.add_argument('--shb', required=True, type=Path)
     parser.add_argument('--baseline', action='store_true', help='expect the known short-write failure')
     parser.add_argument('--case', action='append', choices=CASES)
-    asyncio.run(main(parser.parse_args()))
+    parser.add_argument('--cohort', type=int, help='require one request per distinct connection')
+    parser.add_argument('--barrier-timeout', type=float, default=5,
+                        help='seconds to wait for all cohort members (default: 5)')
+    args = parser.parse_args()
+    if args.cohort is not None and (args.cohort < 1 or args.baseline):
+        parser.error('--cohort requires a positive size and cannot use --baseline')
+    if not 0 < args.barrier_timeout < 10:
+        parser.error('--barrier-timeout must be between 0 and 10 seconds')
+    asyncio.run(main(args))
