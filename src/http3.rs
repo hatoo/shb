@@ -236,11 +236,53 @@ struct InFlight {
     unsent: Vec<u8>,
 }
 
+/// Three critical streams, kept open after their prefixes have been queued.
+/// Only a flow-controlled startup retains this state between drive calls.
+struct H3Init {
+    ids: [u64; 3],
+    preludes: [Vec<u8>; 3],
+    written: [usize; 3],
+}
+
+impl H3Init {
+    fn new(quic: &mut Connection) -> Result<Self> {
+        let mut encoder = Vec::new();
+        proto::put_varint(&mut encoder, proto::STREAM_QPACK_ENCODER);
+        let mut decoder = Vec::new();
+        proto::put_varint(&mut decoder, proto::STREAM_QPACK_DECODER);
+        let mut ids = [0; 3];
+        for id in &mut ids {
+            *id = quic.open_uni().context("the peer allowed no uni streams")?;
+        }
+        Ok(Self {
+            ids,
+            preludes: [proto::control_stream_prelude(), encoder, decoder],
+            written: [0; 3],
+        })
+    }
+
+    fn flush(&mut self, quic: &mut Connection) -> bool {
+        let mut ready = true;
+        for ((&id, prelude), written) in self.ids.iter().zip(&self.preludes).zip(&mut self.written)
+        {
+            if *written < prelude.len() {
+                *written += quic.write(id, &prelude[*written..]);
+            }
+            ready &= *written == prelude.len();
+        }
+        // No FIN: RFC 9114 Section 6.2 makes these critical streams; closing
+        // one would be H3_CLOSED_CRITICAL_STREAM.
+        ready
+    }
+}
+
 struct Conn {
     fd: RawFd,
     quic: Option<Connection>,
     /// QUIC handshake finished and the H3 control/QPACK streams are set up
     h3_ready: bool,
+    /// Present only when peer credit blocked one of the initial prefixes.
+    h3_init: Option<Box<H3Init>>,
     /// Peer-opened unidirectional streams, by QUIC stream id
     uni: Vec<(u64, UniReader)>,
     /// Datagrams have been handed to the endpoint since the state machine was
@@ -296,6 +338,7 @@ impl Conn {
             fd: -1,
             quic: None,
             h3_ready: false,
+            h3_init: None,
             uni: Vec::new(),
             pending: false,
             goaway: None,
@@ -352,6 +395,7 @@ impl Conn {
         self.quic = None;
         self.uni.clear();
         self.h3_ready = false;
+        self.h3_init = None;
         self.goaway = None;
         self.out_queue.clear();
         self.sending = false;
@@ -720,20 +764,11 @@ fn drive(
                     // QPACK streams. The QPACK ones stay empty for the life of
                     // the connection - neither side may insert - but they have
                     // to exist.
-                    let mut encoder = Vec::new();
-                    proto::put_varint(&mut encoder, proto::STREAM_QPACK_ENCODER);
-                    let mut decoder = Vec::new();
-                    proto::put_varint(&mut decoder, proto::STREAM_QPACK_DECODER);
-                    for prelude in [proto::control_stream_prelude(), encoder, decoder] {
-                        let id = quic.open_uni().context("the peer allowed no uni streams")?;
-                        if quic.write(id, &prelude) != prelude.len() {
-                            bail!("short write of H3 init data");
-                        }
-                        // Not finished: RFC 9114 Section 6.2.1 makes the
-                        // control and QPACK streams critical, and closing one
-                        // is H3_CLOSED_CRITICAL_STREAM
+                    let mut init = H3Init::new(quic)?;
+                    conn.h3_ready = init.flush(quic);
+                    if !conn.h3_ready {
+                        conn.h3_init = Some(Box::new(init));
                     }
-                    conn.h3_ready = true;
                 }
                 QuicEvent::Lost(why) => {
                     if narrate() {
@@ -846,6 +881,15 @@ fn drive(
         conn.give_backs
             .judge(conn.streams.is_empty(), parallel, stats, started);
 
+        // MAX_STREAM_DATA updates need not produce an application event.
+        // Retry after input, without reopening streams or starting requests
+        // (and their latency clocks) while any prefix is still blocked.
+        if let Some(init) = conn.h3_init.as_mut()
+            && init.flush(quic)
+        {
+            conn.h3_init = None;
+            conn.h3_ready = true;
+        }
         flush_unsent(quic, &mut conn.streams, &mut conn.has_unsent);
         // Back where the next pass will find them, with the capacity they grew
         conn.readable = readable;
@@ -1414,6 +1458,10 @@ fn finish_close(
 #[cfg(test)]
 #[path = "http3/budget_tests.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+#[path = "http3/init_tests.rs"]
+mod init_tests;
 
 #[cfg(test)]
 #[path = "http3/timeout_tests.rs"]
