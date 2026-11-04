@@ -60,14 +60,18 @@ jobs:
 
       - name: HTTP/3 startup with small uni-stream credit (aioquic)
         run: |
+          python3 -m unittest discover -s benchmarks -p 'test_h3_startup_cohort.py'
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-startup-credit.py --shb ./target/release/shb > "$RUNNER_TEMP/h3-startup-credit.json"
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-startup-credit.py --shb ./target/release/shb --cohort 8 > "$RUNNER_TEMP/h3-startup-cohort.json"
 
       - name: Retain HTTP/3 startup wire ledgers
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: h3-startup-credit
-          path: ${{ runner.temp }}/h3-startup-credit.json
+          path: |
+            ${{ runner.temp }}/h3-startup-credit.json
+            ${{ runner.temp }}/h3-startup-cohort.json
           if-no-files-found: ignore
 
       - name: QUIC receive history, ACK pruning and key updates (aioquic)
