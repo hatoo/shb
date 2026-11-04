@@ -1449,8 +1449,10 @@ impl Connection {
     #[cold]
     #[inline(never)]
     fn on_max_stream_data(&mut self, id: u64, limit: u64) {
-        if let Some(pair) = self.stream_mut(id) {
-            pair.send.set_limit(limit);
+        // Control and QPACK streams have send halves too, even though they
+        // are kept separately from the bidirectional request streams.
+        if let Some(send) = self.send_mut(id) {
+            send.set_limit(limit);
         }
         // A raised limit can unblock bytes that would not fit before
         self.queue_send(id);
@@ -1962,6 +1964,7 @@ impl Connection {
             .filter(|&i| i < self.streams.len())
     }
 
+    #[cfg(test)]
     fn stream_mut(&mut self, id: u64) -> Option<&mut StreamPair> {
         let i = self.stream_index(id)?;
         self.streams[i].as_mut()
@@ -2490,6 +2493,7 @@ mod tests {
     mod receive;
     mod receive_limits;
     mod stream_limits;
+    mod uni_send_credit;
 
     fn client() -> Connection {
         let tls = crate::tls::client_config(b"h3").unwrap();
