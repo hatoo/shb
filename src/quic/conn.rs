@@ -2465,6 +2465,26 @@ impl Connection {
         self.params.initial_max_stream_data_bidi_remote = window;
     }
 
+    pub(crate) fn test_h3_connected(&mut self, uni_window: u64) {
+        self.test_send_limits(8, 4096);
+        self.params.initial_max_streams_uni = 3;
+        self.params.initial_max_stream_data_uni = uni_window;
+        self.events.push_back(Event::Connected);
+    }
+
+    pub(crate) fn test_buffered_uni(&self) -> Vec<(u64, Vec<u8>, bool)> {
+        self.local_uni
+            .iter()
+            .map(|(id, send)| {
+                let (offset, data, fin) =
+                    send.next_send(usize::MAX, u64::MAX)
+                        .unwrap_or((0, &[], false));
+                assert_eq!(offset, 0, "this fixture never transmits packets");
+                (*id, data.to_vec(), fin)
+            })
+            .collect()
+    }
+
     pub(crate) fn test_receive_frame(&mut self, frame: Frame<'_>) {
         self.handle_frame(Space::Data, frame, Instant::now())
             .unwrap();
