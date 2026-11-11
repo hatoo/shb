@@ -58,6 +58,19 @@ jobs:
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-limits.py --shb ./target/release/shb
 
+      - name: HTTP/3 GOAWAY cancellation, retries and accounting (aioquic)
+        run: |
+          python3 -m unittest discover -s benchmarks -p 'test_h3_goaway.py'
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-goaway.py --shb ./target/release/shb --output "$RUNNER_TEMP/h3-goaway.json"
+
+      - name: Retain HTTP/3 GOAWAY peer and report evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-goaway-evidence
+          path: ${{ runner.temp }}/h3-goaway.json
+          if-no-files-found: ignore
+
       - name: HTTP/3 startup with small uni-stream credit (aioquic)
         run: |
           python3 -m unittest discover -s benchmarks -p 'test_h3_startup_cohort.py'
