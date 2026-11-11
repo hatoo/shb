@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import h3_goaway as oracle
+import h3_control_fragments as fragments
 
 
 class GoawayOracleTests(unittest.TestCase):
@@ -97,6 +98,89 @@ class GoawayOracleTests(unittest.TestCase):
                 row = self.row('decreasing')
                 row['report']['latencySeconds']['max'] = maximum
                 self.rejected(row, 'held-latency')
+
+
+class FragmentedControlTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = json.loads((Path(__file__).parent / 'fixtures/h3-control-fragments.json').read_text())['rows']
+
+    def rejected(self, row, code):
+        with self.assertRaises(oracle.GoawayFailure) as raised:
+            oracle.validate_result(row)
+        self.assertEqual(raised.exception.code, code)
+
+    def test_seven_new_wire_ledgers_and_precise_controls(self):
+        self.assertEqual([(r['case'], r['parallel']) for r in self.rows], [
+            ('fragmented', 8), ('malformed-goaway', 1), ('malformed-goaway', 64),
+            ('oversized-goaway', 1), ('oversized-goaway', 64),
+            ('trailing-goaway', 1), ('trailing-goaway', 64)])
+        before, controls = deepcopy(self.rows), []
+        for row in self.rows:
+            with self.subTest(case=row['case'], parallel=row['parallel']):
+                oracle.validate_result(row)
+                controls.extend(oracle.negative_controls(row))
+        self.assertEqual(len(controls), 121)
+        self.assertTrue({'control-bytes', 'control-offset', 'wire-bytes', 'wire-coverage',
+                         'authenticated-ack', 'fragment-order', 'fragment-mixed-packet',
+                         'parser-error', 'cleanup'} <= {c['rejected_by'] for c in controls})
+        self.assertEqual(self.rows, before)
+
+    def test_malformed_control_cannot_count_a_colocated_success(self):
+        for original in self.rows[1:]:
+            for field, code in [('success', 'request-budget'), ('sample', 'sample-count'),
+                                ('status', 'status-count')]:
+                with self.subTest(case=original['case'], parallel=original['parallel'], field=field):
+                    row = deepcopy(original)
+                    if field == 'success':
+                        row['report']['requests']['ok'] = 1
+                        row['report']['requests']['errors'] -= 1
+                    elif field == 'sample':
+                        row['report']['latencySamples'] = 1
+                    else:
+                        row['report']['statusCodes'] = {'299': 1}
+                    self.rejected(row, code)
+
+    def test_malformed_response_must_share_the_terminal_packet(self):
+        for original in self.rows[1:]:
+            row = deepcopy(original)
+            for packet in row['peers'][0]['packets']:
+                if packet['phase'] == 'invalid-final':
+                    packet['frames'] = [f for f in packet['frames'] if f['stream_id'] != 0]
+            self.rejected(row, 'invalid-mixed-packet')
+
+    def test_specific_parser_error_is_required_not_any_drive_error(self):
+        for original in self.rows[1:]:
+            row = deepcopy(original)
+            row['stderr'] = '[drive] an unrelated parser failure\n'
+            self.rejected(row, 'parser-error')
+
+    def test_cross_phase_frame_cannot_fake_a_receive_boundary(self):
+        row = deepcopy(self.rows[0])
+        peer = row['peers'][0]
+        frame = next(f for p in peer['packets'] if p['phase'] == 'grease-type-prefix'
+                     for f in p['frames'] if f['stream_id'] == peer['control_stream_id'])
+        frame['data'] += peer['control_writes'][1]['data']
+        frame['length'] = len(bytes.fromhex(frame['data']))
+        self.rejected(row, 'wire-offset')
+
+    def test_duplicate_packet_or_sequence_is_not_independent_evidence(self):
+        for field, code in [('pn', 'packet-number'), ('sequence', 'event-sequence')]:
+            row = deepcopy(self.rows[0])
+            packets = row['peers'][0]['packets']
+            # A spare ACK-only packet does not alter the phase packet set.
+            packets.append(dict(packets[0], pn=999999, sequence=999999, frames=[]))
+            packets[-1][field] = packets[0][field]
+            self.rejected(row, code)
+
+    def test_workload_contains_nonminimal_fields_and_false_goaways(self):
+        plan = dict(fragments.chunks('fragmented'))
+        self.assertEqual(plan['wide-type-prefix'] + plan['wide-type-tail'], b'\xc0' + b'\0' * 6 + b'\x07')
+        self.assertEqual(plan['wide-length-prefix'] + plan['wide-length-tail'], b'\x80\0\0\x08')
+        self.assertEqual(plan['wide-id-prefix'] + plan['wide-id-tail'], b'\xc0' + b'\0' * 6 + b'\x10')
+        body = b''.join(data for name, data in plan.items() if name.startswith('grease-body-'))
+        self.assertEqual(len(body), 4096)
+        self.assertGreater(body.count(b'\x07\x01\0'), 400)
 
 
 if __name__ == '__main__':
