@@ -331,6 +331,65 @@ mod tests {
         assert_eq!(pn_offset, out.len());
     }
 
+    #[test]
+    fn long_headers_preserve_tokens_across_varint_boundaries() {
+        for token_len in [0, 1, 63, 64, 16383, 16384] {
+            let token: Vec<u8> = (0..token_len).map(|n| (n ^ (n >> 8)) as u8).collect();
+            for cid_len in [0, 1, 8, 20] {
+                for pn_len in 1..=4 {
+                    for space in [Space::Initial, Space::Handshake] {
+                        let h = LongHeader {
+                            space,
+                            dcid: ConnectionId::new(&[0xa1; 20][..cid_len]).unwrap(),
+                            scid: ConnectionId::new(&[0xb2; 20][..20 - cid_len]).unwrap(),
+                            token: token.clone(),
+                        };
+                        let mut expected = vec![0xcc; 13];
+                        expected.extend_from_slice(&[
+                            (if space == Space::Initial { 0xc0 } else { 0xe0 })
+                                | (pn_len as u8 - 1),
+                            0,
+                            0,
+                            0,
+                            1,
+                            cid_len as u8,
+                        ]);
+                        expected.extend_from_slice(&[0xa1; 20][..cid_len]);
+                        expected.push((20 - cid_len) as u8);
+                        expected.extend_from_slice(&[0xb2; 20][..20 - cid_len]);
+                        if space == Space::Initial {
+                            match token_len {
+                                0..=63 => expected.push(token_len as u8),
+                                64..=16383 => expected
+                                    .extend_from_slice(&(0x4000 | token_len as u16).to_be_bytes()),
+                                _ => expected.extend_from_slice(
+                                    &(0x8000_0000 | token_len as u32).to_be_bytes(),
+                                ),
+                            }
+                            expected.extend_from_slice(&token);
+                        }
+                        expected.extend_from_slice(&[0x80, 0, 0, 100]);
+                        let mut out = vec![0xcc; 13];
+                        h.put(&mut out, pn_len, 100);
+                        assert_eq!(
+                            out, expected,
+                            "{space:?} token={token_len} cid={cid_len} pn={pn_len}"
+                        );
+                        let header_len = out.len() - 13;
+                        out.resize(out.len() + 100, 0);
+                        let Incoming::Long { pn_offset, end, .. } =
+                            decode_header(&out[13..], 0).unwrap()
+                        else {
+                            panic!("expected long header");
+                        };
+                        assert_eq!(pn_offset, header_len);
+                        assert_eq!(end, header_len + 100);
+                    }
+                }
+            }
+        }
+    }
+
     /// A short header has no length field, so the connection ID length has to
     /// come from what we told the peer to use
     #[test]

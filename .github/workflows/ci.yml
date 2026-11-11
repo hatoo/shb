@@ -67,6 +67,20 @@ jobs:
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-limits.py --shb ./target/release/shb
 
+      - name: QUIC Retry tokens, forged Retry and Initial recovery (aioquic)
+        timeout-minutes: 3
+        run: |
+          python3 -m unittest discover -s benchmarks -p 'test_quic_retry.py' -v
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-retry.py --shb ./target/release/shb --output "$RUNNER_TEMP/quic-retry.json"
+
+      - name: Retain QUIC Retry wire and accounting evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-retry
+          path: ${{ runner.temp }}/quic-retry.json
+          if-no-files-found: ignore
+
       - name: HTTP/3 GOAWAY cancellation, retries and accounting (aioquic)
         run: |
           python3 -m unittest discover -s benchmarks -p 'test_h3_goaway.py'

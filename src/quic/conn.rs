@@ -2512,6 +2512,7 @@ mod tests {
     mod credit_wire;
     mod receive;
     mod receive_limits;
+    mod retry_token;
     mod stream_limits;
     mod uni_send_credit;
 
