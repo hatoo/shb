@@ -1,0 +1,981 @@
+{
+  "source_revision": "f31cfa69fc98e32a0450ee8df9bf5b96e54b6f98",
+  "binary_sha256": "818f21926824f0ca961c61b3e7af3478598a65120b70fbcb2cb36979d0f267da",
+  "aioquic": "1.3.0",
+  "description": "Consumed fields from five successful encrypted runs of the accepted client. Live checks never read this fixture.",
+  "rows": [
+    {
+      "case": "no-retry",
+      "client_exit": 0,
+      "report": {
+        "protocol": "HTTP/3",
+        "threads": 1,
+        "connections": 1,
+        "requests": {
+          "connectErrors": 0,
+          "errors": 0,
+          "ok": 32,
+          "total": 32
+        },
+        "statusCodes": {
+          "200": 32
+        },
+        "latencySamples": 32,
+        "latencySeconds": {
+          "max": 0.006068094,
+          "mean": 0.00224137090625,
+          "min": 0.000671263,
+          "percentiles": {
+            "p10": 0.001106676,
+            "p25": 0.001248413,
+            "p50": 0.001495213,
+            "p75": 0.002408655,
+            "p90": 0.005492843,
+            "p95": 0.005966512,
+            "p99": 0.006068094,
+            "p99.9": 0.006068094,
+            "p99.99": 0.006068094
+          }
+        }
+      },
+      "ledger": {
+        "handshakes": 1,
+        "peers": 1,
+        "streams": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "responses": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "retries": [],
+        "initials": [
+          {
+            "seq": 1,
+            "pn": 0,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "0c3758b32203e780",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "fa86c22ee23f5a60e9a1bb4821c18abbe4969f184bf0eb2b29cdfe42bbc0a88e"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 3,
+            "pn": 1,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "8948f8b7d1fcfbc9",
+            "wire_bytes": 1200,
+            "crypto": [],
+            "action": "deliver"
+          }
+        ],
+        "deliveries": [
+          {
+            "initial": 0,
+            "seq": 2
+          },
+          {
+            "initial": 1,
+            "seq": 4
+          }
+        ]
+      },
+      "failures": [],
+      "cleanup": {
+        "client_reaped": true,
+        "transport_closed": true,
+        "peers_closed": true,
+        "callbacks_cancelled": true
+      }
+    },
+    {
+      "case": "retry",
+      "client_exit": 0,
+      "report": {
+        "protocol": "HTTP/3",
+        "threads": 1,
+        "connections": 1,
+        "requests": {
+          "connectErrors": 0,
+          "errors": 0,
+          "ok": 32,
+          "total": 32
+        },
+        "statusCodes": {
+          "200": 32
+        },
+        "latencySamples": 32,
+        "latencySeconds": {
+          "max": 0.003105429,
+          "mean": 0.00174174921875,
+          "min": 0.000907875,
+          "percentiles": {
+            "p10": 0.001134881,
+            "p25": 0.001345534,
+            "p50": 0.001531761,
+            "p75": 0.002166541,
+            "p90": 0.002652999,
+            "p95": 0.002963506,
+            "p99": 0.003105429,
+            "p99.9": 0.003105429,
+            "p99.99": 0.003105429
+          }
+        }
+      },
+      "ledger": {
+        "handshakes": 1,
+        "peers": 1,
+        "streams": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "responses": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "retries": [
+          {
+            "kind": "authentic",
+            "seq": 3,
+            "scid": "9bb3cafb5571db4b",
+            "token_length": 256,
+            "token_sha256": "db5b14aa9dbe2c3107cde3fa2a920066198a6c33a8382292c1bbf4c0aef2f292",
+            "integrity_valid": true
+          }
+        ],
+        "initials": [
+          {
+            "seq": 1,
+            "pn": 0,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "c46400228b3bd07a",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "e44e4e907a857005ebb8f534e4fcc0c11500b5109d943a2855a77f2d58537fb8"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 4,
+            "pn": 1,
+            "token_length": 256,
+            "token_sha256": "db5b14aa9dbe2c3107cde3fa2a920066198a6c33a8382292c1bbf4c0aef2f292",
+            "dcid": "9bb3cafb5571db4b",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "e44e4e907a857005ebb8f534e4fcc0c11500b5109d943a2855a77f2d58537fb8"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 6,
+            "pn": 2,
+            "token_length": 256,
+            "token_sha256": "db5b14aa9dbe2c3107cde3fa2a920066198a6c33a8382292c1bbf4c0aef2f292",
+            "dcid": "cf59bc8a8734448a",
+            "wire_bytes": 1200,
+            "crypto": [],
+            "action": "deliver"
+          }
+        ],
+        "deliveries": [
+          {
+            "initial": 0,
+            "seq": 2
+          },
+          {
+            "initial": 1,
+            "seq": 5
+          },
+          {
+            "initial": 2,
+            "seq": 7
+          }
+        ]
+      },
+      "failures": [],
+      "cleanup": {
+        "client_reaped": true,
+        "transport_closed": true,
+        "peers_closed": true,
+        "callbacks_cancelled": true
+      }
+    },
+    {
+      "case": "drop",
+      "client_exit": 0,
+      "report": {
+        "protocol": "HTTP/3",
+        "threads": 1,
+        "connections": 1,
+        "requests": {
+          "connectErrors": 0,
+          "errors": 0,
+          "ok": 32,
+          "total": 32
+        },
+        "statusCodes": {
+          "200": 32
+        },
+        "latencySamples": 32,
+        "latencySeconds": {
+          "max": 0.003016576,
+          "mean": 0.0011095906875,
+          "min": 0.000346096,
+          "percentiles": {
+            "p10": 0.000667843,
+            "p25": 0.000863315,
+            "p50": 0.00108944,
+            "p75": 0.001210782,
+            "p90": 0.001581809,
+            "p95": 0.001824054,
+            "p99": 0.003016576,
+            "p99.9": 0.003016576,
+            "p99.99": 0.003016576
+          }
+        }
+      },
+      "ledger": {
+        "handshakes": 1,
+        "peers": 1,
+        "streams": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "responses": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "retries": [
+          {
+            "kind": "authentic",
+            "seq": 3,
+            "scid": "5103000c42c17220",
+            "token_length": 256,
+            "token_sha256": "85cbd3fb383a15260fc3872e46581eaa6bd13a873bc977a959a2517fbff8fec5",
+            "integrity_valid": true
+          }
+        ],
+        "initials": [
+          {
+            "seq": 1,
+            "pn": 0,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "b3a8805fc1b61226",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "90e8ba8a3cd52bcc16c48222e6d0061c1c5d981f550d9bd9a90dd62abf0d03b3"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 4,
+            "pn": 1,
+            "token_length": 256,
+            "token_sha256": "85cbd3fb383a15260fc3872e46581eaa6bd13a873bc977a959a2517fbff8fec5",
+            "dcid": "5103000c42c17220",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "90e8ba8a3cd52bcc16c48222e6d0061c1c5d981f550d9bd9a90dd62abf0d03b3"
+              }
+            ],
+            "action": "drop"
+          },
+          {
+            "seq": 5,
+            "pn": 2,
+            "token_length": 256,
+            "token_sha256": "85cbd3fb383a15260fc3872e46581eaa6bd13a873bc977a959a2517fbff8fec5",
+            "dcid": "5103000c42c17220",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "90e8ba8a3cd52bcc16c48222e6d0061c1c5d981f550d9bd9a90dd62abf0d03b3"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 7,
+            "pn": 3,
+            "token_length": 256,
+            "token_sha256": "85cbd3fb383a15260fc3872e46581eaa6bd13a873bc977a959a2517fbff8fec5",
+            "dcid": "5103000c42c17220",
+            "wire_bytes": 1200,
+            "crypto": [],
+            "action": "deliver"
+          },
+          {
+            "seq": 9,
+            "pn": 4,
+            "token_length": 256,
+            "token_sha256": "85cbd3fb383a15260fc3872e46581eaa6bd13a873bc977a959a2517fbff8fec5",
+            "dcid": "d7d8e22c0e3c3fd9",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "90e8ba8a3cd52bcc16c48222e6d0061c1c5d981f550d9bd9a90dd62abf0d03b3"
+              }
+            ],
+            "action": "deliver"
+          }
+        ],
+        "deliveries": [
+          {
+            "initial": 0,
+            "seq": 2
+          },
+          {
+            "initial": 2,
+            "seq": 6
+          },
+          {
+            "initial": 3,
+            "seq": 8
+          },
+          {
+            "initial": 4,
+            "seq": 10
+          }
+        ]
+      },
+      "failures": [],
+      "cleanup": {
+        "client_reaped": true,
+        "transport_closed": true,
+        "peers_closed": true,
+        "callbacks_cancelled": true
+      }
+    },
+    {
+      "case": "reorder",
+      "client_exit": 0,
+      "report": {
+        "protocol": "HTTP/3",
+        "threads": 1,
+        "connections": 1,
+        "requests": {
+          "connectErrors": 0,
+          "errors": 0,
+          "ok": 32,
+          "total": 32
+        },
+        "statusCodes": {
+          "200": 32
+        },
+        "latencySamples": 32,
+        "latencySeconds": {
+          "max": 0.001909824,
+          "mean": 0.00100234490625,
+          "min": 0.000590492,
+          "percentiles": {
+            "p10": 0.000740068,
+            "p25": 0.000814648,
+            "p50": 0.0008411,
+            "p75": 0.001229655,
+            "p90": 0.001434367,
+            "p95": 0.001909464,
+            "p99": 0.001909824,
+            "p99.9": 0.001909824,
+            "p99.99": 0.001909824
+          }
+        }
+      },
+      "ledger": {
+        "handshakes": 1,
+        "peers": 1,
+        "streams": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "responses": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "retries": [
+          {
+            "kind": "authentic",
+            "seq": 3,
+            "scid": "81e12b08e4d13d21",
+            "token_length": 256,
+            "token_sha256": "4da5d00d8597a539f308b7e2a395481501884b0f75dc906f492372ea9d3a86ba",
+            "integrity_valid": true
+          }
+        ],
+        "initials": [
+          {
+            "seq": 1,
+            "pn": 0,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "7e856175123def44",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "aa71408ca7e3eb5b21aaf9c44a325c60ea66d9b21b52513b0a927edbb6fcc697"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 4,
+            "pn": 1,
+            "token_length": 256,
+            "token_sha256": "4da5d00d8597a539f308b7e2a395481501884b0f75dc906f492372ea9d3a86ba",
+            "dcid": "81e12b08e4d13d21",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "aa71408ca7e3eb5b21aaf9c44a325c60ea66d9b21b52513b0a927edbb6fcc697"
+              }
+            ],
+            "action": "reorder"
+          },
+          {
+            "seq": 5,
+            "pn": 2,
+            "token_length": 256,
+            "token_sha256": "4da5d00d8597a539f308b7e2a395481501884b0f75dc906f492372ea9d3a86ba",
+            "dcid": "81e12b08e4d13d21",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "aa71408ca7e3eb5b21aaf9c44a325c60ea66d9b21b52513b0a927edbb6fcc697"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 8,
+            "pn": 3,
+            "token_length": 256,
+            "token_sha256": "4da5d00d8597a539f308b7e2a395481501884b0f75dc906f492372ea9d3a86ba",
+            "dcid": "81e12b08e4d13d21",
+            "wire_bytes": 1200,
+            "crypto": [],
+            "action": "deliver"
+          },
+          {
+            "seq": 10,
+            "pn": 4,
+            "token_length": 256,
+            "token_sha256": "4da5d00d8597a539f308b7e2a395481501884b0f75dc906f492372ea9d3a86ba",
+            "dcid": "cac027685008ccff",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "aa71408ca7e3eb5b21aaf9c44a325c60ea66d9b21b52513b0a927edbb6fcc697"
+              }
+            ],
+            "action": "deliver"
+          }
+        ],
+        "deliveries": [
+          {
+            "initial": 0,
+            "seq": 2
+          },
+          {
+            "initial": 2,
+            "seq": 6
+          },
+          {
+            "initial": 1,
+            "seq": 7
+          },
+          {
+            "initial": 3,
+            "seq": 9
+          },
+          {
+            "initial": 4,
+            "seq": 11
+          }
+        ]
+      },
+      "failures": [],
+      "cleanup": {
+        "client_reaped": true,
+        "transport_closed": true,
+        "peers_closed": true,
+        "callbacks_cancelled": true
+      }
+    },
+    {
+      "case": "forged-second",
+      "client_exit": 0,
+      "report": {
+        "protocol": "HTTP/3",
+        "threads": 1,
+        "connections": 1,
+        "requests": {
+          "connectErrors": 0,
+          "errors": 0,
+          "ok": 32,
+          "total": 32
+        },
+        "statusCodes": {
+          "200": 32
+        },
+        "latencySamples": 32,
+        "latencySeconds": {
+          "max": 0.003118968,
+          "mean": 0.001425803875,
+          "min": 0.00111426,
+          "percentiles": {
+            "p10": 0.001150169,
+            "p25": 0.001210422,
+            "p50": 0.001256632,
+            "p75": 0.001352454,
+            "p90": 0.002248801,
+            "p95": 0.002640019,
+            "p99": 0.003118968,
+            "p99.9": 0.003118968,
+            "p99.99": 0.003118968
+          }
+        }
+      },
+      "ledger": {
+        "handshakes": 1,
+        "peers": 1,
+        "streams": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "responses": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48,
+          52,
+          56,
+          60,
+          64,
+          68,
+          72,
+          76,
+          80,
+          84,
+          88,
+          92,
+          96,
+          100,
+          104,
+          108,
+          112,
+          116,
+          120,
+          124
+        ],
+        "retries": [
+          {
+            "kind": "forged",
+            "seq": 3,
+            "scid": "d8b23ecb66f4e021",
+            "token_length": 256,
+            "token_sha256": "a012e6e9a7a5144a7f952bf1a62410ac2f863f80e6f710f3493cc4378edd254a",
+            "integrity_valid": false
+          },
+          {
+            "kind": "authentic",
+            "seq": 4,
+            "scid": "d8b23ecb66f4e021",
+            "token_length": 256,
+            "token_sha256": "127223750035c6c148dc7f1b54da7815e94899515a0861822e83e59ed13f0501",
+            "integrity_valid": true
+          },
+          {
+            "kind": "second",
+            "seq": 6,
+            "scid": "7365636f6e646964",
+            "token_length": 33,
+            "token_sha256": "4c6f582967ad4be5f63c444aa1bfd113c62416aca3ba5face36ec331342b9d3d",
+            "integrity_valid": true
+          }
+        ],
+        "initials": [
+          {
+            "seq": 1,
+            "pn": 0,
+            "token_length": 0,
+            "token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dcid": "c8f335d6392666f6",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "3cd002c71169ce1a293cd095a1b4ad47bf76d8dc75248b32c6e60358febc5960"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 5,
+            "pn": 1,
+            "token_length": 256,
+            "token_sha256": "127223750035c6c148dc7f1b54da7815e94899515a0861822e83e59ed13f0501",
+            "dcid": "d8b23ecb66f4e021",
+            "wire_bytes": 1200,
+            "crypto": [
+              {
+                "offset": 0,
+                "length": 224,
+                "sha256": "3cd002c71169ce1a293cd095a1b4ad47bf76d8dc75248b32c6e60358febc5960"
+              }
+            ],
+            "action": "deliver"
+          },
+          {
+            "seq": 8,
+            "pn": 2,
+            "token_length": 256,
+            "token_sha256": "127223750035c6c148dc7f1b54da7815e94899515a0861822e83e59ed13f0501",
+            "dcid": "073a5e036d04f95c",
+            "wire_bytes": 1200,
+            "crypto": [],
+            "action": "deliver"
+          }
+        ],
+        "deliveries": [
+          {
+            "initial": 0,
+            "seq": 2
+          },
+          {
+            "initial": 1,
+            "seq": 7
+          },
+          {
+            "initial": 2,
+            "seq": 9
+          }
+        ]
+      },
+      "failures": [],
+      "cleanup": {
+        "client_reaped": true,
+        "transport_closed": true,
+        "peers_closed": true,
+        "callbacks_cancelled": true
+      }
+    }
+  ]
+}
