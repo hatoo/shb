@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -31,6 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from h3_goaway import CASES, negative_controls, validate_result
+import h3_control_fragments as fragments
 
 spec = importlib.util.spec_from_file_location(
     'recovery', Path(__file__).with_name('check-quic-response-recovery.py'))
@@ -59,10 +61,12 @@ async def check(binary, certificate, key, case, parallel):
             self.started = False
             self.acknowledged = set()
             self.cursor = 0
+            self.sequence = 0
             self.bodies = {}
             self.ledger = dict(index=self.index, requests=[], responses=[], goaways=[],
                                packets=[], phases=[], resets=[], tls=False, closed=[],
                                client_resets=[], complete_uploads=[],
+                               acks=[], control_writes=[],
                                control_stream_id=self.h3._local_control_stream_id)
             peers.append(self)
             if case == 'blocked-upload' and self.index == 0:
@@ -74,6 +78,14 @@ async def check(binary, certificate, key, case, parallel):
                 self._quic._write_stream_limits = hold_request_credit
             send = self._quic.datagrams_to_send
             logger = self._quic._quic_logger
+            encode_stream = logger.encode_stream_frame
+
+            def stream_bytes(frame, stream_id):
+                row = encode_stream(frame, stream_id=stream_id)
+                if case in fragments.CASES and stream_id == self.h3._local_control_stream_id:
+                    row['data'] = frame.data.hex()
+                return row
+            logger.encode_stream_frame = stream_bytes
 
             def record(now):
                 datagrams = send(now)
@@ -82,8 +94,10 @@ async def check(binary, certificate, key, case, parallel):
                     if event['name'] == 'transport:packet_sent':
                         packet = event['data']
                         if packet['header']['packet_type'] == '1RTT':
+                            self.sequence += 1
                             self.ledger['packets'].append(dict(
                                 phase=self.phase, pn=packet['header']['packet_number'],
+                                sequence=self.sequence,
                                 frames=packet['frames']))
                 self.cursor = len(events)
                 return datagrams
@@ -95,15 +109,20 @@ async def check(binary, certificate, key, case, parallel):
                     q = self._quic
                     buf = Buffer(data=data)
                     pull_quic_header(buf, host_cid_length=len(q.host_cid))
-                    _, payload, _, _ = q._cryptos[tls.Epoch.ONE_RTT].recv.decrypt_packet(
+                    _, payload, pn, _ = q._cryptos[tls.Epoch.ONE_RTT].recv.decrypt_packet(
                         data, buf.tell(), q._spaces[tls.Epoch.ONE_RTT].expected_packet_number)
+                    ranges = []
                     for frame in recovery.decode_frames(payload):
                         if frame['type'] == 4:
                             self.ledger['client_resets'].append(frame['values'])
                         if frame['type'] in (2, 3):
+                            ranges.extend(frame['ranges'])
                             for lo, hi in frame['ranges']:
                                 assert hi - lo < 4096
                                 self.acknowledged.update(range(lo, hi + 1))
+                    if ranges and not any(a['pn'] == pn for a in self.ledger['acks']):
+                        self.sequence += 1
+                        self.ledger['acks'].append(dict(pn=pn, sequence=self.sequence, ranges=ranges))
                 super().datagram_received(data, addr)
             except Exception as exc:
                 failures.append(repr(exc))
@@ -141,7 +160,39 @@ async def check(binary, certificate, key, case, parallel):
 
         async def schedule(self):
             try:
-                if case == 'mixed':
+                if case in fragments.CASES:
+                    sid = self.h3._local_control_stream_id
+                    offset = self._quic._streams[sid].sender._buffer_stop
+                    self.ledger['control_start'] = offset
+                    for name, data in fragments.chunks(case):
+                        self.ledger['control_writes'].append(dict(
+                            phase=name, offset=offset, data=data.hex()))
+                        offset += len(data)
+                        self._quic.send_stream_data(sid, data)
+                        if name == 'wide-id-tail':
+                            self.ledger['goaways'].append(16)
+                            self.response(0, 200)
+                            self.response(4, 201, partial=True)
+                            self._quic.reset_stream(8, 0x102)
+                            self.response(16, 203)
+                            self._quic.reset_stream(20, 0x102)
+                            self.response(24, 204, partial=True)
+                            self.ledger['resets'] += [8, 20]
+                        elif name == 'adjacent':
+                            self.ledger['goaways'] += [16, 8, 8]
+                        if name == 'invalid-final':
+                            self.response(0, 299)
+                            if parallel > 1:
+                                self._quic.reset_stream(4, 0x102)
+                                self.ledger['resets'].append(4)
+                            self.phase = name
+                            self.transmit()
+                        else:
+                            await self.barrier(name)
+                    if case == 'fragmented':
+                        await asyncio.sleep(.1)
+                        self.finish(4)
+                elif case == 'mixed':
                     self.goaway(16)
                     self.response(0, 200)
                     self.response(4, 201, partial=True)
@@ -243,7 +294,8 @@ async def check(binary, certificate, key, case, parallel):
     process, communication, report, stdout, stderr = None, None, None, b'', b''
     result = dict(case=case, parallel=parallel, command=command, passed=False)
     try:
-        process = await asyncio.create_subprocess_exec(*command, stdout=-1, stderr=-1)
+        env = os.environ | {'SHB_DEBUG': '1'} if case in fragments.CASES else None
+        process = await asyncio.create_subprocess_exec(*command, stdout=-1, stderr=-1, env=env)
         communication = asyncio.create_task(process.communicate())
         stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), 30)
         await asyncio.wait_for(asyncio.gather(*jobs), 5)
@@ -262,11 +314,15 @@ async def check(binary, certificate, key, case, parallel):
             if not job.done():
                 job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
+        transport = server._transport
         server.close()
         await asyncio.sleep(.01)
         loop.set_exception_handler(old_handler)
         result.update(report=report, stdout=stdout.decode(), stderr=stderr.decode(),
                       peers=[p.ledger for p in peers], failures=failures,
+                      cleanup=dict(client_reaped=process is not None and process.returncode is not None,
+                                   tasks_joined=all(job.done() for job in jobs),
+                                   server_closed=transport.is_closing()),
                       client_exit=process.returncode if process else None)
     if 'failure' not in result:
         try:
@@ -297,7 +353,7 @@ async def main(args):
             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
         rows = []
         for case in args.case or CASES:
-            for parallel in ([8] if case in ('mixed', 'decreasing', 'blocked-upload') else [1, 64]):
+            for parallel in ([8] if case in ('mixed', 'decreasing', 'blocked-upload', 'fragmented') else [1, 64]):
                 rows.append(await check(args.shb.resolve(), path/'cert', path/'key', case, parallel))
         evidence = dict(aioquic=aioquic.__version__, rows=rows,
                         binary_sha256=hashlib.sha256(args.shb.read_bytes()).hexdigest())

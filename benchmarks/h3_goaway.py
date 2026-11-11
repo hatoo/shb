@@ -7,8 +7,9 @@ from copy import deepcopy
 import math
 
 from report_accounting import validate_sample_accounting
+import h3_control_fragments as fragments
 
-CASES = ('mixed', 'decreasing', 'no-suffix', 'zero', 'ordinary', 'blocked-upload')
+CASES = ('mixed', 'decreasing', 'no-suffix', 'zero', 'ordinary', 'blocked-upload', *fragments.CASES)
 
 
 class GoawayFailure(ValueError):
@@ -23,10 +24,12 @@ def require(condition, code, detail):
 
 
 def expected(case, parallel):
-    if case == 'zero':
+    if case == 'zero' or case in fragments.INVALID:
         return 0, parallel, {}, [parallel]
     if case == 'mixed':
         return 7, 1, {'200': 1, '201': 1, '202': 1, '203': 1, '205': 3}, [8, 3]
+    if case == 'fragmented':
+        return 7, 1, {'200': 1, '201': 1, '203': 1, '205': 4}, [8, 4]
     if case == 'decreasing':
         return 8, 0, {'200': 1, '201': 1, '205': 6}, [8, 6]
     if case == 'blocked-upload':
@@ -42,7 +45,7 @@ def validate_result(row):
     """
     case, parallel = row['case'], row['parallel']
     require(case in CASES and parallel in (
-        [8] if case in ('mixed', 'decreasing', 'blocked-upload') else [1, 64]),
+        [8] if case in ('mixed', 'decreasing', 'blocked-upload', 'fragmented') else [1, 64]),
         'workload', (case, parallel))
     require(row['client_exit'] == 0, 'client-exit', row['client_exit'])
     require(not row['failures'], 'peer-failure', row['failures'])
@@ -75,6 +78,7 @@ def validate_result(row):
         'mixed': [16] * 4, 'decreasing': [24, 24, 16, 8, 8],
         'no-suffix': [parallel * 4] * 5, 'zero': [0],
         'ordinary': [], 'blocked-upload': [16],
+        'fragmented': [16, 16, 8, 8], **{case: [] for case in fragments.INVALID},
     }
     require(first['goaways'] == boundaries[case]
             and all(not p['goaways'] for p in peers[1:]),
@@ -84,6 +88,8 @@ def validate_result(row):
         'decreasing': [f'boundary-{i}' for i in range(5)],
         'no-suffix': ['no-suffix'] + [f'repeated-{i}' for i in range(4)],
         'zero': [], 'ordinary': [], 'blocked-upload': ['blocked-upload'],
+        **{case: [name for name, _ in fragments.chunks(case) if name != 'invalid-final']
+           for case in fragments.CASES},
     }
     require([p['name'] for p in first['phases']] == names[case],
             'phase-sequence', first['phases'])
@@ -92,7 +98,7 @@ def validate_result(row):
         packets = {p['pn'] for p in first['packets'] if p['phase'] == phase['name']}
         require(sent and len(sent) == len(set(sent)) and sent == acked
                 and set(sent) <= packets, 'ack-barrier', phase)
-    if names[case]:
+    if names[case] and case not in fragments.INVALID:
         maximum = report['latencySeconds']['max']
         require(isinstance(maximum, (float, int)) and math.isfinite(maximum)
                 and maximum >= .08, 'held-latency', maximum)
@@ -116,6 +122,8 @@ def validate_result(row):
             and {8, 20} <= {
                 f['stream_id'] for f in p['frames'] if f['frame_type'] == 'reset_stream'}
             for p in packets), 'mixed-packet', packets)
+    if case in fragments.CASES:
+        fragments.validate(row, require)
 
 
 def negative_controls(row):
@@ -157,8 +165,9 @@ def negative_controls(row):
     if row['peers'][0]['phases']:
         check('missing ACK', 'ack-barrier', lambda r: r['peers'][0]['phases'][0].__setitem__(
             'acknowledged', []))
-        check('lost held latency', 'held-latency', lambda r: r['report']['latencySeconds'].__setitem__(
-            'max', .001))
+        if row['case'] not in fragments.INVALID:
+            check('lost held latency', 'held-latency', lambda r: r['report']['latencySeconds'].__setitem__(
+                'max', .001))
     if row['case'] == 'blocked-upload':
         check('missing cancellation', 'upload-cancellation',
               lambda r: r['peers'][0].__setitem__('client_resets', []))
@@ -177,4 +186,57 @@ def negative_controls(row):
                                         if f['frame_type'] != 'reset_stream']
             packets.append(dict(phase='mixed', pn=max(p['pn'] for p in packets) + 1, frames=resets))
         check('mixed events split across packets', 'mixed-packet', split_resets)
+    if row['case'] in fragments.CASES:
+        check('wrong error count', 'request-budget', lambda r: r['report']['requests'].__setitem__(
+            'errors', r['report']['requests']['errors'] + 1))
+        check('wrong boundary', 'goaway-boundaries', lambda r: r['peers'][0]['goaways'].append(0))
+        check('missing cleanup', 'cleanup', lambda r: r.pop('cleanup'))
+        check('changed append bytes', 'control-bytes', lambda r: r['peers'][0]['control_writes'][0].__setitem__(
+            'data', '00'))
+        check('changed append offset', 'control-offset', lambda r: r['peers'][0]['control_writes'][0].__setitem__(
+            'offset', 0))
+
+        def first_frame(r):
+            peer = r['peers'][0]
+            write = peer['control_writes'][0]
+            return next(f for p in peer['packets'] for f in p['frames']
+                        if p['phase'] == write['phase'] and f['frame_type'] == 'stream'
+                        and f['stream_id'] == peer['control_stream_id'])
+
+        check('changed wire bytes', 'wire-bytes', lambda r: first_frame(r).__setitem__('data', '00'))
+        check('changed wire offset', 'wire-coverage', lambda r: first_frame(r).__setitem__('offset', 0))
+        check('missing authenticated ACKs', 'authenticated-ack', lambda r: r['peers'][0].__setitem__(
+            'acks', []))
+
+        def unrelated_acks(r):
+            for ack in r['peers'][0]['acks']:
+                ack['ranges'] = [[999999, 999999]]
+        check('ACK ranges name unsent packets', 'authenticated-ack', unrelated_acks)
+
+        def early_fragment(r):
+            peer = r['peers'][0]
+            packet = next(p for p in peer['packets'] if p['phase'] == peer['control_writes'][1]['phase'])
+            packet['sequence'] = -2
+        check('next fragment before ACK', 'fragment-order', early_fragment)
+        if row['case'] in fragments.INVALID:
+            check('timeout masquerading as parser failure', 'parser-error',
+                  lambda r: r.__setitem__('stderr', '[lost] timed out\n'))
+            def remove_invalid_response(r):
+                for packet in r['peers'][0]['packets']:
+                    if packet['phase'] == 'invalid-final':
+                        packet['frames'] = [f for f in packet['frames']
+                                            if not (f['frame_type'] == 'stream' and f['stream_id'] == 0)]
+            check('invalid control without colocated response', 'invalid-mixed-packet', remove_invalid_response)
+        else:
+            def split_fragment_resets(r):
+                peer = r['peers'][0]
+                packets = peer['packets']
+                resets = []
+                for packet in packets:
+                    if packet['phase'] == 'wide-id-tail':
+                        resets.extend(f for f in packet['frames'] if f['frame_type'] == 'reset_stream')
+                        packet['frames'] = [f for f in packet['frames'] if f['frame_type'] != 'reset_stream']
+                packets.append(dict(phase='wide-id-tail', pn=max(p['pn'] for p in packets) + 1,
+                                    sequence=max(p['sequence'] for p in packets) + 1000, frames=resets))
+            check('final fragment separated from resets', 'fragment-mixed-packet', split_fragment_resets)
     return controls
