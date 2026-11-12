@@ -74,3 +74,32 @@ a frozen peer, warmup, alternating comparisons and independent confirmation on
 a qualified host, plus ordinary protocol and tail-latency guards. Passing this
 fixture alone does not establish an end-to-end speedup or justify merging a
 performance candidate.
+
+## Small-response guards
+
+Pass `--matrix small` to the same suite command, with a new output directory,
+to check 128-byte bodies in 64-byte chunks, 4096/256 and 16384/256. Each size
+runs ordered, reverse and mixed delivery through the independent aioquic reader,
+the uninstrumented client and the untimed exposure observer. Each positive case
+uses three sequential requests to exercise pooled stream reuse. Missing-prefix,
+missing-FIN and corrupt-body controls use the 128-byte case and must fail at
+their specific body/FIN checks. The existing large matrix remains the default
+and retains its duplicate and dropped-datagram recovery coverage.
+
+`plan.json` records all cases before execution. `suite.json` preserves commands
+and exits even if a case fails; the controller stops at that failure without
+retrying it. `coverage.json` is written only after every planned case succeeds.
+It records configured suffix chunks separately from actual observed queue peaks,
+consumed/final/credited byte totals and independent wire evidence. Packet
+splitting and the first response's ignored final frame can make queue peaks
+larger than the configured suffix count. Unexpected packet loss fails the small
+matrix. Namespace/socket errors and exact request/status/latency accounting are
+checked for every case using the same validators as the large suite.
+
+Reuse frozen peers and observers when their source and binary hashes still
+match; no rebuild is needed just to select this matrix. Run baseline and
+candidate clients with their respective observers, holding the peer fixed.
+CI runs both matrices and uploads their evidence. These short correctness runs
+do not qualify small-effect performance or tail latency. Use separate warmup,
+fixed-count AB/BA comparisons and reversed independent confirmation on a
+qualified host for that remaining gate; observers must remain outside timing.

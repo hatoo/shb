@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from native_reordering import covers, validate_exposure, validate_udp, validate_wire
+from native_reordering import covers, suite_cases, suite_coverage, validate_exposure, validate_udp, validate_wire
 
 
 def packet(direction, pn, frames):
@@ -120,6 +120,122 @@ class ExposureTests(unittest.TestCase):
             validate_exposure(report(row, 525311), 1, 525312, 1024, 'reverse')
         with self.assertRaises(ValueError):
             validate_exposure(report(row) + '\n' + report(row), 1, 525312, 1024, 'reverse')
+
+
+class SmallMatrixTests(unittest.TestCase):
+    def results(self):
+        results = []
+        for case in suite_cases('small'):
+            summary = dict(case, passed=True)
+            count, size = case['requests'], case['body_bytes']
+            if case['fault'] != 'none':
+                summary['rejected'] = dict(reason='wrong response bytes at offset 0' if case['fault'] == 'corrupt' else 'deadline',
+                                           body_bytes=size if case['fault'] == 'missing-fin' else 0, ended=False)
+            else:
+                summary['schedule'] = dict(fences=[] if case['mode'] == 'ordered' else [{}] * count,
+                                           transport=dict(lost_packets=0))
+                if case['reader'] == 'aioquic':
+                    summary.update(independent_completed=count, body_bytes_verified=count * size,
+                                   wire={str(i * 4): {} for i in range(count)})
+                else:
+                    summary['reader'] = 'shb'
+                    summary['report'] = dict(requests=dict(total=count, ok=count, errors=0, connectErrors=0),
+                                             latencySamples=count, statusCodes={'200': count}, latencySeconds={},
+                                             protocol='HTTP/3', connections=1, threads=1)
+                if case['reader'] == 'exposure':
+                    # Deliberately differs from logical chunks: packet splitting
+                    # and an ignored final frame can increase the native queue.
+                    peak = 0 if case['mode'] == 'ordered' else size // case['chunk'] + 2
+                    summary['exposure'] = dict(bodies=[dict(bytes=size) for _ in range(count)],
+                                               streams=[dict(peak_pending=peak, final_size=size + 17,
+                                                             credited_bytes=size + 17, read_offset=size + 17,
+                                                             ready=0, pending=0) for _ in range(count)])
+            results.append(dict(case=case['case'], summary=summary))
+        return results
+
+    def test_small_plan_covers_each_geometry_schedule_reader_and_fault(self):
+        cases = suite_cases('small')
+        self.assertEqual(len(cases), 30)
+        self.assertEqual(len({c['case'] for c in cases}), 30)
+        positive = {(c['body_bytes'], c['chunk'], c['mode'], c['reader'], c['requests'])
+                    for c in cases if c['fault'] == 'none'}
+        self.assertEqual(positive, {(size, chunk, mode, reader, 3)
+                         for size, chunk in ((128, 64), (4096, 256), (16384, 256))
+                         for mode in ('ordered', 'reverse', 'mixed')
+                         for reader in ('aioquic', 'shb', 'exposure')})
+        self.assertEqual({(c['fault'], c['body_bytes'], c['chunk'], c['reader'], c['requests'])
+                          for c in cases if c['fault'] != 'none'},
+                         {(fault, 128, 64, 'aioquic', 1)
+                          for fault in ('missing-prefix', 'missing-fin', 'corrupt')})
+
+    def test_large_plan_retains_duplicate_and_loss_controls(self):
+        cases = suite_cases('large')
+        self.assertEqual(len(cases), 16)
+        self.assertTrue(all(c['body_bytes'] == 525312 and c['chunk'] == 1024 for c in cases))
+        self.assertEqual(sum(c['mode'] == 'duplicates' for c in cases), 3)
+        self.assertEqual(sum(c['fault'] == 'drop-once' for c in cases), 1)
+
+    def test_record_observed_queues_separately_from_configured_chunks(self):
+        result = suite_coverage('small', self.results())
+        self.assertFalse(result['timing_eligible'])
+        row = next(c for c in result['cases'] if c['case'] == '128-64-exposure-reverse-none')
+        self.assertEqual(row['configured_suffix_chunks'], 1)
+        self.assertEqual(row['observed_peak_pending'], [4, 4, 4])
+        self.assertEqual(row['observed_final_bytes'], row['observed_credited_bytes'])
+        self.assertEqual(row['observed_final_bytes'], row['observed_consumed_bytes'])
+
+    def test_missing_duplicate_or_wrong_size_cannot_cover_matrix(self):
+        good = self.results()
+        with self.assertRaisesRegex(ValueError, 'incomplete matrix'):
+            suite_coverage('small', good[:-1])
+        broken = copy.deepcopy(good)
+        broken[1] = broken[0]
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            suite_coverage('small', broken)
+        broken = copy.deepcopy(good)
+        broken[0]['summary']['body_bytes'] = 525312
+        with self.assertRaisesRegex(ValueError, 'body_bytes mismatch'):
+            suite_coverage('small', broken)
+
+    def test_failure_missing_wire_or_missing_observer_cannot_pass(self):
+        for index, key, value, reason in ((0, 'passed', False, 'did not pass'),
+                                          (0, 'wire', {}, 'missing independent wire stream'),
+                                          (2, 'exposure', {'streams': [], 'bodies': [{'bytes': 128}] * 3}, 'retired stream')):
+            with self.subTest(key=key):
+                broken = self.results()
+                broken[index]['summary'][key] = value
+                with self.assertRaisesRegex(ValueError, reason):
+                    suite_coverage('small', broken)
+
+    def test_sample_loss_and_unexpected_transport_loss_fail(self):
+        broken = self.results()
+        broken[1]['summary']['report']['latencySamples'] = 2
+        with self.assertRaisesRegex(ValueError, 'sample counts'):
+            suite_coverage('small', broken)
+        broken = self.results()
+        broken[0]['summary']['schedule']['transport']['lost_packets'] = 1
+        with self.assertRaisesRegex(ValueError, 'packet loss'):
+            suite_coverage('small', broken)
+
+    def test_negative_exit_alone_cannot_replace_specific_rejection(self):
+        broken = self.results()
+        del broken[-1]['summary']['rejected']
+        with self.assertRaisesRegex(ValueError, 'specifically rejected'):
+            suite_coverage('small', broken)
+
+    def test_fault_substitution_and_observer_credit_drift_fail(self):
+        broken = self.results()
+        broken[-1]['summary']['rejected'] = broken[-3]['summary']['rejected']
+        with self.assertRaisesRegex(ValueError, 'corruption missed'):
+            suite_coverage('small', broken)
+        broken = self.results()
+        broken[-2]['summary']['rejected']['body_bytes'] = 0
+        with self.assertRaisesRegex(ValueError, 'wrong blocked state'):
+            suite_coverage('small', broken)
+        broken = self.results()
+        broken[2]['summary']['exposure']['streams'][0]['credited_bytes'] += 1
+        with self.assertRaisesRegex(ValueError, 'credit mismatch'):
+            suite_coverage('small', broken)
 
 
 if __name__ == '__main__':

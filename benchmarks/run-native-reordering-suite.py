@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from native_reordering import suite_cases, suite_coverage
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -15,6 +17,8 @@ def main():
     parser.add_argument('--exposure', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--namespace', choices=('user', 'sudo'), default='user')
+    parser.add_argument('--matrix', choices=('large', 'small'), default='large',
+                        help='small: 128/64, 4096/256 and 16384/256 byte/chunk guards')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     here = Path(__file__).resolve().parent
@@ -22,16 +26,15 @@ def main():
               for k, p in vars(args).items() if k in ('peer', 'shb', 'exposure')}
     (args.output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
     rows = []
-    cases = [(reader, mode, 'none', 3)
-             for mode in ('ordered', 'reverse', 'mixed', 'duplicates')
-             for reader in ('aioquic', 'shb', 'exposure')]
-    cases += [('aioquic', 'reverse', fault, 1)
-              for fault in ('drop-once', 'missing-prefix', 'missing-fin', 'corrupt')]
-    for reader, mode, fault, count in cases:
-        name = f'{reader}-{mode}-{fault}'
+    cases = suite_cases(args.matrix)
+    (args.output / 'plan.json').write_text(json.dumps(dict(matrix=args.matrix, cases=cases), indent=2) + '\n')
+    results = []
+    for case in cases:
+        name, reader = case['case'], case['reader']
         command = [sys.executable, str(here / 'check-native-reordering.py'),
                    '--peer', str(args.peer.resolve()), '--output', str((args.output / name).resolve()),
-                   '--namespace', args.namespace, '--mode', mode, '--fault', fault, '--requests', str(count)]
+                   '--namespace', args.namespace, '--mode', case['mode'], '--fault', case['fault'],
+                   '--requests', str(case['requests']), '--size', str(case['body_bytes']), '--chunk', str(case['chunk'])]
         if reader in ('shb', 'exposure'):
             command += ['--shb', str((args.shb if reader == 'shb' else args.exposure).resolve())]
         if reader == 'exposure':
@@ -50,6 +53,9 @@ def main():
         # and the changed hypothesis/method are recorded.
         if row['exit'] != 0:
             raise SystemExit(1)
+        results.append(dict(case=name, summary=json.loads((args.output / name / 'summary.json').read_text())))
+    coverage = suite_coverage(args.matrix, results)
+    (args.output / 'coverage.json').write_text(json.dumps(coverage, indent=2) + '\n')
 
 
 if __name__ == '__main__':

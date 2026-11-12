@@ -194,6 +194,10 @@ jobs:
           python3 benchmarks/build-reordering-exposure.py 9fcad6b56c9d8b258e82fba93570ff6d2e8660b6 "$RUNNER_TEMP/reordering-observer"
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/run-native-reordering-suite.py --peer "$RUNNER_TEMP/reordering-peer/native-reordering-peer" --shb "$GITHUB_WORKSPACE/target/release/shb" --exposure "$RUNNER_TEMP/reordering-observer/shb-exposure" --output "$RUNNER_TEMP/reordering-results" --namespace sudo
 
+      - name: Native QUIC small responses and receive-queue guards
+        run: |
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/run-native-reordering-suite.py --peer "$RUNNER_TEMP/reordering-peer/native-reordering-peer" --shb "$GITHUB_WORKSPACE/target/release/shb" --exposure "$RUNNER_TEMP/reordering-observer/shb-exposure" --output "$RUNNER_TEMP/reordering-small-results" --namespace sudo --matrix small
+
       - name: Retain native QUIC reordering evidence
         if: always()
         uses: actions/upload-artifact@v5
@@ -201,6 +205,7 @@ jobs:
           name: native-quic-reordering
           path: |
             ${{ runner.temp }}/reordering-results
+            ${{ runner.temp }}/reordering-small-results
             ${{ runner.temp }}/reordering-peer/*.log
             ${{ runner.temp }}/reordering-peer/manifest.json
             ${{ runner.temp }}/reordering-observer/*.log
