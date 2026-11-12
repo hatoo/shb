@@ -186,6 +186,27 @@ jobs:
           cargo build --release --locked --example h3-response-flight-peer
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-h3-response-flight.py --peer ./target/release/examples/h3-response-flight-peer --shb ./target/release/shb --output "$RUNNER_TEMP/h3-response-flight"
 
+      - name: Native QUIC response reordering, ACK fences and exact delivery
+        run: |
+          git fetch --no-tags origin 9fcad6b56c9d8b258e82fba93570ff6d2e8660b6
+          python3 -m unittest discover -s benchmarks -p test_native_reordering.py -v
+          python3 benchmarks/build-native-reordering.py "$RUNNER_TEMP/reordering-peer"
+          python3 benchmarks/build-reordering-exposure.py 9fcad6b56c9d8b258e82fba93570ff6d2e8660b6 "$RUNNER_TEMP/reordering-observer"
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/run-native-reordering-suite.py --peer "$RUNNER_TEMP/reordering-peer/native-reordering-peer" --shb "$GITHUB_WORKSPACE/target/release/shb" --exposure "$RUNNER_TEMP/reordering-observer/shb-exposure" --output "$RUNNER_TEMP/reordering-results" --namespace sudo
+
+      - name: Retain native QUIC reordering evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: native-quic-reordering
+          path: |
+            ${{ runner.temp }}/reordering-results
+            ${{ runner.temp }}/reordering-peer/*.log
+            ${{ runner.temp }}/reordering-peer/manifest.json
+            ${{ runner.temp }}/reordering-observer/*.log
+            ${{ runner.temp }}/reordering-observer/manifest.json
+            ${{ runner.temp }}/reordering-observer/exposure.patch
+
       - name: Retain native HTTP/3 response-flight evidence
         if: always()
         uses: actions/upload-artifact@v4
