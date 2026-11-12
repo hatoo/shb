@@ -837,6 +837,80 @@ mod tests {
         assert_eq!(ack[4], FLAG_ACK);
     }
 
+    fn exact_client_preface() -> Vec<u8> {
+        // Independent wire bytes: the connection preface, three SETTINGS,
+        // and a connection WINDOW_UPDATE raising 65535 to 2^31 - 1.
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        bytes.extend_from_slice(&[
+            0, 0, 18, 4, 0, 0, 0, 0, 0, // SETTINGS header
+            0, 1, 0, 0, 0, 0, // HEADER_TABLE_SIZE = 0
+            0, 2, 0, 0, 0, 0, // ENABLE_PUSH = 0
+            0, 4, 127, 255, 255, 255, // INITIAL_WINDOW_SIZE = 2^31 - 1
+            0, 0, 4, 8, 0, 0, 0, 0, 0, // WINDOW_UPDATE header
+            127, 255, 0, 0, // increment = 2^31 - 1 - 65535
+        ]);
+        bytes
+    }
+
+    #[test]
+    fn client_first_preface_has_exact_settings_and_connection_credit() {
+        let mut c = Connection::new();
+        c.initiate();
+        assert_eq!(c.take_output().unwrap(), exact_client_preface());
+        assert!(c.take_output().is_none());
+    }
+
+    #[test]
+    fn preface_preserves_all_early_replies_and_peer_settings() {
+        // Exercise queued output shorter and longer than the preface, including
+        // a burst larger than 4 KiB.
+        for pings in [0u64, 1, 3, 4, 63, 256] {
+            for chunk in [1, 7, usize::MAX] {
+                let mut c = Connection::new();
+                let mut events = Vec::new();
+                let mut input = frame(SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0]);
+                let mut expected = exact_client_preface();
+                expected.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
+                for i in 0..pings {
+                    input.extend_from_slice(&frame(PING, 0, 0, &i.to_be_bytes()));
+                    expected.extend_from_slice(&frame(PING, FLAG_ACK, 0, &i.to_be_bytes()));
+                }
+                for part in input.chunks(chunk) {
+                    c.feed(part, &mut events).unwrap();
+                }
+                assert!(events.is_empty());
+                c.initiate();
+                assert_eq!(c.take_output().unwrap(), expected, "{pings}/{chunk}");
+                assert!(c.take_output().is_none(), "no duplicated replies");
+
+                // The early SETTINGS still affects the first request, and its
+                // response must retire exactly that stream after draining the preface.
+                assert_eq!(c.start_stream(&[0x82], b""), Some(1));
+                assert_eq!(
+                    c.take_output().unwrap(),
+                    frame(
+                        HEADERS,
+                        FLAG_END_HEADERS | FLAG_END_STREAM,
+                        1,
+                        &[0x20, 0x82]
+                    ),
+                );
+                c.feed(&frame(HEADERS, 5, 1, &[0x88]), &mut events).unwrap();
+                assert!(matches!(
+                    events.as_slice(),
+                    [
+                        Event::Status {
+                            stream_id: 1,
+                            status: 200
+                        },
+                        Event::End { stream_id: 1 },
+                    ]
+                ));
+                assert!(c.open.is_empty());
+            }
+        }
+    }
+
     /// The frame header from RFC 9113 Section 4.1, asserted as bytes: a
     /// 24-bit length, the type, the flags, then a 31-bit stream id
     #[test]
