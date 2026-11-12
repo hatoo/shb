@@ -39,6 +39,14 @@ jobs:
       - name: Test (release)
         run: cargo test --release
 
+      - name: HTTP/2 unchanged-settings benchmark peer contracts
+        run: |
+          rustfmt --edition 2024 --check benchmarks/h2-unchanged-settings-server.rs
+          rustc --edition=2024 -D warnings --test benchmarks/h2-unchanged-settings-server.rs -o /tmp/h2-settings-tests
+          /tmp/h2-settings-tests
+          rustc --edition=2024 -D warnings --test -O benchmarks/h2-unchanged-settings-server.rs -o /tmp/h2-settings-tests-release
+          /tmp/h2-settings-tests-release
+
       - name: Exact latency-summary corpus replay (debug and release)
         run: |
           rustfmt --edition 2024 --check --config skip_children=true benchmarks/latency-summary.rs

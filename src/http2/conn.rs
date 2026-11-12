@@ -595,6 +595,11 @@ impl Connection {
                 // Our only use for this is deciding whether a request body
                 // fits; responses ride on the huge window we advertise
                 SETTINGS_INITIAL_WINDOW_SIZE if value <= MAX_WINDOW => {
+                    // An unchanged setting leaves even negative stream windows
+                    // alone. Continue through later entries and still ACK below.
+                    if value == self.peer_initial_window {
+                        continue;
+                    }
                     // RFC 9113 Section 6.9.2: the change moves every open
                     // stream's window by the same amount, and may make one
                     // negative

@@ -228,3 +228,83 @@ fn invalid_initial_window_is_rejected_without_acknowledging_it() {
     assert!(c.take_output().is_none());
     assert!(events.is_empty());
 }
+
+#[test]
+fn unchanged_windows_preserve_negative_credit_holes_and_later_settings() {
+    for chunk in [1, 7, usize::MAX] {
+        let mut c = connected();
+        let mut events = Vec::new();
+        let body = b"abcdefg";
+        c.feed(&settings(&[3]), &mut events).unwrap();
+        c.take_output();
+        let first = c.start_stream(&[0x82], body).unwrap();
+        let retired = c.start_stream(&[0x82], body).unwrap();
+        let last = c.start_stream(&[0x82], body).unwrap();
+        assert_eq!(body_burst::drain(&mut c).len(), 3);
+        c.feed(
+            &frame(RST_STREAM, 0, retired, &8u32.to_be_bytes()),
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(events.as_slice(), [Event::Reset { stream_id }] if *stream_id == retired));
+        events.clear();
+        c.feed(&settings(&[0]), &mut events).unwrap();
+        c.take_output();
+        assert!(c.open.iter_mut().all(|s| s.window == -3));
+
+        // Repeated zero deltas must not hide a later change or a different
+        // setting in the same frame. Fragment every part of the wire header.
+        let mut payload = settings(&[0, 0, 5, 5, 4])[FRAME_HEADER_LEN..].to_vec();
+        payload.extend_from_slice(&[0, 3, 0, 0, 0, 2]);
+        for bytes in frame(SETTINGS, 0, 0, &payload).chunks(chunk) {
+            c.feed(bytes, &mut events).unwrap();
+        }
+        assert_eq!(c.take_output().unwrap(), frame(SETTINGS, FLAG_ACK, 0, &[]));
+        assert_eq!(c.peer_initial_window, 4);
+        assert!(!c.can_open());
+        c.pump_bodies(body);
+        assert_eq!(
+            body_burst::drain(&mut c),
+            vec![(first, false, b"d".to_vec()), (last, false, b"d".to_vec())]
+        );
+        c.feed(&settings(&[4, 7, 7]), &mut events).unwrap();
+        assert_eq!(c.take_output().unwrap(), frame(SETTINGS, FLAG_ACK, 0, &[]));
+        c.pump_bodies(body);
+        assert_eq!(
+            body_burst::drain(&mut c),
+            vec![
+                (first, true, b"efg".to_vec()),
+                (last, true, b"efg".to_vec())
+            ]
+        );
+        for id in [first, last] {
+            c.feed(
+                &frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, id, &[0x88]),
+                &mut events,
+            )
+            .unwrap();
+            assert!(
+                matches!(events.as_slice(), [Event::Status { stream_id, status: 200 }, Event::End { stream_id: ended }] if *stream_id == id && *ended == id)
+            );
+            events.clear();
+        }
+        assert_eq!(c.open.len(), 0);
+        assert!(c.take_output().is_none());
+    }
+}
+
+#[test]
+fn unchanged_window_does_not_hide_later_invalid_settings() {
+    for invalid in [vec![0, 4, 128, 0, 0, 0], vec![0, 5, 0, 0, 0, 0]] {
+        let mut c = connected();
+        let mut events = Vec::new();
+        let mut payload = vec![0, 4, 0, 0, 255, 255];
+        payload.extend(invalid);
+        assert!(
+            c.feed(&frame(SETTINGS, 0, 0, &payload), &mut events)
+                .is_err()
+        );
+        assert!(c.take_output().is_none());
+        assert!(events.is_empty());
+    }
+}
