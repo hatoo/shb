@@ -4,6 +4,80 @@ import os
 from pathlib import Path
 
 
+def suite_cases(matrix):
+    """A fixed, bounded plan; configured chunks are not observed queue depth."""
+    require(matrix in ('large', 'small'), 'unknown reordering matrix')
+    sizes = ((525312, 1024),) if matrix == 'large' else ((128, 64), (4096, 256), (16384, 256))
+    modes = ('ordered', 'reverse', 'mixed', 'duplicates') if matrix == 'large' else ('ordered', 'reverse', 'mixed')
+    cases = [dict(reader=reader, mode=mode, fault='none', requests=3, body_bytes=size, chunk=chunk)
+             for size, chunk in sizes for mode in modes
+             for reader in ('aioquic', 'shb', 'exposure')]
+    faults = ('drop-once', 'missing-prefix', 'missing-fin', 'corrupt') if matrix == 'large' else ('missing-prefix', 'missing-fin', 'corrupt')
+    size, chunk = sizes[0]
+    cases += [dict(reader='aioquic', mode='reverse', fault=fault, requests=1, body_bytes=size, chunk=chunk)
+              for fault in faults]
+    for case in cases:
+        prefix = '' if matrix == 'large' else f"{case['body_bytes']}-{case['chunk']}-"
+        case['case'] = prefix + f"{case['reader']}-{case['mode']}-{case['fault']}"
+    return cases
+
+
+def suite_coverage(matrix, results):
+    """Require each planned case once, and retain actual native/wire exposure."""
+    expected = suite_cases(matrix)
+    require(len(results) == len(expected), 'incomplete matrix coverage')
+    coverage = []
+    for case, result in zip(expected, results):
+        require(result['case'] == case['case'], 'missing, duplicate or reordered matrix case')
+        summary = result['summary']
+        require(summary.get('passed') is True, 'matrix case did not pass')
+        for key in ('mode', 'fault', 'requests', 'body_bytes', 'chunk'):
+            require(summary.get(key) == case[key], f'matrix {key} mismatch')
+        require(summary.get('reader') == ('aioquic' if case['reader'] == 'aioquic' else 'shb'),
+                'matrix reader mismatch')
+        row = dict(case)
+        if case['fault'] in ('missing-prefix', 'missing-fin', 'corrupt'):
+            require('rejected' in summary, 'negative control was not specifically rejected')
+            rejected = summary['rejected']
+            require(rejected.get('ended') is False, 'negative control completed unexpectedly')
+            if case['fault'] == 'corrupt':
+                require('wrong response bytes' in rejected.get('reason', '') and
+                        0 <= rejected['body_bytes'] < case['body_bytes'],
+                        'corruption missed the byte oracle')
+            else:
+                delivered = case['body_bytes'] if case['fault'] == 'missing-fin' else 0
+                require(rejected.get('reason') == 'deadline' and rejected.get('body_bytes') == delivered,
+                        'negative control reached the wrong blocked state')
+            row['rejected'] = rejected
+        else:
+            require('rejected' not in summary, 'positive case was rejected')
+            schedule = summary['schedule']
+            row['configured_suffix_chunks'] = (case['body_bytes'] - 1) // case['chunk']
+            row['ack_fences'] = len(schedule['fences'])
+            if matrix == 'small':
+                require(schedule['transport'].get('lost_packets') == 0, 'unexpected small-case packet loss')
+            if case['reader'] == 'aioquic':
+                require(summary.get('independent_completed') == case['requests'] and
+                        summary.get('body_bytes_verified') == case['requests'] * case['body_bytes'],
+                        'independent body/completion coverage mismatch')
+                require(len(summary['wire']) == case['requests'], 'missing independent wire stream')
+                row['wire'] = summary['wire']
+            else:
+                from h3_response_flight import validate_client
+                validate_client(summary['report'], 0, case['requests'], 1, 1)
+            if case['reader'] == 'exposure':
+                exposure = summary['exposure']
+                streams = exposure['streams']
+                validate_observations(exposure['bodies'], streams, case['requests'],
+                                      case['body_bytes'], case['chunk'], case['mode'])
+                row['observed_peak_pending'] = [s['peak_pending'] for s in streams]
+                row['observed_final_bytes'] = [s['final_size'] for s in streams]
+                row['observed_credited_bytes'] = [s['credited_bytes'] for s in streams]
+                row['observed_consumed_bytes'] = [s['read_offset'] for s in streams]
+        coverage.append(row)
+    return dict(matrix=matrix, timing_eligible=False, cases=coverage)
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -26,6 +100,10 @@ def records(stderr, prefix):
 def validate_exposure(stderr, requests, size, chunk, mode):
     bodies = records(stderr, 'NATIVE_BODY ')
     streams = records(stderr, 'NATIVE_EXPOSURE ')
+    return validate_observations(bodies, streams, requests, size, chunk, mode)
+
+
+def validate_observations(bodies, streams, requests, size, chunk, mode):
     require(len(bodies) == requests and all(r == {'bytes': size} for r in bodies),
             'observer did not verify every response body byte')
     # Only completed request streams are retired into the pool. Control and
