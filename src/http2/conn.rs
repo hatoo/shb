@@ -734,6 +734,7 @@ mod tests {
 
     mod body_burst;
     mod continuation;
+    mod windows;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u32;

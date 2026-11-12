@@ -33,7 +33,10 @@ def log_lines(path):
 
 def run_case(shb, directory, name, length, parallel=8, connections=2,
              count=16, window=4194304, max_frame=16384, reconnect=False,
-             tls=False, change_settings=False):
+             tls=False, change_settings=False, window_schedule=()):
+    # Keep one SETTINGS change outstanding at a time so each ACK has an
+    # unambiguous expected value. Reconnect and frame-size cases run separately.
+    assert not window_schedule or (not reconnect and not change_settings)
     body = bytes(33 + i % 90 for i in range(length))
     body_file = directory / (name + '.body')
     body_file.write_bytes(body)
@@ -52,7 +55,8 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
 
     def serve(raw):
         state = dict(requests=0, ends=0, body_bytes=0, received=0,
-                     sent=0, teardown=0, frames=0, settings_changed=False)
+                     sent=0, teardown=0, frames=0, settings_changed=False,
+                     settings_acks=0, windows_sent=[], windows_acked=[])
         ledgers.append(state)
         try:
             raw.settimeout(15)
@@ -113,6 +117,15 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
                             if change_settings and not state['settings_changed']:
                                 h.update_settings({h2.settings.SettingCodes.MAX_FRAME_SIZE: 65536})
                                 state['settings_changed'] = True
+                        elif isinstance(event, h2.events.SettingsAcknowledged):
+                            state['settings_acks'] += 1
+                            if window_schedule and state['settings_acks'] > 2:
+                                acked = len(state['windows_acked'])
+                                assert acked < len(state['windows_sent']), state
+                                entry = event.changed_settings.get(h2.settings.SettingCodes.INITIAL_WINDOW_SIZE)
+                                assert entry is not None, event
+                                assert entry.new_value == state['windows_sent'][acked], (event, state)
+                                state['windows_acked'].append(entry.new_value)
                         elif isinstance(event, h2.events.StreamEnded):
                             assert bodies.pop(event.stream_id) == length
                             state['ends'] += 1
@@ -121,6 +134,16 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
                             if reconnect:
                                 h.close_connection(last_stream_id=event.stream_id)
                                 closing = True
+                    if (window_schedule and state['settings_acks'] >= 2
+                            and state['requests'] > 0
+                            and len(state['windows_sent']) == len(state['windows_acked'])
+                            and len(state['windows_sent']) < len(window_schedule)):
+                        # initiate_connection and update_settings each sent a
+                        # setup frame. Wait for both ACKs and an open upload:
+                        # starting at zero credit makes the first grant observable.
+                        value = window_schedule[len(state['windows_sent'])]
+                        h.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: value})
+                        state['windows_sent'].append(value)
                 assert not wire and not preface
                 assert not bodies, bodies
                 assert state['ends'] == state['requests']
@@ -171,6 +194,11 @@ def run_case(shb, directory, name, length, parallel=8, connections=2,
         assert len(ledgers) >= count
     if change_settings:
         assert all(s['settings_changed'] for s in ledgers)
+    if window_schedule:
+        for state in ledgers:
+            assert state['windows_sent'] == list(window_schedule), (name, state)
+            assert state['windows_acked'] == list(window_schedule), (name, state)
+            assert state['settings_acks'] == 2 + len(window_schedule), (name, state)
     return dict(name=name, body_sha256=hashlib.sha256(body).hexdigest(),
                 command=command, connections=ledgers, report=report)
 
@@ -414,6 +442,12 @@ def main():
             ('1m-goaway', 1048576, dict(reconnect=True, parallel=1, connections=1, count=8)),
             ('tls-16k', 16384, dict(tls=True)),
             ('tls-1m', 1048576, dict(tls=True)),
+        ]
+        cases += [
+            (f'{"tls" if tls else "clear"}-window-changes-p{parallel}', 262145,
+             dict(tls=tls, parallel=parallel, connections=1, count=32, window=0,
+                  window_schedule=(17, 0, 4096, 1, 65535, 1048576)))
+            for tls in [False, True] for parallel in [1, 16]
         ]
         native = [native_case(args.peer.resolve(), directory, name, tls)
                   for tls in [None, 'tls12', 'tls13']
