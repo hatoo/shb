@@ -2,7 +2,7 @@ use super::*;
 
 // Decode the wire independently of Connection's frame writer. Keep DATA from
 // each call separate so a later grant cannot conceal an early send or FIN.
-fn data_frames(wire: &[u8]) -> Vec<(u32, bool, Vec<u8>)> {
+pub(super) fn data_frames(wire: &[u8]) -> Vec<(u32, bool, Vec<u8>)> {
     let mut frames = Vec::new();
     let mut offset = 0;
     while offset < wire.len() {
@@ -25,7 +25,7 @@ fn data_frames(wire: &[u8]) -> Vec<(u32, bool, Vec<u8>)> {
     frames
 }
 
-fn drain(c: &mut Connection) -> Vec<(u32, bool, Vec<u8>)> {
+pub(super) fn drain(c: &mut Connection) -> Vec<(u32, bool, Vec<u8>)> {
     let wire = c.take_output().unwrap_or_default();
     let frames = data_frames(&wire);
     c.recycle(wire);
