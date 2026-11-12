@@ -4,10 +4,12 @@
 //! stream per request, writes the whole request at once, and reads a response
 //! that almost always arrives in order. So the send side keeps one contiguous
 //! buffer rather than a rope, and the receive side has a fast path that
-//! appends in-order data straight through and only sorts when a datagram
-//! actually arrives out of order.
+//! appends in-order data straight through and queues out-of-order fragments
+//! by their lowest offset.
 
 use anyhow::Result;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 #[cfg(test)]
 #[path = "send_buffer_tests.rs"]
@@ -16,6 +18,10 @@ mod send_buffer_tests;
 #[cfg(test)]
 #[path = "receive_limit_tests.rs"]
 mod receive_limit_tests;
+
+#[cfg(test)]
+#[path = "receive_queue_tests.rs"]
+mod receive_queue_tests;
 
 /// How much buffer a pooled stream keeps hold of. Requests are tens of bytes
 /// and most responses are small, so this covers the common case; a stream that
@@ -429,6 +435,33 @@ impl std::fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
+/// The earliest offset is the maximum heap element. Payload bytes are not
+/// compared: equal offsets can contain large duplicate fragments.
+struct PendingFragment {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl PartialEq for PendingFragment {
+    fn eq(&self, other: &Self) -> bool {
+        self.offset == other.offset
+    }
+}
+
+impl Eq for PendingFragment {}
+
+impl PartialOrd for PendingFragment {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingFragment {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.offset.cmp(&self.offset)
+    }
+}
+
 /// One end of a stream we read from
 pub struct RecvStream {
     /// Contiguous data from `read_offset` that the application has not taken.
@@ -437,8 +470,8 @@ pub struct RecvStream {
     ready: Vec<u8>,
     /// Stream offset of the next byte the application will see
     read_offset: u64,
-    /// Data that arrived early, sorted by offset
-    pending: Vec<(u64, Vec<u8>)>,
+    /// Data that arrived early, with the next offset at the heap root.
+    pending: BinaryHeap<PendingFragment>,
     /// Offset the stream ends at, once the peer says so
     final_size: Option<u64>,
     /// Highest accepted end offset, including RESET final sizes and gaps
@@ -464,7 +497,7 @@ impl RecvStream {
         Self {
             ready,
             read_offset: 0,
-            pending: Vec::new(),
+            pending: BinaryHeap::new(),
             final_size: None,
             received: 0,
             max_data: window,
@@ -529,20 +562,22 @@ impl RecvStream {
             }
             self.drain_pending();
         } else if !data.is_empty() {
-            self.pending.push((offset, data.to_vec()));
-            self.pending.sort_unstable_by_key(|(o, _)| *o);
+            self.pending.push(PendingFragment {
+                offset,
+                data: data.to_vec(),
+            });
         }
         Ok(new)
     }
 
     /// Move anything that has become contiguous out of `pending`
     fn drain_pending(&mut self) {
-        while let Some((offset, _)) = self.pending.first() {
+        while let Some(fragment) = self.pending.peek() {
             let head = self.read_offset + self.ready.len() as u64;
-            if *offset > head {
+            if fragment.offset > head {
                 break;
             }
-            let (offset, data) = self.pending.remove(0);
+            let PendingFragment { offset, data } = self.pending.pop().unwrap();
             let skip = (head - offset) as usize;
             if skip < data.len() {
                 self.ready.extend_from_slice(&data[skip..]);

@@ -17,7 +17,11 @@ fn snapshot(recv: &RecvStream) -> Snapshot {
     Snapshot {
         ready: recv.ready.clone(),
         ready_capacity: recv.ready.capacity(),
-        pending: recv.pending.clone(),
+        pending: recv
+            .pending
+            .iter()
+            .map(|fragment| (fragment.offset, fragment.data.clone()))
+            .collect(),
         pending_capacity: recv.pending.capacity(),
         read_offset: recv.read_offset,
         received: recv.received,
