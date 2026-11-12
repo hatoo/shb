@@ -732,6 +732,7 @@ fn bad(what: &str) -> anyhow::Error {
 mod tests {
     use super::*;
 
+    mod body_burst;
     mod continuation;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
