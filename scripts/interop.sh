@@ -45,7 +45,7 @@ fi
 # protocol | url | what is known to be serving it | extra shb arguments
 #
 # The fourth field is optional. It exists because some response shapes cannot
-# be reached with a plain GET - HTTP/2 trailers, for one.
+# be reached with a plain GET - 100 Continue, for one.
 ENDPOINTS=$(cat <<'EOF'
 h1|http://example.com/|ICANN, cleartext
 h1|https://example.com/|ICANN
@@ -106,7 +106,6 @@ h2|https://www.taobao.com/|Tengine, Alibaba's fork of nginx
 h2|https://openresty.org/|OpenResty Edge
 h1|https://httpbin.org/post|a real 100 Continue, which no plain GET produces|-m POST -H 'expect: 100-continue' -d aaaa
 h2|https://httpbin.org/post|the same 100 Continue over HTTP/2|-m POST -H 'expect: 100-continue' -d aaaa
-h2|https://grpcb.in/hello.HelloService/SayHello|gRPC: the one server here that sends HTTP/2 trailers, which v0.2.3 could not read|-m POST -H 'content-type: application/grpc' -H 'te: trailers' -d x
 h3|https://cloudflare-quic.com/|Cloudflare quiche, an HTTP/3 test endpoint
 h3|https://quic.nginx.org/|nginx QUIC, an HTTP/3 test endpoint
 h3|https://h2o.examp1e.net/|quicly, H2O's own QUIC
@@ -149,8 +148,6 @@ EOF
 # for HTTP/2 and for an Alt-Svc advertisement for HTTP/3, and was the server's
 # doing rather than ours.
 KNOWN_GOOD=$(cat <<'EOF'
-h1|https://grpcb.in/|gRPC test server
-h2|https://grpcb.in/|gRPC test server
 h1|https://grpc.io/|gRPC
 h2|https://grpc.io/|gRPC
 h3|https://grpc.io/|gRPC
