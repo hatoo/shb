@@ -14,6 +14,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod budget;
 mod buf_ring;
 mod clock;
+mod fd_table;
 mod http1;
 mod http2;
 mod http3;
@@ -275,6 +276,10 @@ fn main() -> Result<()> {
         .map(|i| args.connections / threads + usize::from(i < args.connections % threads))
         .collect();
     let budget_per_thread = budget.split(threads);
+
+    // Grow the shared Linux FD table before workers start opening sockets,
+    // outside the measured run. Failure leaves ordinary startup unchanged.
+    let _ = fd_table::reserve(args.connections, threads);
 
     let bench_start = Instant::now();
     let results: Vec<Result<Stats>> = std::thread::scope(|s| {
