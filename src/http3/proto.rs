@@ -26,6 +26,7 @@ pub const STREAM_QPACK_DECODER: u64 = 0x03;
 // Error codes (RFC 9114 Section 8.1)
 /// Nothing went wrong; the connection is simply done with
 pub const H3_NO_ERROR: u64 = 0x100;
+pub const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
 /// The server never started on the request, so it can be sent again
 /// without anything happening twice
 pub const H3_REQUEST_REJECTED: u64 = 0x10b;
@@ -172,6 +173,8 @@ impl ResponseReader {
 /// unknown stream types must be discarded.
 #[derive(Default)]
 pub struct UniReader {
+    /// RESET can arrive before the bytes identifying the stream type.
+    pub(super) closed: bool,
     kind: Option<u64>,
     pending: Vec<u8>,
     skip: u64,
@@ -181,6 +184,14 @@ pub struct UniReader {
 }
 
 impl UniReader {
+    pub fn critical_closed(&self) -> bool {
+        self.closed
+            && matches!(
+                self.kind,
+                Some(STREAM_CONTROL | STREAM_QPACK_ENCODER | STREAM_QPACK_DECODER)
+            )
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
         self.pending.extend_from_slice(data);
         let mut pos = 0;

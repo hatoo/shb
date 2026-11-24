@@ -141,7 +141,8 @@ fn run(disrupt: bool) {
                 }
                 Event::Finished { id, reset } => {
                     assert_eq!(reset, None);
-                    finished.insert(id);
+                    assert_eq!(received.get(&id), Some(&BODY));
+                    assert!(finished.insert(id), "duplicate terminal event for {id}");
                 }
                 Event::Lost(reason) => {
                     assert_eq!(completed.load(Ordering::SeqCst), STREAMS + 1, "{reason}")
@@ -222,7 +223,11 @@ fn run(disrupt: bool) {
     server.join().unwrap();
     assert_eq!(received.len(), STREAMS + 1);
     assert!(received.values().all(|n| *n == BODY));
-    assert_eq!(finished.len(), STREAMS);
+    assert_eq!(
+        finished,
+        (0..STREAMS).map(|n| n as u64 * 4).chain([3]).collect(),
+        "all request streams and the peer uni stream must finish exactly once"
+    );
     assert_eq!(limits.len(), STREAMS + 1);
     assert!(credits > 50);
     assert!(queue_peak > 0);

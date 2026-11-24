@@ -125,6 +125,15 @@ pub enum Event {
     Lost(String),
 }
 
+/// Receive state retained for final-size and credit validation after termination.
+/// Bounded by the cumulative advertised peer stream limit. Adapted from the
+/// corresponding hatoo/xdp-http c433 repair (MIT), originally derived from shb.
+struct PeerUni {
+    id: u64,
+    recv: RecvStream,
+    finished: bool,
+}
+
 /// One packet number space's keys, numbers and record of what is in flight
 #[derive(Default)]
 struct SpaceState {
@@ -274,7 +283,7 @@ pub struct Connection {
     /// never send MAX_STREAMS, and advertise no peer bidirectional streams.
     max_peer_uni: u64,
     /// Peer-opened unidirectional streams, few and long-lived
-    peer_uni: Vec<(u64, RecvStream)>,
+    peer_uni: Vec<PeerUni>,
     /// Our own unidirectional streams
     local_uni: Vec<(u64, SendStream)>,
 
@@ -2078,8 +2087,8 @@ impl Connection {
         }
         self.peer_uni
             .iter_mut()
-            .find(|(uid, _)| *uid == id)
-            .map(|(_, recv)| recv)
+            .find(|stream| stream.id == id)
+            .map(|stream| &mut stream.recv)
     }
 
     /// Note that a stream is owed a MAX_STREAM_DATA. Whether it still is
@@ -2230,23 +2239,34 @@ impl Connection {
             bail!("the peer sent data on our unidirectional stream {id}");
         } else {
             self.check_peer_uni(id)?;
-            let (pos, new) = match self.peer_uni.iter().position(|(i, _)| *i == id) {
+            let (pos, new) = match self.peer_uni.iter().position(|stream| stream.id == id) {
                 Some(pos) => {
                     let new = self.peer_uni[pos]
-                        .1
+                        .recv
                         .push_with_credit(offset, data, fin, credit)?;
                     (pos, new)
                 }
                 None => {
                     let mut recv = RecvStream::new(self.stream_window);
                     let new = recv.push_with_credit(offset, data, fin, credit)?;
-                    self.peer_uni.push((id, recv));
+                    self.peer_uni.push(PeerUni {
+                        id,
+                        recv,
+                        finished: false,
+                    });
                     self.events.push_back(Event::Opened(id));
                     (self.peer_uni.len() - 1, new)
                 }
             };
-            if self.peer_uni[pos].1.has_data() {
+            if self.peer_uni[pos].recv.has_data() {
                 self.push_readable(id);
+            }
+            // FIN does not complete a stream while preceding data has gaps.
+            // Readable must precede Finished so the application can read its type.
+            let stream = &mut self.peer_uni[pos];
+            if stream.recv.is_finished() && !stream.finished {
+                stream.finished = true;
+                self.events.push_back(Event::Finished { id, reset: None });
             }
             new
         };
@@ -2278,15 +2298,32 @@ impl Connection {
             // No receive state remains for this fully retired request.
         } else {
             self.check_peer_uni(id)?;
-            if let Some((_, recv)) = self.peer_uni.iter_mut().find(|(i, _)| *i == id) {
-                self.data_received += recv.reset(final_size, credit)?;
+            let pos = if let Some(pos) = self.peer_uni.iter().position(|stream| stream.id == id) {
+                self.data_received += self.peer_uni[pos].recv.reset(final_size, credit)?;
+                pos
             } else {
                 // RESET_STREAM can be the first frame received on a peer stream.
                 let mut recv = RecvStream::new(self.stream_window);
                 let new = recv.reset(final_size, credit)?;
-                self.peer_uni.push((id, recv));
+                self.peer_uni.push(PeerUni {
+                    id,
+                    recv,
+                    finished: false,
+                });
                 self.events.push_back(Event::Opened(id));
                 self.data_received += new;
+                self.peer_uni.len() - 1
+            };
+            if !self.peer_uni[pos].finished && self.peer_uni[pos].recv.has_data() {
+                self.push_readable(id);
+            }
+            let stream = &mut self.peer_uni[pos];
+            if !stream.finished {
+                stream.finished = true;
+                self.events.push_back(Event::Finished {
+                    id,
+                    reset: Some(error),
+                });
             }
         }
         Ok(())
@@ -2490,6 +2527,12 @@ impl Connection {
             .unwrap();
     }
 
+    pub(crate) fn test_close_code(&self) -> Option<(u64, bool)> {
+        self.close_pending
+            .as_ref()
+            .map(|close| (close.code, close.app))
+    }
+
     pub(crate) fn test_buffered_request(&self, id: u64) -> Option<(&[u8], bool)> {
         let pair = self.streams.get(self.stream_index(id)?)?.as_ref()?;
         pair.send
@@ -2514,6 +2557,7 @@ mod tests {
     mod receive_limits;
     mod retry_token;
     mod stream_limits;
+    mod uni_finished;
     mod uni_send_credit;
 
     fn client() -> Connection {
