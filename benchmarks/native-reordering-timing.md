@@ -28,7 +28,10 @@ python3 benchmarks/measure-native-reordering.py \
 ```
 
 Use `--namespace sudo` only where unprivileged namespaces are unavailable and
-noninteractive sudo is configured. The fixed peer has two runtime workers.
+noninteractive sudo is configured. The fixed peer defaults to two runtime
+workers; `--peer-workers 1` selects one when only one disjoint server core is
+available. Up to 20000 requests are allowed for small-response tail guards;
+the original large-response example remains 512 requests.
 Choose distinct physical cores once; do not search affinities for favorable
 results. The controller caps requests, body size and runtime. Output directories
 must be new. The PID namespace contains the supervisor, client and peer even

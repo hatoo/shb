@@ -55,7 +55,7 @@ async def run(args):
     supervisor = Path(__file__).with_name('measure-process.py')
     config = dict(mode=args.mode, requests=args.requests, body_bytes=args.size,
                   chunk=args.chunk, client_cpu=args.client_cpu,
-                  peer_cpus=args.peer_cpus, peer_workers=2,
+                  peer_cpus=args.peer_cpus, peer_workers=args.peer_workers,
                   connections=1, parallel=1, threads=1, timeout='5s',
                   run_deadline_s=args.deadline)
     inputs = dict(peer=args.peer, client=args.shb, supervisor=supervisor,
@@ -74,7 +74,7 @@ async def run(args):
               f'SHB_NATIVE_REORDER={args.mode}:{args.size}:{args.chunk}']
     try:
         async with Peer(args.peer, output / 'peer', args.requests, args.size,
-                        workers=2, deadline=args.deadline, prefix=prefix) as peer:
+                        workers=args.peer_workers, deadline=args.deadline, prefix=prefix) as peer:
             peer_pid = int((output / 'peer-resource.pid').read_text())
             port = int(peer.address.split(':')[1])
             summary['socket_start'] = socket_evidence(peer_pid, port)
@@ -148,16 +148,18 @@ if __name__ == '__main__':
     parser.add_argument('--chunk', type=int, default=1024)
     parser.add_argument('--client-cpu', type=int, default=2)
     parser.add_argument('--peer-cpus', default='4,6')
+    parser.add_argument('--peer-workers', type=int, choices=(1, 2), default=2)
     parser.add_argument('--deadline', type=int, default=40)
     parser.add_argument('--namespace', choices=('user', 'sudo'), default='user')
     args = parser.parse_args()
     sys.path.insert(0, str(args.fixture_dir.resolve()))
     from h3_response_flight import Peer, kill_group, validate_client, validate_peer
     from native_reordering import require, socket_evidence, udp_snapshot, validate_schedule, validate_udp
-    require(1 <= args.requests <= 512 and 64 <= args.chunk <= 1024, 'invalid bounded workload')
+    require(1 <= args.requests <= 20000 and 64 <= args.chunk <= 1024, 'invalid bounded workload')
     require(2 * args.chunk <= args.size <= 16 * 1048576 and 1 <= args.deadline <= 120,
             'invalid body/deadline')
     peer_cpus = {int(c) for c in args.peer_cpus.split(',')}
+    require(len(peer_cpus) >= args.peer_workers, 'peer workers exceed available CPUs')
     require(args.client_cpu not in peer_cpus and peer_cpus and
             peer_cpus | {args.client_cpu} <= os.sched_getaffinity(0), 'invalid CPU affinity')
     for name in ('peer', 'shb', 'output', 'fixture_dir'):
