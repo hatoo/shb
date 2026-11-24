@@ -75,6 +75,20 @@ jobs:
         run: |
           "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/check-quic-receive-limits.py --shb ./target/release/shb
 
+      - name: HTTP/3 critical peer-stream closure and exact accounting (aioquic)
+        timeout-minutes: 3
+        run: |
+          "$RUNNER_TEMP/h3-status-venv/bin/python" -m unittest discover -s benchmarks -p 'test_h3_critical_close.py' -v
+          "$RUNNER_TEMP/h3-status-venv/bin/python" benchmarks/h3_critical_close.py --shb ./target/release/shb --output "$RUNNER_TEMP/h3-critical-close.json"
+
+      - name: Retain HTTP/3 critical-stream encrypted-wire and accounting evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-critical-close
+          path: ${{ runner.temp }}/h3-critical-close.json
+          if-no-files-found: ignore
+
       - name: QUIC Retry tokens, forged Retry and Initial recovery (aioquic)
         timeout-minutes: 3
         run: |

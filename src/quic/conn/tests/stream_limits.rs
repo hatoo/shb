@@ -76,7 +76,7 @@ fn peer_stream_limit_uses_advertised_count_and_not_registered_count() {
                 conn.on_stream(last, 0, b"abcdefgh", true).unwrap();
             }
             assert_eq!(conn.peer_uni.len(), 1, "implicit gaps need no entries");
-            assert_eq!(conn.peer_uni[0].0, last);
+            assert_eq!(conn.peer_uni[0].id, last);
             assert_eq!(conn.data_received, 8);
         }
     }
@@ -108,7 +108,7 @@ fn peer_stream_limit_handles_maximum_ids_without_overflow_or_gap_allocation() {
             conn.on_stream(last, 0, b"", false).unwrap();
         }
         assert_eq!(conn.peer_uni.len(), 1);
-        assert_eq!(conn.peer_uni[0].0, last);
+        assert_eq!(conn.peer_uni[0].id, last);
         assert_eq!(conn.data_received, 0);
     }
 }
@@ -127,7 +127,10 @@ fn peer_stream_limit_preserves_reordering_duplicates_and_reset_first() {
         conn.on_reset(id, 42, 8).unwrap();
     }
     assert_eq!(
-        conn.peer_uni.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        conn.peer_uni
+            .iter()
+            .map(|stream| stream.id)
+            .collect::<Vec<_>>(),
         [11, 7, 3]
     );
     assert_eq!(conn.data_received, 24);
@@ -139,11 +142,22 @@ fn peer_stream_limit_preserves_reordering_duplicates_and_reset_first() {
             .count(),
         3
     );
+    assert_eq!(
+        conn.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Finished { id, reset } => Some((*id, *reset)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [(11, Some(42)), (7, None), (3, None)],
+        "each peer termination is reported exactly once"
+    );
     assert!(
         !conn
             .events
             .iter()
-            .any(|e| matches!(e, Event::Finished { .. } | Event::Lost(_)))
+            .any(|event| matches!(event, Event::Lost(_)))
     );
     conn.events.clear();
     // Finishing/resetting earlier streams does not replenish a cumulative limit.
@@ -158,7 +172,11 @@ fn peer_stream_limit_rejects_empty_frames_and_checks_existing_entries() {
             let mut conn = fixture(3);
             // Model an existing entry: the check must precede both lookup and
             // registration, not just insertion into the vector.
-            conn.peer_uni.push((id, RecvStream::new(1 << 20)));
+            conn.peer_uni.push(PeerUni {
+                id,
+                recv: RecvStream::new(1 << 20),
+                finished: false,
+            });
             let result = if reset {
                 conn.on_reset(id, 42, 0)
             } else {
@@ -173,7 +191,7 @@ fn peer_stream_limit_rejects_empty_frames_and_checks_existing_entries() {
                 Some(4)
             );
             assert_eq!(conn.peer_uni.len(), 1);
-            assert!(!conn.peer_uni[0].1.size_known());
+            assert!(!conn.peer_uni[0].recv.size_known());
             assert_eq!(conn.data_received, 0);
             assert!(conn.events.is_empty());
         }

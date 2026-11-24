@@ -734,6 +734,25 @@ fn pump_transmits(
     Ok(())
 }
 
+fn uni_reader(uni: &mut Vec<(u64, UniReader)>, id: u64) -> &mut UniReader {
+    let slot = match uni.iter().position(|(uid, _)| *uid == id) {
+        Some(pos) => pos,
+        None => {
+            uni.push((id, UniReader::default()));
+            uni.len() - 1
+        }
+    };
+    &mut uni[slot].1
+}
+
+fn check_critical_close(quic: &mut Connection, reader: &UniReader) -> Result<()> {
+    if reader.critical_closed() {
+        quic.close(proto::H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+        bail!("peer closed a critical HTTP/3 stream");
+    }
+    Ok(())
+}
+
 /// Drive the QUIC and H3 state machines after input (datagrams or timeouts)
 ///
 /// Returns false if the connection is broken.
@@ -784,6 +803,14 @@ fn drive(
                         inflight.unsent.clear();
                     }
                 }
+                QuicEvent::Finished { id, .. } if id & 3 == 3 => {
+                    let reader = uni_reader(&mut conn.uni, id);
+                    reader.closed = true;
+                    // Known critical closure wins over this batch's responses.
+                    // A reset before its type is remembered until readable data
+                    // identifies it; absent/partial/unknown types are tolerated.
+                    check_critical_close(quic, reader)?;
+                }
                 // Collected rather than acted on: the same datagram that ends
                 // a stream usually carries the response, and completing it
                 // here would retire the stream before its body is read
@@ -802,16 +829,10 @@ fn drive(
             }
             // A peer-opened stream: its control stream, or one of its QPACK
             // streams, which never carry anything shb acts on beyond GOAWAY
-            let slot = match conn.uni.iter().position(|(uid, _)| *uid == id) {
-                Some(pos) => pos,
-                None => {
-                    conn.uni.push((id, UniReader::default()));
-                    conn.uni.len() - 1
-                }
-            };
-            let reader = &mut conn.uni[slot].1;
+            let reader = uni_reader(&mut conn.uni, id);
             quic.consume(id, |data| reader.feed(data))?;
-            if let Some(id) = conn.uni[slot].1.goaway {
+            check_critical_close(quic, reader)?;
+            if let Some(id) = reader.goaway {
                 conn.goaway = Some(conn.goaway.map_or(id, |prev| prev.min(id)));
             }
         }
@@ -1454,6 +1475,10 @@ fn finish_close(
     pump_transmits(submitter, sq, conn_idx, conn, now, transmit_buf, gso)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "http3/critical_tests.rs"]
+mod critical_tests;
 
 #[cfg(test)]
 #[path = "http3/budget_tests.rs"]
