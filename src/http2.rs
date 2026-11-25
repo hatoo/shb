@@ -5,6 +5,7 @@
 
 mod conn;
 mod hpack;
+mod streams;
 
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
@@ -14,9 +15,9 @@ use std::time::Duration;
 use crate::clock::Instant;
 
 use self::conn::{Connection, Event};
+use self::streams::Streams;
 use crate::budget::Budget;
 use crate::buf_ring::BufRing;
-use crate::inflight::H2Ring;
 use crate::stats::Stats;
 use crate::target::Target;
 use crate::tls::{TlsSession, TlsSetup};
@@ -90,7 +91,7 @@ struct Conn {
     /// user_data and ignored
     generation: u64,
     /// In-flight requests, up to the configured parallelism
-    streams: H2Ring<InFlight>,
+    streams: Streams<InFlight>,
     /// Responses received on this connection since it was opened
     answered: u64,
     /// Requests the peer gave back before it had answered anything on this
@@ -116,7 +117,7 @@ impl Conn {
             recv_armed: false,
             goaway: false,
             generation: 0,
-            streams: H2Ring::new(),
+            streams: Streams::new(),
             answered: 0,
             held: 0,
             idle_since: Instant::now(),
@@ -156,11 +157,11 @@ impl Conn {
     }
 
     fn timed_out(&mut self, now: Instant, limit: Duration, may_start: bool) -> bool {
-        if let Some(oldest) = self.streams.slot(0) {
+        if let Some(oldest) = self.streams.first() {
             self.idle_since = now;
             // fill_streams timestamps requests once, in increasing stream-id
-            // order. Ring keeps the oldest live request at slot zero, even
-            // after out-of-order completions and compaction. If it has not
+            // order. The tracker keeps the oldest live request first, even
+            // after out-of-order completions and storage changes. If it has not
             // expired, no younger request can have expired either.
             now.duration_since(oldest.start) >= limit
         } else {
@@ -1017,3 +1018,6 @@ mod lifetime_tests;
 
 #[cfg(test)]
 mod completion_tests;
+
+#[cfg(test)]
+mod worker_streams_tests;

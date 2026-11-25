@@ -27,7 +27,7 @@ fn the_oldest_live_request_keeps_the_exact_timeout_boundary() {
     assert!(conn.streams.take(3).is_some());
     assert!(!conn.timed_out(now, limit, false));
     assert!(conn.timed_out(now, Duration::ZERO, false));
-    assert!(conn.streams.slot(0).unwrap().start == start_at(20));
+    assert!(conn.streams.first().unwrap().start == start_at(20));
 }
 
 #[test]
@@ -43,15 +43,15 @@ fn a_pinned_request_and_compacted_prefix_preserve_the_oldest_start() {
     let now = start_at(5000);
     let limit = now.duration_since(start_at(0));
     assert!(conn.timed_out(now, limit, true));
-    assert_eq!(conn.streams.slot_count(), 4096);
+    assert_eq!(conn.streams.len(), 97);
     assert!(conn.streams.take(1).is_some()); // Settles holes and compacts.
-    assert_eq!(conn.streams.slot_count(), 96);
-    assert!(conn.streams.slot(0).unwrap().start == start_at(4000));
+    assert_eq!(conn.streams.len(), 96);
+    assert!(conn.streams.first().unwrap().start == start_at(4000));
     assert!(!conn.timed_out(now, limit, true));
     for i in 4096..8192 {
         push(&mut conn, 1 + 2 * i, start_at(i as u64));
         assert!(conn.streams.take(1 + 2 * (i - 96) as u64).is_some());
-        assert!(conn.streams.slot(0).unwrap().start == start_at((i - 95) as u64));
+        assert!(conn.streams.first().unwrap().start == start_at((i - 95) as u64));
     }
     assert_eq!(conn.streams.len(), 96);
 }
@@ -111,7 +111,7 @@ fn reset_refusal_and_goaway_retire_only_their_own_timestamps() {
         &mut started,
     );
     assert_eq!((stats.errors, started, conn.held), (1, 4, 2));
-    assert!(conn.streams.slot(0).unwrap().start == start_at(20));
+    assert!(conn.streams.first().unwrap().start == start_at(20));
     let now = start_at(30);
     assert!(!conn.timed_out(now, now.duration_since(start_at(0)), false));
     assert!(conn.timed_out(now, now.duration_since(start_at(20)), false));

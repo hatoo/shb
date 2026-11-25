@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn serve(mut sock: impl Read + Write, first: bool) -> usize {
+fn serve(mut sock: impl Read + Write, first: bool, parallel: usize, rounds: usize) -> usize {
+    let first_requests = parallel + rounds * (parallel - 1);
+    let mut waves = 0;
     let mut preface = [0; 24];
     sock.read_exact(&mut preface).unwrap();
     assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -23,7 +25,10 @@ fn serve(mut sock: impl Read + Write, first: bool) -> usize {
                 ),
                 "waiting for client teardown failed: {e}"
             );
-            assert_eq!(requests, 255, "all replacements arrived before timeout");
+            assert_eq!(
+                requests, first_requests,
+                "all replacements arrived before timeout"
+            );
             return requests;
         }
         let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
@@ -39,17 +44,19 @@ fn serve(mut sock: impl Read + Write, first: bool) -> usize {
                 assert_eq!(id, 2 * requests as u32 - 1);
                 assert_eq!(header[4] & 5, 5, "complete GET headers");
                 if first {
-                    assert!(requests <= 255);
-                    if requests == 128 {
+                    assert!(requests <= first_requests);
+                    if waves < rounds && requests == parallel + waves * (parallel - 1) {
                         let mut responses = Vec::new();
-                        for stream in (1..128).rev() {
-                            responses.extend(super::h2_frame(1, 5, 1 + stream * 2, &[0x88]));
+                        let begin = 1 + waves * (parallel - 1);
+                        for stream in (begin..begin + parallel - 1).rev() {
+                            responses.extend(super::h2_frame(1, 5, 1 + stream as u32 * 2, &[0x88]));
                         }
                         sock.write_all(&responses).unwrap();
+                        waves += 1;
                     }
                 } else {
                     sock.write_all(&super::h2_frame(1, 5, id, &[0x88])).unwrap();
-                    if requests == 257 {
+                    if requests == 512 - first_requests {
                         return requests;
                     }
                 }
@@ -59,7 +66,7 @@ fn serve(mut sock: impl Read + Write, first: bool) -> usize {
     }
 }
 
-fn check(tls: bool) {
+fn check(tls: bool, parallel: usize, rounds: usize) {
     let config = if tls {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key =
@@ -95,9 +102,14 @@ fn check(tls: bool) {
             // until worker teardown and prevent this run from succeeding.
             requests.push(if let Some(config) = &config {
                 let mut session = rustls::ServerConnection::new(config.clone()).unwrap();
-                serve(rustls::Stream::new(&mut session, &mut stream), first)
+                serve(
+                    rustls::Stream::new(&mut session, &mut stream),
+                    first,
+                    parallel,
+                    rounds,
+                )
             } else {
-                serve(stream, first)
+                serve(stream, first, parallel, rounds)
             });
         }
         requests
@@ -108,7 +120,7 @@ fn check(tls: bool) {
         "--timeout",
         "2s",
         "-p",
-        "128",
+        &parallel.to_string(),
         "-c",
         "1",
         "-t",
@@ -117,23 +129,40 @@ fn check(tls: bool) {
         "512",
         &format!("{scheme}://{addr}/"),
     ]);
-    assert_eq!(server.join().unwrap(), [255, 257]);
+    let first = parallel + rounds * (parallel - 1);
+    assert_eq!(server.join().unwrap(), [first, 512 - first]);
     assert_eq!(
         report["requests"],
         serde_json::json!({
-            "ok": 384, "errors": 128, "connectErrors": 0, "total": 512,
+            "ok": 512 - parallel, "errors": parallel, "connectErrors": 0, "total": 512,
         })
     );
-    assert_eq!(report["statusCodes"], serde_json::json!({"200": 384}));
+    assert_eq!(
+        report["statusCodes"],
+        serde_json::json!({"200": 512 - parallel})
+    );
     assert!(!report["latencySeconds"].is_null());
+    super::latency_accounting::assert_samples(&report);
 }
 
 #[test]
 fn h2_timeout_survives_holes_and_reconnects() {
-    check(false);
+    check(false, 128, 1);
 }
 
 #[test]
 fn h2_tls_timeout_survives_holes_and_reconnects() {
-    check(true);
+    check(true, 128, 1);
+}
+
+// Four younger cohorts cross twice the peak concurrency, forcing the worker
+// tracker sparse before the timeout. The server ledger remains independent.
+#[test]
+fn h2_sparse_worker_timeout_and_reconnect() {
+    check(false, 32, 4);
+}
+
+#[test]
+fn h2_tls_sparse_worker_timeout_and_reconnect() {
+    check(true, 32, 4);
 }
