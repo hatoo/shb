@@ -164,8 +164,11 @@ fn check(tls: bool, ping: bool) {
         setup.as_ref(),
         1,
         crate::budget::Budget::Requests(1),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         1,
     );
     let (sent, received) = server.join().unwrap();

@@ -183,8 +183,11 @@ fn check(tls: bool, invalid: bool) {
         setup.as_ref(),
         1,
         crate::budget::Budget::Requests(if invalid { 1 } else { 12 }),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         1,
     );
     let (sent, received) = server.join().unwrap();

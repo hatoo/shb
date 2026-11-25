@@ -491,6 +491,15 @@ fn retirement_cancels_a_pending_connect_and_its_linked_timeout() {
 
 #[test]
 fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
+    blocked_send_retirement(false);
+}
+
+#[test]
+fn drain_expiry_cancels_a_blocked_send_without_losing_or_double_counting_requests() {
+    blocked_send_retirement(true);
+}
+
+fn blocked_send_retirement(draining: bool) {
     let mut f = Fixture::new();
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(f.conn.fd) };
     let socket = socket2::SockRef::from(&borrowed);
@@ -537,6 +546,26 @@ fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
             "test must leave a partial send pending"
         );
     }
+    let mut stats = Stats::default();
+    if draining {
+        f.conn.streams.push(
+            1,
+            InFlight {
+                start: Instant::now(),
+                status: 0,
+            },
+        );
+        f.conn.held = 1;
+        let mut control =
+            RunControl::new(Budget::Duration(Duration::ZERO), Some(Duration::ZERO)).unwrap();
+        let pointer = f.conn.out.as_ptr();
+        control.refresh(std::slice::from_mut(&mut f.conn), &mut stats);
+        assert!(control.expired());
+        f.conn.fail_inflight(&mut stats);
+        assert_eq!(stats.errors, 2);
+        assert!(f.conn.sending);
+        assert_eq!(f.conn.out.as_ptr(), pointer);
+    }
     f.retire();
     let cqes = f.completions();
     assert!(
@@ -546,6 +575,18 @@ fn retirement_cancels_a_blocked_send_before_reusing_its_storage() {
     );
     // No kernel reference remains, so growing/replacing out is safe now.
     f.conn.out = vec![0x92; 8 * 1024 * 1024];
+    if draining {
+        f.conn.fail_inflight(&mut stats);
+        assert_eq!(
+            (stats.completed, stats.errors, stats.connect_errors),
+            (0, 2, 0)
+        );
+        assert!(stats.latencies_ns.is_empty());
+        assert!(
+            cqes.iter()
+                .all(|c| uring::decode_user_data(c.user_data()).2 != f.conn.generation)
+        );
+    }
 }
 
 fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -636,8 +677,11 @@ fn goaway_worker(tls: bool) {
         setup.as_ref(),
         1,
         Budget::Requests(4),
-        Duration::from_secs(1),
-        Some(Duration::from_secs(2)),
+        Timeouts {
+            connect: Duration::from_secs(1),
+            request: Some(Duration::from_secs(2)),
+            drain: None,
+        },
         1,
     )
     .unwrap();

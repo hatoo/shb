@@ -26,6 +26,100 @@ use crate::uring::{
 use anyhow::{Context, Result, bail};
 use io_uring::{Submitter, cqueue, squeue, types};
 
+pub struct Timeouts {
+    pub connect: Duration,
+    pub request: Option<Duration>,
+    pub drain: Option<Duration>,
+}
+
+/// Separate issuing and draining deadlines. Only the opt-in drain mode reads
+/// the monotonic clock here; ordinary counted/cutoff runs retain their timer.
+struct RunControl {
+    budget: Budget,
+    stopped: bool,
+    drain: Option<(std::time::Instant, std::time::Instant)>,
+}
+
+impl RunControl {
+    fn new(budget: Budget, drain: Option<Duration>) -> Result<Self> {
+        let drain = drain
+            .map(|limit| {
+                let duration = budget
+                    .deadline()
+                    .context("--drain-timeout requires --duration")?;
+                let issuing = std::time::Instant::now()
+                    .checked_add(duration)
+                    .context("duration is too large")?;
+                let finished = issuing
+                    .checked_add(limit)
+                    .context("drain timeout is too large")?;
+                Ok::<_, anyhow::Error>((issuing, finished))
+            })
+            .transpose()?;
+        Ok(Self {
+            budget,
+            stopped: false,
+            drain,
+        })
+    }
+
+    fn may_start(&self, started: u64) -> bool {
+        !self.stopped
+            && self.budget.may_start(started)
+            && self
+                .drain
+                .is_none_or(|(issuing, _)| std::time::Instant::now() < issuing)
+    }
+
+    fn stop(&mut self, conns: &mut [Conn], stats: &mut Stats) {
+        if !self.stopped && self.drain.is_some() {
+            // These attempts were waiting for an answer on their connection
+            // before becoming retryable. Once issuing ends they cannot retry.
+            for conn in conns {
+                stats.errors += std::mem::take(&mut conn.held);
+            }
+        }
+        self.stopped = true;
+    }
+
+    fn refresh(&mut self, conns: &mut [Conn], stats: &mut Stats) {
+        if !self.stopped
+            && self
+                .drain
+                .is_some_and(|(issuing, _)| std::time::Instant::now() >= issuing)
+        {
+            self.stop(conns, stats);
+        }
+    }
+
+    fn draining(&self) -> bool {
+        self.stopped && self.drain.is_some()
+    }
+
+    fn expired(&self) -> bool {
+        self.drain
+            .is_some_and(|(_, finished)| std::time::Instant::now() >= finished)
+    }
+
+    fn wait_timeout(&self) -> Duration {
+        self.drain
+            .map_or(uring::WAIT_TIMEOUT, |(issuing, finished)| {
+                let deadline = if self.stopped { finished } else { issuing };
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(uring::WAIT_TIMEOUT)
+            })
+    }
+
+    fn fail_connect(&self, stats: &mut Stats, started: &mut u64) {
+        // No synthetic request is charged for an idle handshake after issuing
+        // has stopped. Existing live streams are still failed separately.
+        if self.drain.is_none() || self.may_start(*started) {
+            fail_connect(stats, started, self.budget);
+        }
+    }
+}
+
 /// Build the HPACK block sent for every request on every connection
 ///
 /// They are encoded once and then memcpy'd per request; nothing in them
@@ -194,8 +288,7 @@ fn fill_streams(
     body: &[u8],
     parallel: usize,
     started: &mut u64,
-    budget: Budget,
-    stop: bool,
+    control: &RunControl,
 ) {
     let Some(h2) = conn.h2.as_mut() else {
         return;
@@ -213,10 +306,10 @@ fn fill_streams(
     // GOAWAY too: the streams below its line are still going to be answered,
     // and only once their bodies have arrived
     h2.pump_bodies(body);
-    if stop || conn.goaway {
+    if conn.goaway {
         return;
     }
-    while conn.streams.len() < parallel && budget.may_start(*started) {
+    while conn.streams.len() < parallel && control.may_start(*started) {
         let Some(stream_id) = h2.start_stream(header_block, body) else {
             break;
         };
@@ -415,7 +508,13 @@ fn drain_final_completions(
 /// Counting retries per run instead let a server that answers ten streams a
 /// connection run out of retries partway through a long run: nginx with
 /// keepalive_requests 10 failed 761 of 1000 requests at 100 streams.
-fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats, started: &mut u64) {
+fn process_events(
+    conn: &mut Conn,
+    events: &[Event],
+    stats: &mut Stats,
+    started: &mut u64,
+    retry: bool,
+) {
     for event in events {
         match *event {
             Event::Status { stream_id, status } => {
@@ -448,7 +547,9 @@ fn process_events(conn: &mut Conn, events: &[Event], stats: &mut Stats, started:
             }
             Event::Unprocessed { stream_id } => {
                 if conn.streams.take(stream_id as u64).is_some() {
-                    if conn.answered > 0 {
+                    if !retry {
+                        stats.errors += 1;
+                    } else if conn.answered > 0 {
                         *started -= 1;
                     } else {
                         conn.held += 1;
@@ -483,8 +584,7 @@ pub fn run_worker(
     tls_setup: Option<&TlsSetup>,
     connections: usize,
     budget: Budget,
-    connect_timeout: Duration,
-    timeout: Option<Duration>,
+    timeouts: Timeouts,
     parallel: usize,
 ) -> Result<Stats> {
     if connections == 0 || budget.is_empty() {
@@ -523,7 +623,7 @@ pub fn run_worker(
     // The sockaddr / Timespec referenced by Connect SQEs must stay at a stable
     // address until completion
     let raw_addr = Box::new(socket2::SockAddr::from(target.addr));
-    let connect_timeout = Box::new(types::Timespec::from(connect_timeout));
+    let connect_timeout = Box::new(types::Timespec::from(timeouts.connect));
 
     let mut stats = Stats::default();
     if let Some(n) = budget.expected_requests() {
@@ -536,10 +636,11 @@ pub fn run_worker(
 
     // Held for its lifetime: the SQE points at it until the run is over
     let _deadline = uring::arm_deadline(&submitter, &mut sq, budget.deadline())?;
+    let mut control = RunControl::new(budget, timeouts.drain)?;
 
     // Kick off the initial connects (streams are opened on connect completion)
     for (i, conn) in conns.iter_mut().enumerate() {
-        if !budget.may_start(i as u64) {
+        if !control.may_start(i as u64) {
             break;
         }
         conn.fd = uring::start_connect(
@@ -555,40 +656,50 @@ pub fn run_worker(
 
     // Reusable buffer for decrypted plaintext (TLS mode)
     let mut scratch = vec![0u8; 64 * 1024];
-    let mut stop = false;
     // How many completions one wait should collect before returning
     let batch = uring::batch_size_multiplexed(parallel);
 
     'outer: loop {
+        control.refresh(&mut conns, &mut stats);
         if budget.is_met(stats.completed + stats.errors) {
             break;
         }
         if crate::shutdown::requested() {
             break;
         }
+        if control.expired()
+            || (control.stopped
+                && (control.drain.is_none()
+                    || conns
+                        .iter()
+                        .all(|conn| conn.streams.is_empty() && conn.held == 0 && !conn.sending)))
+        {
+            break;
+        }
         // Publish the tail of pushed SQEs before submitting
         sq.sync();
-        uring::submit_and_wait_timeout(&submitter, uring::WAIT_TIMEOUT, batch)?;
+        uring::submit_and_wait_timeout(&submitter, control.wait_timeout(), batch)?;
 
         cq.sync();
+        control.refresh(&mut conns, &mut stats);
 
         // A response that never comes would otherwise hold the run open for
         // ever: a wedged server is a result to report, not a reason to wait
-        if let Some(limit) = timeout {
+        if let Some(limit) = timeouts.request {
             let now = Instant::now();
             for (conn_idx, conn) in conns.iter_mut().enumerate() {
-                let wedged = conn.timed_out(now, limit, budget.may_start(started));
+                let wedged = conn.timed_out(now, limit, control.may_start(started));
                 if !wedged {
                     continue;
                 }
                 if conn.streams.is_empty() && conn.held == 0 {
                     // It carried nothing at all: a connect that did not work
                     // out, which is what it costs the budget
-                    fail_connect(&mut stats, &mut started, budget);
+                    control.fail_connect(&mut stats, &mut started);
                 }
                 conn.fail_inflight(&mut stats);
                 retire(&submitter, &mut sq, conn_idx, conn)?;
-                if !stop && budget.may_start(started) {
+                if control.may_start(started) {
                     match uring::start_connect(
                         &submitter,
                         &mut sq,
@@ -610,8 +721,15 @@ pub fn run_worker(
 
         for cqe in &mut cq {
             let (ud, res, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
+            control.refresh(&mut conns, &mut stats);
+            if control.expired() {
+                if let Some(bid) = cqueue::buffer_select(flags) {
+                    buf_ring.recycle(bid);
+                }
+                break 'outer;
+            }
             if ud == TIMEOUT_USER_DATA {
-                stop = true;
+                control.stop(&mut conns, &mut stats);
                 continue;
             }
             let (op, conn_idx, generation) = uring::decode_user_data(ud);
@@ -633,7 +751,7 @@ pub fn run_worker(
                 OP_CONNECT => {
                     if res < 0 {
                         // e.g. ECONNREFUSED, or ECANCELED when the LinkTimeout fired
-                        fail_connect(&mut stats, &mut started, budget);
+                        control.fail_connect(&mut stats, &mut started);
                         conn_broken = true;
                     } else {
                         let conn = &mut conns[conn_idx];
@@ -660,8 +778,7 @@ pub fn run_worker(
                             &target.body,
                             parallel,
                             &mut started,
-                            budget,
-                            stop,
+                            &control,
                         );
                         pending_flush.mark(conn_idx);
                     }
@@ -760,7 +877,7 @@ pub fn run_worker(
                                             h2.initiate();
                                         } else {
                                             warn_once(NO_H2);
-                                            fail_connect(&mut stats, &mut started, budget);
+                                            control.fail_connect(&mut stats, &mut started);
                                             conn_broken = true;
                                         }
                                     }
@@ -770,7 +887,18 @@ pub fn run_worker(
                             }
                         };
                         buf_ring.recycle(bid);
-                        process_events(conn, &events, &mut stats, &mut started);
+                        // Parsing a large receive/TLS record can cross the
+                        // issuing deadline. Settle held retries before these
+                        // events can refund attempts that can no longer run.
+                        control.refresh(&mut conns, &mut stats);
+                        let conn = &mut conns[conn_idx];
+                        process_events(
+                            conn,
+                            &events,
+                            &mut stats,
+                            &mut started,
+                            !control.draining(),
+                        );
                         match fed {
                             Err(e) => {
                                 let e = format!("{e:#}");
@@ -798,8 +926,7 @@ pub fn run_worker(
                                     &target.body,
                                     parallel,
                                     &mut started,
-                                    budget,
-                                    stop,
+                                    &control,
                                 );
                                 // Window updates / ACKs / new request HEADERS
                                 // go out in the flush pass below
@@ -819,14 +946,14 @@ pub fn run_worker(
                 // counted run against such a server ends rather than
                 // connecting again for ever
                 if conn.tls.as_ref().is_some_and(TlsSession::is_handshaking) {
-                    fail_connect(&mut stats, &mut started, budget);
+                    control.fail_connect(&mut stats, &mut started);
                 }
                 // Whatever was still in flight is lost with the connection.
                 // A connection that drained after a GOAWAY has nothing in
                 // flight, and may still owe for what it gave back.
                 conn.fail_inflight(&mut stats);
                 retire(&submitter, &mut sq, conn_idx, conn)?;
-                if !stop && budget.may_start(started) {
+                if control.may_start(started) {
                     match uring::start_connect(
                         &submitter,
                         &mut sq,
@@ -851,9 +978,18 @@ pub fn run_worker(
         // and TCP_NODELAY made each one its own segment.
         flush_pending(&submitter, &mut sq, &mut conns, &mut pending_flush)?;
 
-        if stop {
+        if control.stopped && control.drain.is_none() {
             break;
         }
+    }
+
+    if control.drain.is_some() {
+        // At the bound (or interruption), every still-owned request is an
+        // error, exactly once. Retirement below retains the kernel I/O barrier.
+        for conn in &mut conns {
+            conn.fail_inflight(&mut stats);
+        }
+        debug_assert_eq!(started, stats.completed + stats.errors);
     }
 
     // Best-effort GOAWAY before closing so servers do not log our teardown as
@@ -909,6 +1045,9 @@ mod budget_tests;
 mod timeout_tests;
 
 #[cfg(test)]
+mod drain_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -953,10 +1092,11 @@ mod tests {
             ],
             &mut stats,
             &mut started,
+            true,
         );
         assert_eq!(started, 3, "not back in the budget yet");
         assert_eq!(conn.held, 2);
-        process_events(&mut conn, &answered(1), &mut stats, &mut started);
+        process_events(&mut conn, &answered(1), &mut stats, &mut started, true);
         assert_eq!(started, 1, "the answer releases them");
         assert_eq!(conn.held, 0);
         assert_eq!((stats.completed, stats.errors), (1, 0));
@@ -968,12 +1108,13 @@ mod tests {
         let mut conn = Conn::new();
         let mut stats = Stats::default();
         let mut started = open(&mut conn, [1, 3]);
-        process_events(&mut conn, &answered(1), &mut stats, &mut started);
+        process_events(&mut conn, &answered(1), &mut stats, &mut started, true);
         process_events(
             &mut conn,
             &[Event::Unprocessed { stream_id: 3 }],
             &mut stats,
             &mut started,
+            true,
         );
         assert_eq!(started, 1);
         assert_eq!(conn.held, 0);
@@ -996,6 +1137,7 @@ mod tests {
             ],
             &mut stats,
             &mut started,
+            true,
         );
         conn.fail_inflight(&mut stats);
         assert_eq!(stats.errors, 3, "two given back, one still in flight");

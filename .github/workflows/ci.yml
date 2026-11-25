@@ -56,6 +56,21 @@ jobs:
       - name: HTTP/2 GOAWAY cohort accounting
         run: python3 -m unittest discover -s benchmarks -p 'test_h2_goaway_cohort.py'
 
+      - name: HTTP/2 bounded duration drain (hyper-h2)
+        timeout-minutes: 2
+        run: |
+          python3 -m venv "$RUNNER_TEMP/h2-drain-venv"
+          "$RUNNER_TEMP/h2-drain-venv/bin/pip" install h2==4.3.0
+          "$RUNNER_TEMP/h2-drain-venv/bin/python" benchmarks/check-h2-duration-drain.py --shb ./target/release/shb --output "$RUNNER_TEMP/h2-duration-drain.json"
+
+      - name: Retain HTTP/2 duration-drain ledgers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2-duration-drain
+          path: ${{ runner.temp }}/h2-duration-drain.json
+          if-no-files-found: ignore
+
       - name: Literal QPACK status names (aioquic)
         run: |
           python3 -m unittest discover -s benchmarks -p 'test_h3_response_fragments.py'

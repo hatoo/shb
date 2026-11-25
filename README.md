@@ -118,6 +118,7 @@ and `--disable-keepalive` only applies to HTTP/1.1.
 | `-c, --connections` | `50` | Concurrent connections |
 | `-n, --requests` | `200` | Total requests to send |
 | `-z, --duration` | — | Run for a duration instead (`10s`, `1m30s`) |
+| `--drain-timeout` | off | With `--http2 -z`, stop issuing at the duration deadline and allow this much extra time for open requests to finish; unfinished requests count as errors |
 | `-p, --parallel` | `1` | Concurrent streams per connection (HTTP/2 and HTTP/3) |
 | `-t, --threads` | physical cores | Worker threads, capped at `--connections` |
 | `--batch-size` | worked out | How many completions a worker holds out for; see below |
@@ -134,6 +135,21 @@ and `--disable-keepalive` only applies to HTTP/1.1.
 
 On `http://` URLs `--http2` uses prior knowledge (no `Upgrade` dance); on
 `https://` the protocol is negotiated with ALPN.
+
+By default, `-z` stops at its deadline and reports responses completed so far.
+For an HTTP/2 run that accounts for all outstanding requests, use
+`--http2 -z 10s --drain-timeout 2s`. Each worker stops opening streams and
+reconnecting at its issuing deadline, then finishes existing uploads and
+responses for at most two additional seconds. Requests still unfinished at
+the bound count as errors; refusals during the drain also count as errors,
+since they cannot be retried. `--timeout` still applies, and Ctrl-C ends the
+drain early, charging outstanding requests as errors. A zero drain timeout
+charges outstanding requests immediately.
+
+Successful requests keep their original start timestamps and every latency
+sample. Elapsed time and requests/sec include the drain. Use identical drain
+settings when comparing binaries. This option requires both `--http2` and
+`--duration`; counted runs already wait for their request budget to finish.
 
 <details>
 <summary><code>shb -h</code></summary>
@@ -154,6 +170,8 @@ Options:
           Total number of requests [default: 200]
   -z, --duration <DURATION>
           Run for this long instead of a fixed request count (e.g. 10s, 1m30s)
+      --drain-timeout <DURATION>
+          After --duration, stop starting requests and allow this long for open HTTP/2 responses to finish. Unfinished requests count as errors. The reported elapsed time and request rate include the drain
   -m, --method <METHOD>
           HTTP method (defaults to GET, or POST when -d is given, like curl)
   -H, --header <HEADER>

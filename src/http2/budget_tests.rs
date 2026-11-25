@@ -4,7 +4,14 @@ fn open(conn: &mut Conn, started: &mut u64, budget: Budget) {
     let mut h2 = Connection::new();
     h2.initiate();
     conn.h2 = Some(h2);
-    fill_streams(conn, &[0x82, 0x86, 0x84], &[], 3, started, budget, false);
+    fill_streams(
+        conn,
+        &[0x82, 0x86, 0x84],
+        &[],
+        3,
+        started,
+        &RunControl::new(budget, None).unwrap(),
+    );
 }
 
 fn answer(conn: &mut Conn, stats: &mut Stats, started: &mut u64, stream_id: u32) {
@@ -19,6 +26,7 @@ fn answer(conn: &mut Conn, stats: &mut Stats, started: &mut u64, stream_id: u32)
         ],
         stats,
         started,
+        true,
     );
 }
 
@@ -87,6 +95,7 @@ fn exhausted_budget_still_fails_live_requests_and_held_give_backs_once() {
         ],
         &mut stats,
         &mut started,
+        true,
     );
     assert_eq!((conn.streams.len(), conn.held, started), (1, 2, 3));
     fail_connect(&mut stats, &mut started, budget);
@@ -109,6 +118,7 @@ fn a_confirmed_give_back_can_pay_for_a_later_connect_failure() {
         &[Event::Unprocessed { stream_id: 5 }, Event::Goaway],
         &mut stats,
         &mut started,
+        true,
     );
     fail_connect(&mut stats, &mut started, budget);
     assert_eq!((started, stats.errors, conn.held), (3, 0, 1));
