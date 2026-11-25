@@ -218,8 +218,11 @@ fn tls_reconnects_preserve_every_status_and_latency_sample() {
         Some(&setup),
         8,
         crate::budget::Budget::Requests(256),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         8,
     )
     .unwrap();
@@ -380,8 +383,11 @@ fn final_flight(mode: FinalFlight) {
         Some(&setup),
         2,
         crate::budget::Budget::Requests(2),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         1,
     )
     .unwrap();

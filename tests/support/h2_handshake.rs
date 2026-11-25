@@ -129,8 +129,11 @@ fn check(no_alpn: bool) {
         Some(&setup),
         2,
         crate::budget::Budget::Requests(2),
-        Duration::from_secs(5),
-        Some(Duration::from_secs(10)),
+        crate::http2::Timeouts {
+            connect: Duration::from_secs(5),
+            request: Some(Duration::from_secs(10)),
+            drain: None,
+        },
         2,
     )
     .unwrap();

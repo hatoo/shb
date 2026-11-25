@@ -27,6 +27,9 @@ mod latency_accounting;
 #[path = "support/h2_timeout.rs"]
 mod h2_timeout;
 
+#[path = "support/h2_duration_drain.rs"]
+mod h2_duration_drain;
+
 #[path = "support/h2_peer.rs"]
 mod h2_peer;
 use h2_peer::{H2Script, h2_frame, serve_scripted_h2};

@@ -183,7 +183,7 @@ fn run_schedule_with_ids(frames: &[Frame], cuts: &[usize], ids: &[u32]) {
         model.apply(&expected);
         let before = Instant::now();
         // Production processes parsed events even if a later frame failed.
-        process_events(&mut conn, &events, &mut stats, &mut started);
+        process_events(&mut conn, &events, &mut stats, &mut started, true);
         let after = Instant::now();
         model.check(&mut conn, &stats, started);
         for &id in model.live.keys() {

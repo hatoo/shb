@@ -191,8 +191,11 @@ fn check(tls: bool, case: Case, split: bool) {
             setup.as_ref(),
             1,
             crate::budget::Budget::Requests(case.requests()),
-            WAIT,
-            Some(WAIT),
+            crate::http2::Timeouts {
+                connect: WAIT,
+                request: Some(WAIT),
+                drain: None,
+            },
             case.requests() as usize,
         );
         finished.send(result).unwrap();

@@ -46,8 +46,11 @@ fn tcp_empty_header_fragments_preserve_every_sample() {
         None,
         1,
         crate::budget::Budget::Requests(64),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         8,
     )
     .unwrap();
@@ -77,8 +80,11 @@ fn tls_empty_header_fragments_preserve_samples_across_reconnects() {
         Some(&setup),
         8,
         crate::budget::Budget::Requests(256),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         8,
     )
     .unwrap();
@@ -159,8 +165,11 @@ fn invalid_sequence(tls: bool, response: Vec<u8>, truncate: bool) {
         setup.as_ref(),
         1,
         crate::budget::Budget::Requests(1),
-        WAIT,
-        Some(WAIT),
+        crate::http2::Timeouts {
+            connect: WAIT,
+            request: Some(WAIT),
+            drain: None,
+        },
         1,
     )
     .unwrap();

@@ -110,6 +110,13 @@ pub struct Args {
     #[arg(short = 'z', long, value_parser = humantime::parse_duration)]
     pub duration: Option<Duration>,
 
+    /// After --duration, stop starting requests and allow this long for open
+    /// HTTP/2 responses to finish. Unfinished requests count as errors.
+    /// The reported elapsed time and request rate include the drain.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration,
+        requires_all = ["duration", "http2"])]
+    pub drain_timeout: Option<Duration>,
+
     /// HTTP method (defaults to GET, or POST when -d is given, like curl)
     #[arg(short = 'm', long)]
     pub method: Option<String>,
@@ -290,6 +297,7 @@ fn main() -> Result<()> {
                 let budget = budget_per_thread[i];
                 let connect_timeout = args.connect_timeout;
                 let timeout = args.timeout;
+                let drain_timeout = args.drain_timeout;
                 let http2 = args.http2;
                 let http3 = args.http3;
                 let parallel = args.parallel;
@@ -310,8 +318,11 @@ fn main() -> Result<()> {
                             tls,
                             connections,
                             budget,
-                            connect_timeout,
-                            timeout,
+                            http2::Timeouts {
+                                connect: connect_timeout,
+                                request: timeout,
+                                drain: drain_timeout,
+                            },
                             parallel,
                         )
                     } else {

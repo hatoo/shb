@@ -109,6 +109,7 @@ fn reset_refusal_and_goaway_retire_only_their_own_timestamps() {
         ],
         &mut stats,
         &mut started,
+        true,
     );
     assert_eq!((stats.errors, started, conn.held), (1, 4, 2));
     assert!(conn.streams.slot(0).unwrap().start == start_at(20));
@@ -167,10 +168,10 @@ fn timeout_decisions_and_accounting_match_a_full_scan_model() {
                         ]
                     }
                 };
-                process_events(&mut conn, &events, &mut stats, &mut started);
+                process_events(&mut conn, &events, &mut stats, &mut started, true);
                 live.remove(&id);
             }
-            14 => process_events(&mut conn, &[Event::Goaway], &mut stats, &mut started),
+            14 => process_events(&mut conn, &[Event::Goaway], &mut stats, &mut started, true),
             _ => {}
         }
         let may_start = random & 64 != 0;
