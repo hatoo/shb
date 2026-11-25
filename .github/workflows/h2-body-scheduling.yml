@@ -1,0 +1,47 @@
+name: HTTP2 body scheduling
+
+on:
+  push:
+    branches: ['codex/validate-h2-bodies-c439-*']
+  pull_request:
+    paths:
+      - 'src/http2/**'
+      - 'src/inflight.rs'
+      - 'benchmarks/check-h2-body-scheduling.py'
+      - '.github/workflows/h2-body-scheduling.yml'
+
+jobs:
+  body-scheduling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust correctness and release binaries
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo test --locked --release
+          cargo build --locked --release --bin shb --example h2-upload-server
+      - name: Independent complete-upload and rearming peers
+        run: |
+          mkdir -p "$RUNNER_TEMP/body-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/body-evidence/revision.txt"
+          sha256sum src/http2/conn.rs src/http2/conn/tests/body_pending.rs Cargo.toml Cargo.lock target/release/shb target/release/examples/h2-upload-server > "$RUNNER_TEMP/body-evidence/before.sha256"
+          python3 -m venv "$RUNNER_TEMP/body-venv"
+          "$RUNNER_TEMP/body-venv/bin/pip" install h2==4.3.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/body-venv/bin/python" -m unittest discover -s benchmarks -p 'test_report_accounting.py'
+          "$RUNNER_TEMP/body-venv/bin/python" benchmarks/check-h2-complete-uploads.py --shb target/release/shb --peer target/release/examples/h2-upload-server > "$RUNNER_TEMP/body-evidence/complete-uploads.json"
+          "$RUNNER_TEMP/body-venv/bin/python" benchmarks/check-h2-body-scheduling.py --shb target/release/shb --output "$RUNNER_TEMP/body-evidence/rearming.json"
+          sha256sum --check "$RUNNER_TEMP/body-evidence/before.sha256"
+      - name: Preserve independent wire ledgers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2-body-scheduling-evidence
+          path: ${{ runner.temp }}/body-evidence/
+          if-no-files-found: error
